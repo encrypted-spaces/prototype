@@ -5,10 +5,10 @@ use std::collections::{BTreeSet, HashMap};
 use encrypted_spaces_backend::error::{Result, SdkError};
 use encrypted_spaces_backend::merk_storage::proofs::VerifiedRows;
 use encrypted_spaces_backend::merk_storage::{
-    determine_query_strategy, execute_query, group_columns_into_rows, parse_key, reassemble_row,
-    ParsedKey, QueryStrategy, RowReadSource, ID_FIELD,
+    determine_query_strategy, execute_query, group_columns_into_rows, parse_key,
+    process_query_results, reassemble_row, ParsedKey, QueryStrategy, RowReadSource, ID_FIELD,
 };
-use encrypted_spaces_backend::query::{Predicate, Query, QueryParam};
+use encrypted_spaces_backend::query::{Order, Predicate, Query, QueryParam};
 use encrypted_spaces_backend::schema::Schema;
 use encrypted_spaces_changelog_core::{prefix_successor, ReadOp};
 use encrypted_spaces_backend::merk_storage::keys::query_param_to_tuple_element;
@@ -181,14 +181,82 @@ impl KvCache {
         }
 
         let required = required_ranges_for_strategy(&strategy, &query.table)?;
-        if !required
+        if required
             .iter()
             .all(|(s, e)| self.storage.covers_range(s, e))
         {
-            return Ok(CacheResult::Miss);
+            let rows = execute_query(&reader, query)?;
+            return Ok(CacheResult::Hit(rows));
         }
-        let rows = execute_query(&reader, query)?;
-        Ok(CacheResult::Hit(rows))
+
+        // Partial coverage + LIMIT: if the first L rows of the requested
+        // scan order fit inside a covered prefix (Asc) or suffix (Desc),
+        // we can answer the query without needing the rest of the range.
+        if let Some(limit) = query.limit {
+            if let Some(rows) = self.try_select_with_limit_partial(query, &required, limit)? {
+                return Ok(CacheResult::Hit(rows));
+            }
+        }
+        Ok(CacheResult::Miss)
+    }
+
+    /// Limit-aware partial-coverage path. Reads the covered prefix/suffix
+    /// of the single contiguous range a non-`ByIndex` strategy would touch,
+    /// applies the query's order/cursor/limit, and returns `Some(rows)` if
+    /// either:
+    /// - we collected at least `limit` rows (the rest is hidden by limit
+    ///   regardless of whether the rest of the range is covered), or
+    /// - we walked the entire requested range (so the cache has the truth
+    ///   even though we got fewer than `limit` rows).
+    ///
+    /// Returns `None` (Miss) when partial coverage + the available rows
+    /// can't decide the question.
+    fn try_select_with_limit_partial(
+        &self,
+        query: &Query,
+        required: &[KeyRange],
+        limit: u32,
+    ) -> Result<Option<Vec<serde_json::Value>>> {
+        if limit == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        // Only single-range strategies support this; ByIds with N ids has N
+        // disjoint ranges and isn't a meaningful "scan with limit".
+        if required.len() != 1 {
+            return Ok(None);
+        }
+        let (start, end) = (&required[0].0, &required[0].1);
+
+        let (effective_start, effective_end, walks_to_full_range) = match query.order {
+            Order::Asc => {
+                let eff_end = self.storage.covered_prefix_end(start, end);
+                let complete = eff_end.as_slice() == end.as_slice();
+                (start.clone(), eff_end, complete)
+            }
+            Order::Desc => {
+                let eff_start = self.storage.covered_suffix_start(start, end);
+                let complete = eff_start.as_slice() == start.as_slice();
+                (eff_start, end.clone(), complete)
+            }
+        };
+
+        if effective_start >= effective_end {
+            return Ok(None);
+        }
+
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = self
+            .storage
+            .iter_range_present(&effective_start, &effective_end)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let rows = group_columns_into_rows(&entries)?;
+        let limited = process_query_results(rows, query)?;
+
+        if (limited.len() as u32) >= limit || walks_to_full_range {
+            Ok(Some(limited))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Coverage check for `ByIndex` predicates. The index value range must

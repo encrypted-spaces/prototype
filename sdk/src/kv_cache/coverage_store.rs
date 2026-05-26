@@ -110,6 +110,82 @@ impl CoverageStore {
             .range(start.to_vec()..end.to_vec())
             .filter_map(|(k, v)| v.as_ref().map(|v| (k, v)))
     }
+
+    /// Largest covered prefix of `[start, end)` walking forward from
+    /// `start`. Returns the byte position where coverage first stops
+    /// (clamped to `end`). If `start` itself isn't covered, returns
+    /// `start` (no prefix is covered).
+    pub fn covered_prefix_end(&self, start: &[u8], end: &[u8]) -> Vec<u8> {
+        if start >= end {
+            return end.to_vec();
+        }
+        // The interval containing or immediately preceding `start`.
+        let Some((s, e)) = self.intervals.range(..=start.to_vec()).next_back() else {
+            return start.to_vec();
+        };
+        if s.as_slice() > start || e.as_slice() <= start {
+            return start.to_vec();
+        }
+        // Walk forward as long as adjacent intervals continue the run.
+        let mut covered_end = e.clone();
+        while covered_end.as_slice() < end {
+            match self.intervals.get(&covered_end) {
+                Some(next_end) => covered_end = next_end.clone(),
+                None => break,
+            }
+        }
+        if covered_end.as_slice() > end {
+            end.to_vec()
+        } else {
+            covered_end
+        }
+    }
+
+    /// Largest covered suffix of `[start, end)` walking backward from `end`.
+    /// Returns the byte position where coverage begins (clamped to `start`).
+    /// If the byte just before `end` isn't covered, returns `end` (no suffix
+    /// is covered).
+    pub fn covered_suffix_start(&self, start: &[u8], end: &[u8]) -> Vec<u8> {
+        if start >= end {
+            return start.to_vec();
+        }
+        // The interval immediately before `end` (covers byte end-1 if any
+        // interval starting at or before end-1 ends at or after end).
+        let last_byte_bound = end.to_vec();
+        let Some((s, e)) = self
+            .intervals
+            .range(..last_byte_bound)
+            .next_back()
+        else {
+            return end.to_vec();
+        };
+        if e.as_slice() < end {
+            return end.to_vec();
+        }
+        // Walk backward as long as adjacent intervals continue the run.
+        let mut covered_start = s.clone();
+        loop {
+            let Some((prev_start, prev_end)) = self
+                .intervals
+                .range(..covered_start.clone())
+                .next_back()
+            else {
+                break;
+            };
+            if prev_end.as_slice() < covered_start.as_slice() {
+                break;
+            }
+            covered_start = prev_start.clone();
+            if covered_start.as_slice() <= start {
+                break;
+            }
+        }
+        if covered_start.as_slice() < start {
+            start.to_vec()
+        } else {
+            covered_start
+        }
+    }
 }
 
 #[cfg(test)]
@@ -220,5 +296,64 @@ mod tests {
         cs.put_point(s(b"c"), Some(s(b"3")));
         let got: Vec<_> = cs.iter_range_present(b"a", b"c").map(|(k, _)| k.clone()).collect();
         assert_eq!(got, vec![s(b"a"), s(b"b")]);
+    }
+
+    #[test]
+    fn covered_prefix_end_full_coverage() {
+        let mut cs = CoverageStore::new();
+        cs.extend_coverage(s(b"a"), s(b"z"));
+        assert_eq!(cs.covered_prefix_end(b"a", b"z"), s(b"z"));
+        assert_eq!(cs.covered_prefix_end(b"b", b"y"), s(b"y"));
+    }
+
+    #[test]
+    fn covered_prefix_end_partial() {
+        let mut cs = CoverageStore::new();
+        cs.extend_coverage(s(b"a"), s(b"m"));
+        // Walk [a, z) — covered through m, then gap.
+        assert_eq!(cs.covered_prefix_end(b"a", b"z"), s(b"m"));
+    }
+
+    #[test]
+    fn covered_prefix_end_runs_through_adjacent_intervals() {
+        let mut cs = CoverageStore::new();
+        // Two adjacent intervals merge on extend, so to test the walk-through
+        // pattern we construct a disjoint case and a contained case.
+        cs.extend_coverage(s(b"a"), s(b"f"));
+        cs.extend_coverage(s(b"m"), s(b"z"));
+        // [a, p) — covered through f, then gap before m.
+        assert_eq!(cs.covered_prefix_end(b"a", b"p"), s(b"f"));
+    }
+
+    #[test]
+    fn covered_prefix_end_start_not_covered() {
+        let mut cs = CoverageStore::new();
+        cs.extend_coverage(s(b"m"), s(b"z"));
+        // start `a` is uncovered → returns start.
+        assert_eq!(cs.covered_prefix_end(b"a", b"z"), s(b"a"));
+    }
+
+    #[test]
+    fn covered_suffix_start_full_coverage() {
+        let mut cs = CoverageStore::new();
+        cs.extend_coverage(s(b"a"), s(b"z"));
+        assert_eq!(cs.covered_suffix_start(b"a", b"z"), s(b"a"));
+        assert_eq!(cs.covered_suffix_start(b"b", b"y"), s(b"b"));
+    }
+
+    #[test]
+    fn covered_suffix_start_partial() {
+        let mut cs = CoverageStore::new();
+        cs.extend_coverage(s(b"m"), s(b"z"));
+        // Walk back from `z` — covered down to `m`, then gap.
+        assert_eq!(cs.covered_suffix_start(b"a", b"z"), s(b"m"));
+    }
+
+    #[test]
+    fn covered_suffix_start_end_not_covered() {
+        let mut cs = CoverageStore::new();
+        cs.extend_coverage(s(b"a"), s(b"f"));
+        // The byte just before `z` is uncovered → returns end.
+        assert_eq!(cs.covered_suffix_start(b"a", b"z"), s(b"z"));
     }
 }
