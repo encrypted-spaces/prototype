@@ -718,28 +718,28 @@ impl<T, W> SelectBuilder<T, W> {
         let fk_col = strip_table_prefix(&join.fk_col);
         let pk_col = strip_table_prefix(&join.pk_col);
 
-        // Cache participation in joins is currently scoped to PK joins:
-        // `pk_col` must be the joined-side id field. Other shapes fall
-        // through to the server.
-        if pk_col != ID_FIELD {
-            return Ok(None);
-        }
-
-        // Distinct integer FK values from the decrypted main rows.
-        let mut fk_values: Vec<i64> = Vec::new();
+        // Distinct FK values from the decrypted main rows. We pass them as
+        // generic serde_json::Values so `lookup_joined_rows` can dispatch
+        // on `pk_col` (PK vs indexed-column join).
+        let mut fk_values: Vec<serde_json::Value> = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         for row in &main_rows {
-            if let Some(fk) = row.get(fk_col).and_then(|v| v.as_i64()) {
-                if seen.insert(fk) {
-                    fk_values.push(fk);
-                }
+            let Some(value) = row.get(fk_col) else {
+                continue;
+            };
+            if value.is_null() {
+                continue;
+            }
+            if seen.insert(value.to_string()) {
+                fk_values.push(value.clone());
             }
         }
 
+        let schemas = self.collect_schemas();
         let joined_result = self.space.with_state(|state| {
             state
                 .kv_cache
-                .lookup_joined_rows_by_id(joined_table, &fk_values)
+                .lookup_joined_rows(joined_table, pk_col, &fk_values, &schemas)
         })?;
         let CacheResult::Hit(mut joined_rows) = joined_result else {
             return Ok(None);

@@ -1,13 +1,17 @@
 //! [`KvCache`] — anchored, splice-updated key/value cache for SDK queries.
 
+use std::collections::{BTreeSet, HashMap};
+
 use encrypted_spaces_backend::error::{Result, SdkError};
 use encrypted_spaces_backend::merk_storage::proofs::VerifiedRows;
 use encrypted_spaces_backend::merk_storage::{
-    determine_query_strategy, execute_query, group_columns_into_rows, reassemble_row,
-    QueryStrategy, RowReadSource,
+    determine_query_strategy, execute_query, group_columns_into_rows, parse_key, reassemble_row,
+    ParsedKey, QueryStrategy, RowReadSource, ID_FIELD,
 };
-use encrypted_spaces_backend::query::{Predicate, Query};
+use encrypted_spaces_backend::query::{Predicate, Query, QueryParam};
+use encrypted_spaces_backend::schema::Schema;
 use encrypted_spaces_changelog_core::{prefix_successor, ReadOp};
+use encrypted_spaces_backend::merk_storage::keys::query_param_to_tuple_element;
 use encrypted_spaces_storage_encoding::keys;
 
 use super::coverage_store::CoverageStore;
@@ -162,12 +166,21 @@ impl KvCache {
             storage: &self.storage,
         };
         let strategy = determine_query_strategy(&reader, query)?;
-        let required = match required_ranges_for_strategy(&strategy, &query.table)? {
-            Some(r) => r,
-            // ByIndex (and any other shape we don't model here) falls through
-            // to the server — narrowly scoped first cut.
-            None => return Ok(CacheResult::Miss),
-        };
+
+        // ByIndex needs a two-phase coverage check: first the index range,
+        // then scan the index to find matching row ids and confirm each
+        // row range is also covered.
+        if let QueryStrategy::ByIndex { predicate } = &strategy {
+            match self.indexed_predicate_coverage(&query.table, predicate)? {
+                IndexedCoverage::Covered => {
+                    let rows = execute_query(&reader, query)?;
+                    return Ok(CacheResult::Hit(rows));
+                }
+                IndexedCoverage::Missing => return Ok(CacheResult::Miss),
+            }
+        }
+
+        let required = required_ranges_for_strategy(&strategy, &query.table)?;
         if !required
             .iter()
             .all(|(s, e)| self.storage.covers_range(s, e))
@@ -178,12 +191,104 @@ impl KvCache {
         Ok(CacheResult::Hit(rows))
     }
 
-    /// Look up joined-table rows by FK value for a PK join (joined-side
-    /// `pk_col == "id"`). Returns `Hit(rows)` only if every fk value's row
-    /// range is fully covered in the cache; otherwise `Miss`. The caller
-    /// has already produced the distinct FK values from the main-table
-    /// rows returned by [`try_select`].
-    pub fn lookup_joined_rows_by_id(
+    /// Coverage check for `ByIndex` predicates. The index value range must
+    /// be fully covered, and every row id the index points at must have
+    /// its row range fully covered too. Range/comparison operators
+    /// (Gt/Lt/Between/In) report Missing for now — those need ordered
+    /// index scans we don't model yet.
+    fn indexed_predicate_coverage(
+        &self,
+        table: &str,
+        predicate: &Predicate,
+    ) -> Result<IndexedCoverage> {
+        use encrypted_spaces_backend::query::ComparisonOperator;
+        let values: &[QueryParam] = match predicate.operator {
+            ComparisonOperator::Equal => &predicate.values[..1.min(predicate.values.len())],
+            ComparisonOperator::In => &predicate.values,
+            _ => return Ok(IndexedCoverage::Missing),
+        };
+        if values.is_empty() {
+            return Ok(IndexedCoverage::Missing);
+        }
+
+        let mut row_ids: BTreeSet<i64> = BTreeSet::new();
+        for value in values {
+            let tuple_element = query_param_to_tuple_element(value);
+            let index_prefix = keys::index_value_prefix(table, &predicate.column, tuple_element)
+                .map_err(|e| SdkError::InvalidQuery(format!("Invalid index value: {e}")))?;
+            let index_end = prefix_succ_required(&index_prefix)?;
+            if !self.storage.covers_range(&index_prefix, &index_end) {
+                return Ok(IndexedCoverage::Missing);
+            }
+            for (key, _) in self.storage.iter_prefix_present(&index_prefix) {
+                if let Ok(ParsedKey::Index { row_id, .. }) = parse_key(key) {
+                    row_ids.insert(row_id);
+                }
+            }
+        }
+
+        for row_id in &row_ids {
+            let row_key = keys::row_key(table, *row_id);
+            let row_end = prefix_succ_required(&row_key)?;
+            if !self.storage.covers_range(&row_key, &row_end) {
+                return Ok(IndexedCoverage::Missing);
+            }
+        }
+
+        Ok(IndexedCoverage::Covered)
+    }
+
+    /// Look up joined-table rows for one or more FK values. Dispatches on
+    /// `pk_col`:
+    ///
+    /// - `pk_col == "id"` — PK join. Each FK must be an integer; each
+    ///   matching row's range must be fully covered.
+    /// - `pk_col` is indexed on the joined table — indexed-column join.
+    ///   For each FK, both the index value range and every matching row's
+    ///   range must be fully covered.
+    /// - Otherwise — `Miss` (the SDK will fetch from the server, which is
+    ///   also the only path the cache could be wrong).
+    pub fn lookup_joined_rows(
+        &self,
+        joined_table: &str,
+        pk_col: &str,
+        fk_values: &[serde_json::Value],
+        schemas: &HashMap<String, Schema>,
+    ) -> Result<CacheResult<Vec<serde_json::Value>>> {
+        if fk_values.is_empty() {
+            return Ok(CacheResult::Hit(Vec::new()));
+        }
+
+        if pk_col == ID_FIELD {
+            let mut ids: Vec<i64> = Vec::with_capacity(fk_values.len());
+            for v in fk_values {
+                let Some(id) = v.as_i64() else {
+                    return Ok(CacheResult::Miss);
+                };
+                ids.push(id);
+            }
+            return self.lookup_joined_rows_by_id(joined_table, &ids);
+        }
+
+        let Some(schema) = schemas.get(joined_table) else {
+            return Ok(CacheResult::Miss);
+        };
+        if !schema.indexed_columns().contains(&pk_col) {
+            return Ok(CacheResult::Miss);
+        }
+
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+        let mut seen_ids: BTreeSet<i64> = BTreeSet::new();
+        for fk in fk_values {
+            match self.lookup_indexed_join_value(joined_table, pk_col, fk, &mut seen_ids)? {
+                CacheResult::Hit(more) => rows.extend(more),
+                CacheResult::Miss => return Ok(CacheResult::Miss),
+            }
+        }
+        Ok(CacheResult::Hit(rows))
+    }
+
+    fn lookup_joined_rows_by_id(
         &self,
         joined_table: &str,
         fk_values: &[i64],
@@ -204,6 +309,56 @@ impl KvCache {
         }
         Ok(CacheResult::Hit(rows))
     }
+
+    /// Resolve a single indexed-column FK value: check coverage of the
+    /// index range, then enumerate matching row_ids and read each row
+    /// (with its own coverage check). Dedupes against `seen_ids` so a row
+    /// matching multiple FK values isn't emitted twice.
+    fn lookup_indexed_join_value(
+        &self,
+        joined_table: &str,
+        pk_col: &str,
+        fk: &serde_json::Value,
+        seen_ids: &mut BTreeSet<i64>,
+    ) -> Result<CacheResult<Vec<serde_json::Value>>> {
+        let param = QueryParam::from(fk.clone());
+        let tuple_element = query_param_to_tuple_element(&param);
+        let index_prefix = keys::index_value_prefix(joined_table, pk_col, tuple_element)
+            .map_err(|e| SdkError::InvalidQuery(format!("Invalid index value: {e}")))?;
+        let index_end = prefix_succ_required(&index_prefix)?;
+        if !self.storage.covers_range(&index_prefix, &index_end) {
+            return Ok(CacheResult::Miss);
+        }
+
+        // Collect matching row ids from the cached index entries.
+        let matching_ids: Vec<i64> = self
+            .storage
+            .iter_prefix_present(&index_prefix)
+            .filter_map(|(key, _)| match parse_key(key).ok()? {
+                ParsedKey::Index { row_id, .. } => Some(row_id),
+                _ => None,
+            })
+            .collect();
+
+        let reader = KvCacheReader {
+            storage: &self.storage,
+        };
+        let mut rows = Vec::with_capacity(matching_ids.len());
+        for row_id in matching_ids {
+            if !seen_ids.insert(row_id) {
+                continue;
+            }
+            let row_key = keys::row_key(joined_table, row_id);
+            let row_end = prefix_succ_required(&row_key)?;
+            if !self.storage.covers_range(&row_key, &row_end) {
+                return Ok(CacheResult::Miss);
+            }
+            if let Some(row) = reader.get_row_by_id(joined_table, row_id)? {
+                rows.push(row);
+            }
+        }
+        Ok(CacheResult::Hit(rows))
+    }
 }
 
 /// Borrowed `RowReadSource` over a `CoverageStore`. The cache delegates
@@ -213,19 +368,22 @@ struct KvCacheReader<'a> {
     storage: &'a CoverageStore,
 }
 
+enum IndexedCoverage {
+    Covered,
+    Missing,
+}
+
 type KeyRange = (Vec<u8>, Vec<u8>);
 
-/// Byte ranges that a given strategy reads from the row-key space. Returns
-/// `None` for strategies the cache cannot bound up-front (currently `ByIndex`).
-fn required_ranges_for_strategy(
-    strategy: &QueryStrategy,
-    table: &str,
-) -> Result<Option<Vec<KeyRange>>> {
+/// Byte ranges a non-`ByIndex` strategy reads from the row-key space.
+/// `ByIndex` predicates are handled separately via
+/// [`KvCache::indexed_predicate_coverage`].
+fn required_ranges_for_strategy(strategy: &QueryStrategy, table: &str) -> Result<Vec<KeyRange>> {
     match strategy {
         QueryStrategy::ById(id) => {
             let start = keys::row_key(table, *id);
             let end = prefix_succ_required(&start)?;
-            Ok(Some(vec![(start, end)]))
+            Ok(vec![(start, end)])
         }
         QueryStrategy::ByIds(ids) => {
             let mut ranges = Vec::with_capacity(ids.len());
@@ -234,7 +392,7 @@ fn required_ranges_for_strategy(
                 let end = prefix_succ_required(&start)?;
                 ranges.push((start, end));
             }
-            Ok(Some(ranges))
+            Ok(ranges)
         }
         QueryStrategy::ByIdRange {
             start,
@@ -252,14 +410,14 @@ fn required_ranges_for_strategy(
                 Some(id) => keys::row_key(table, *id),
                 None => prefix_succ_required(&keys::row_prefix(table))?,
             };
-            Ok(Some(vec![(start_key, end_key)]))
+            Ok(vec![(start_key, end_key)])
         }
         QueryStrategy::TableScan => {
             let start = keys::row_prefix(table);
             let end = prefix_succ_required(&start)?;
-            Ok(Some(vec![(start, end)]))
+            Ok(vec![(start, end)])
         }
-        QueryStrategy::ByIndex { .. } => Ok(None),
+        QueryStrategy::ByIndex { .. } => Ok(Vec::new()),
     }
 }
 
@@ -325,17 +483,42 @@ impl<'a> RowReadSource for KvCacheReader<'a> {
 
     fn index_row_keys_for_predicate(
         &self,
-        _table_name: &str,
-        _predicate: &Predicate,
+        table_name: &str,
+        predicate: &Predicate,
     ) -> Result<Vec<Vec<u8>>> {
-        // ByIndex is currently routed to Miss by `try_select`, so this is
-        // unreachable on the hit path. If `execute_query` ever reaches this,
-        // the planner has diverged from `try_select`; fail loudly.
-        Err(SdkError::DatabaseError(
-            "KvCacheReader::index_row_keys_for_predicate called but try_select \
-             rejects indexed predicates"
-                .into(),
-        ))
+        use encrypted_spaces_backend::query::ComparisonOperator;
+        // Only Equal/In are supported on the cache side — Gt/Lt/Between
+        // need ordered range scans we don't yet model. `try_select`'s
+        // coverage gate (`indexed_predicate_coverage`) reports Missing for
+        // other operators, so callers never reach this path with one.
+        let values: &[QueryParam] = match predicate.operator {
+            ComparisonOperator::Equal => &predicate.values[..1.min(predicate.values.len())],
+            ComparisonOperator::In => &predicate.values,
+            _ => {
+                return Err(SdkError::DatabaseError(format!(
+                    "KvCacheReader: unsupported indexed predicate operator {:?}",
+                    predicate.operator
+                )));
+            }
+        };
+
+        let mut row_keys = Vec::new();
+        for value in values {
+            let tuple_element = query_param_to_tuple_element(value);
+            let index_prefix = keys::index_value_prefix(table_name, &predicate.column, tuple_element)
+                .map_err(|e| SdkError::InvalidQuery(format!("Invalid index value: {e}")))?;
+            for (key, _) in self
+                .storage
+                .iter_prefix_present(&index_prefix)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<Vec<_>>()
+            {
+                if let Ok(ParsedKey::Index { row_id, .. }) = parse_key(&key) {
+                    row_keys.push(keys::row_key(table_name, row_id));
+                }
+            }
+        }
+        Ok(row_keys)
     }
 
     fn iter_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
