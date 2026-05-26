@@ -466,7 +466,7 @@ fn assemble_join(
 ///
 /// Used when rows are served from a full-table cache hit that doesn't
 /// pre-filter by the predicate.
-fn row_matches_predicate(row: &serde_json::Value, pred: &Predicate) -> bool {
+pub(crate) fn row_matches_predicate(row: &serde_json::Value, pred: &Predicate) -> bool {
     let cell = row.get(&pred.column).unwrap_or(&serde_json::Value::Null);
 
     match pred.operator {
@@ -697,14 +697,14 @@ impl<T, W> SelectBuilder<T, W> {
         let mut main_query = self.query.clone();
         main_query.join = None;
         main_query.operation = QueryOperation::Select(Vec::new());
+        let schemas = self.collect_schemas();
         let main_result = self
             .space
-            .with_state(|state| state.kv_cache.try_select(&main_query))?;
+            .with_state(|state| state.kv_cache.try_select(&main_query, &schemas))?;
         let CacheResult::Hit(mut main_rows) = main_result else {
             return Ok(None);
         };
 
-        let schemas = self.collect_schemas();
         decrypt_table_rows(&mut main_rows, &self.query.table, &schemas, &self.space).await?;
 
         let Some(join) = &self.join else {
@@ -1433,7 +1433,8 @@ mod tests {
     /// range. Behavioral replacement for the old `is_table_complete`.
     fn cache_covers_full_table(space: &Space, table: &str) -> bool {
         let q = Query::new(table.to_string(), QueryOperation::Select(Vec::new()));
-        space.with_state(|s| matches!(s.kv_cache.try_select(&q), Ok(CacheResult::Hit(_))))
+        let schemas = space.with_state(|s| s.table_schemas.clone());
+        space.with_state(|s| matches!(s.kv_cache.try_select(&q, &schemas), Ok(CacheResult::Hit(_))))
     }
 
     #[tokio::test]

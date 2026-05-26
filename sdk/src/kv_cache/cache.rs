@@ -161,10 +161,28 @@ impl KvCache {
     /// The cache is schema-agnostic: non-id predicates always plan as
     /// `ByIndex` and resolve to `Miss`, so the eventual server fetch is the
     /// one that validates whether the referenced column is actually indexed.
-    pub fn try_select(&self, query: &Query) -> Result<CacheResult<Vec<serde_json::Value>>> {
+    pub fn try_select(
+        &self,
+        query: &Query,
+        schemas: &HashMap<String, Schema>,
+    ) -> Result<CacheResult<Vec<serde_json::Value>>> {
         let reader = KvCacheReader {
             storage: &self.storage,
         };
+
+        // Predicate-on-non-indexed-non-id-column would mis-plan as ByIndex
+        // (our reader's validate_column_indexed is schema-agnostic). Catch
+        // it here: route to the full-table fallback or Miss.
+        if let Some(pred) = &query.predicate {
+            if pred.column != ID_FIELD
+                && !schemas
+                    .get(&query.table)
+                    .is_some_and(|s| s.indexed_columns().contains(&pred.column.as_str()))
+            {
+                return self.full_table_fallback(query);
+            }
+        }
+
         let strategy = determine_query_strategy(&reader, query)?;
 
         // ByIndex needs a two-phase coverage check: first the index range,
@@ -176,7 +194,11 @@ impl KvCache {
                     let rows = execute_query(&reader, query)?;
                     return Ok(CacheResult::Hit(rows));
                 }
-                IndexedCoverage::Missing => return Ok(CacheResult::Miss),
+                IndexedCoverage::Missing => {
+                    // Bucket isn't cached; try whole-table fallback (Trevor's
+                    // FullTableFallbackOptions equivalent).
+                    return self.full_table_fallback(query);
+                }
             }
         }
 
@@ -198,6 +220,36 @@ impl KvCache {
             }
         }
         Ok(CacheResult::Miss)
+    }
+
+    /// Whole-table fallback. If the cache has full coverage of the table's
+    /// row-key range, scan every row, filter client-side by the query's
+    /// predicate, and apply order/cursor/limit/projection. Matches Trevor's
+    /// `FullTableFallbackOptions` path.
+    fn full_table_fallback(
+        &self,
+        query: &Query,
+    ) -> Result<CacheResult<Vec<serde_json::Value>>> {
+        let start = keys::row_prefix(&query.table);
+        let end = prefix_succ_required(&start)?;
+        if !self.storage.covers_range(&start, &end) {
+            return Ok(CacheResult::Miss);
+        }
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = self
+            .storage
+            .iter_range_present(&start, &end)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let rows = group_columns_into_rows(&entries)?;
+        let matching: Vec<serde_json::Value> = match &query.predicate {
+            Some(pred) => rows
+                .into_iter()
+                .filter(|row| crate::table::row_matches_predicate(row, pred))
+                .collect(),
+            None => rows,
+        };
+        let limited = process_query_results(matching, query)?;
+        Ok(CacheResult::Hit(limited))
     }
 
     /// Limit-aware partial-coverage path. Reads the covered prefix/suffix
@@ -672,7 +724,7 @@ mod tests {
     fn miss_when_empty() {
         let cache = KvCache::new([0; 32]);
         let result = cache
-            .try_select(&select_all_query(TABLE))
+            .try_select(&select_all_query(TABLE), &HashMap::new())
             .unwrap();
         assert!(matches!(result, CacheResult::Miss));
     }
@@ -689,7 +741,7 @@ mod tests {
         );
         cache.apply_select([0; 32], &verified);
         let result = cache
-            .try_select(&select_all_query(TABLE))
+            .try_select(&select_all_query(TABLE), &HashMap::new())
             .unwrap();
         match result {
             CacheResult::Hit(rows) => {
@@ -713,7 +765,7 @@ mod tests {
         );
         cache.apply_select([0; 32], &verified);
         let result = cache
-            .try_select(&select_by_id(TABLE, 2))
+            .try_select(&select_by_id(TABLE, 2), &HashMap::new())
             .unwrap();
         match result {
             CacheResult::Hit(rows) => {
@@ -742,7 +794,7 @@ mod tests {
         };
         cache.apply_select([0; 32], &verified);
         let result = cache
-            .try_select(&select_by_id(TABLE, 2))
+            .try_select(&select_by_id(TABLE, 2), &HashMap::new())
             .unwrap();
         assert!(matches!(result, CacheResult::Miss));
     }
@@ -789,7 +841,7 @@ mod tests {
         // Splicing with the original commitment must report "not applied".
         let applied = cache.apply_select([1; 32], &verified);
         assert!(!applied, "splice must drop when anchor has advanced");
-        let result = cache.try_select(&select_all_query(TABLE)).unwrap();
+        let result = cache.try_select(&select_all_query(TABLE), &HashMap::new()).unwrap();
         assert!(matches!(result, CacheResult::Miss));
     }
 
@@ -801,7 +853,7 @@ mod tests {
         cache.reanchor([2; 32]);
         assert_eq!(cache.anchor(), &[2; 32]);
         let result = cache
-            .try_select(&select_all_query(TABLE))
+            .try_select(&select_all_query(TABLE), &HashMap::new())
             .unwrap();
         assert!(matches!(result, CacheResult::Miss));
     }
@@ -822,7 +874,169 @@ mod tests {
             order: Order::Asc,
             limit: None,
         };
-        let result = cache.try_select(&q).unwrap();
+        let result = cache.try_select(&q, &HashMap::new()).unwrap();
         assert!(matches!(result, CacheResult::Miss));
+    }
+
+    fn schema_with_columns(table: &str, columns: Vec<(&str, bool, bool)>) -> Schema {
+        use encrypted_spaces_backend::schema::{ColumnDefinition, ColumnType};
+        Schema {
+            name: table.to_string(),
+            columns: columns
+                .into_iter()
+                .map(|(name, plaintext, indexed)| ColumnDefinition {
+                    name: name.to_string(),
+                    column_type: ColumnType::Integer,
+                    plaintext,
+                    indexed,
+                })
+                .collect(),
+            auto_increment: true,
+        }
+    }
+
+    #[test]
+    fn full_table_fallback_filters_non_indexed_predicate_when_table_covered() {
+        // Schema: id (plaintext, not indexed), value (plaintext, NOT indexed).
+        let schema = schema_with_columns(
+            TABLE,
+            vec![("id", true, false), ("value", true, false)],
+        );
+        let mut schemas = HashMap::new();
+        schemas.insert(TABLE.to_string(), schema);
+
+        let mut cache = KvCache::new([0; 32]);
+        let verified = full_table_verified(
+            TABLE,
+            &[
+                (1, "value", serde_json::json!(10)),
+                (2, "value", serde_json::json!(20)),
+                (3, "value", serde_json::json!(20)),
+            ],
+        );
+        cache.apply_select([0; 32], &verified);
+
+        // WHERE value = 20 — non-indexed predicate, full table covered.
+        // Fallback scans + filters client-side.
+        let q = Query {
+            table: TABLE.to_string(),
+            operation: QueryOperation::Select(Vec::new()),
+            predicate: Some(Predicate {
+                column: "value".to_string(),
+                operator: ComparisonOperator::Equal,
+                values: vec![QueryParam::Integer(20)],
+                cursor_id: None,
+            }),
+            join: None,
+            order: Order::Asc,
+            limit: None,
+        };
+        let result = cache.try_select(&q, &schemas).unwrap();
+        match result {
+            CacheResult::Hit(rows) => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0].get("id").and_then(|v| v.as_i64()), Some(2));
+                assert_eq!(rows[1].get("id").and_then(|v| v.as_i64()), Some(3));
+            }
+            CacheResult::Miss => panic!("expected Hit via full-table fallback"),
+        }
+    }
+
+    #[test]
+    fn full_table_fallback_misses_when_table_not_covered() {
+        let schema = schema_with_columns(
+            TABLE,
+            vec![("id", true, false), ("value", true, false)],
+        );
+        let mut schemas = HashMap::new();
+        schemas.insert(TABLE.to_string(), schema);
+
+        let cache = KvCache::new([0; 32]); // empty
+        let q = Query {
+            table: TABLE.to_string(),
+            operation: QueryOperation::Select(Vec::new()),
+            predicate: Some(Predicate {
+                column: "value".to_string(),
+                operator: ComparisonOperator::Equal,
+                values: vec![QueryParam::Integer(20)],
+                cursor_id: None,
+            }),
+            join: None,
+            order: Order::Asc,
+            limit: None,
+        };
+        let result = cache.try_select(&q, &schemas).unwrap();
+        assert!(matches!(result, CacheResult::Miss));
+    }
+
+    #[test]
+    fn limit_with_partial_prefix_coverage_asc_hits() {
+        // Cache covers the table prefix through row 1. limit(1) Asc
+        // satisfies inside the covered prefix even though rows >= 2 are
+        // unknown.
+        let mut cache = KvCache::new([0; 32]);
+        let table_start = keys::row_prefix(TABLE);
+        let row1_key = keys::row_key(TABLE, 1);
+        let row1_end = prefix_successor(&row1_key).unwrap();
+        let verified = VerifiedRows {
+            main_rows: Vec::new(),
+            rows_by_table: HashMap::new(),
+            kv_pairs: vec![col_kv(TABLE, 1, "text", serde_json::json!("first"))],
+            read_ops: vec![ReadOp::Range {
+                start: table_start,
+                end: row1_end,
+            }],
+        };
+        cache.apply_select([0; 32], &verified);
+
+        let q = Query {
+            table: TABLE.to_string(),
+            operation: QueryOperation::Select(Vec::new()),
+            predicate: None,
+            join: None,
+            order: Order::Asc,
+            limit: Some(1),
+        };
+        let result = cache.try_select(&q, &HashMap::new()).unwrap();
+        match result {
+            CacheResult::Hit(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get("id").and_then(|v| v.as_i64()), Some(1));
+            }
+            CacheResult::Miss => panic!("limit(1) should hit on covered prefix"),
+        }
+    }
+
+    #[test]
+    fn limit_with_insufficient_prefix_coverage_misses() {
+        // Cache covers table prefix through row 1, but limit asks for 2.
+        let mut cache = KvCache::new([0; 32]);
+        let table_start = keys::row_prefix(TABLE);
+        let row1_key = keys::row_key(TABLE, 1);
+        let row1_end = prefix_successor(&row1_key).unwrap();
+        let verified = VerifiedRows {
+            main_rows: Vec::new(),
+            rows_by_table: HashMap::new(),
+            kv_pairs: vec![col_kv(TABLE, 1, "text", serde_json::json!("first"))],
+            read_ops: vec![ReadOp::Range {
+                start: table_start,
+                end: row1_end,
+            }],
+        };
+        cache.apply_select([0; 32], &verified);
+
+        let q = Query {
+            table: TABLE.to_string(),
+            operation: QueryOperation::Select(Vec::new()),
+            predicate: None,
+            join: None,
+            order: Order::Asc,
+            limit: Some(2),
+        };
+        let result = cache.try_select(&q, &HashMap::new()).unwrap();
+        assert!(
+            matches!(result, CacheResult::Miss),
+            "limit(2) should miss when only 1 row covered"
+        );
     }
 }
