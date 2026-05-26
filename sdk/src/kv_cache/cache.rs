@@ -177,6 +177,33 @@ impl KvCache {
         let rows = execute_query(&reader, query)?;
         Ok(CacheResult::Hit(rows))
     }
+
+    /// Look up joined-table rows by FK value for a PK join (joined-side
+    /// `pk_col == "id"`). Returns `Hit(rows)` only if every fk value's row
+    /// range is fully covered in the cache; otherwise `Miss`. The caller
+    /// has already produced the distinct FK values from the main-table
+    /// rows returned by [`try_select`].
+    pub fn lookup_joined_rows_by_id(
+        &self,
+        joined_table: &str,
+        fk_values: &[i64],
+    ) -> Result<CacheResult<Vec<serde_json::Value>>> {
+        let reader = KvCacheReader {
+            storage: &self.storage,
+        };
+        let mut rows = Vec::with_capacity(fk_values.len());
+        for &fk in fk_values {
+            let start = keys::row_key(joined_table, fk);
+            let end = prefix_succ_required(&start)?;
+            if !self.storage.covers_range(&start, &end) {
+                return Ok(CacheResult::Miss);
+            }
+            if let Some(row) = reader.get_row_by_id(joined_table, fk)? {
+                rows.push(row);
+            }
+        }
+        Ok(CacheResult::Hit(rows))
+    }
 }
 
 /// Borrowed `RowReadSource` over a `CoverageStore`. The cache delegates
