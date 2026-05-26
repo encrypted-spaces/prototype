@@ -883,11 +883,6 @@ mod tests {
 
     // -- Cache and broadcast tests --------------------------------------------
 
-    // Tests below this point probe the old row-level cache's internal
-    // structures (row_ids, try_query, get_row). The KvCache exposes hit/miss
-    // through `try_select` instead, so these tests are gated out until they
-    // are rewritten against the new cache API.
-    #[cfg(any())]
     #[tokio::test]
     async fn test_parent_insert_caches_committed_list_number() -> Result<()> {
         // Populate a complete empty-table cache first so the local insert has
@@ -921,28 +916,11 @@ mod tests {
             .execute()
             .await?;
 
-        let cached_list_number = space.with_state(|state| {
-            state
-                .cache
-                .get_row(TABLE, row_id)
-                .and_then(|row| row.get(COL))
-                .and_then(|value| value.as_i64())
-        });
-        assert!(
-            cached_list_number.is_some_and(|list_number| list_number > 0),
-            "cached parent row must have allocated list_number, got {cached_list_number:?}"
-        );
-
-        let cached_rows =
-            space.with_state_mut(|state| state.cache.try_query(TABLE, &[], &[row_id]));
-        assert!(
-            cached_rows.as_ref().is_some_and(|rows| {
-                rows.iter()
-                    .any(|row| row.get("id").and_then(|value| value.as_i64()) == Some(row_id))
-            }),
-            "inserted parent row must remain directly cache-addressable"
-        );
-
+        // The cache splice from the insert puts the assigned list_number
+        // into the parent row's column. A subsequent select-by-id must
+        // therefore return the allocated list_number (not the placeholder 0
+        // the SDK submitted in the insert query).
+        //
         // Re-selecting must keep returning the allocated list_number, not the
         // placeholder 0 from the submitted query.
         let rows: Vec<Row> = space
@@ -960,7 +938,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(any())]
     #[tokio::test]
     async fn test_parent_insert_updates_indexed_where_eq_bucket() -> Result<()> {
         // Regression test: inserting a parent row with a List column must
@@ -1037,24 +1014,17 @@ mod tests {
             .execute()
             .await?;
 
-        let cached_ids = space.with_state(|state| state.cache.row_ids("indexed_list_table"));
-        assert!(cached_ids.contains(&first_id));
-        assert!(cached_ids.contains(&second_id));
-        assert!(
-            cached_ids.contains(&unrelated_id),
-            "unrelated cached rows must survive a List-column parent insert"
-        );
-        let second_list_number = space.with_state(|state| {
-            state
-                .cache
-                .get_row("indexed_list_table", second_id)
-                .and_then(|row| row.get("items"))
-                .and_then(|value| value.as_i64())
-        });
-        assert!(
-            second_list_number.is_some_and(|list_number| list_number > 0),
-            "cached inserted row must have allocated list_number, got {second_list_number:?}"
-        );
+        // Functional: the bucket select below covers what the old probes
+        // implied — that the new parent row carries an allocated list_number
+        // and that the unrelated bucket's rows survived the insert splice.
+        let unrelated_after: Vec<IndexedRow> = space
+            .table::<IndexedRow>("indexed_list_table")
+            .select()
+            .where_eq("category", 7)
+            .all()
+            .await?;
+        assert_eq!(unrelated_after.len(), 1);
+        assert_eq!(unrelated_after[0].id, Some(unrelated_id));
 
         let rows: Vec<IndexedRow> = space
             .table::<IndexedRow>("indexed_list_table")
@@ -1082,29 +1052,6 @@ mod tests {
         i64::from_be_bytes(key.try_into().expect("list keys are always 8 bytes"))
     }
 
-    // Helpers that probe the old row-level cache by row_id; the KvCache has
-    // no equivalent. Tests using them are gated above.
-    #[cfg(any())]
-    fn cached_list_row(space: &Space, row_id: i64) -> serde_json::Value {
-        space
-            .with_state(|state| state.cache.get_row("_lists", row_id).cloned())
-            .unwrap_or_else(|| panic!("expected _lists row {row_id} to be cached"))
-    }
-
-    #[cfg(any())]
-    fn cached_i64(row: &serde_json::Value, column: &str) -> i64 {
-        row.get(column)
-            .and_then(|value| value.as_i64())
-            .unwrap_or_else(|| panic!("expected cached column {column} to be i64"))
-    }
-
-    #[cfg(any())]
-    fn cached_string(row: &serde_json::Value, column: &str) -> String {
-        row.get(column)
-            .and_then(|value| value.as_str())
-            .unwrap_or_else(|| panic!("expected cached column {column} to be string"))
-            .to_string()
-    }
 
     #[tokio::test]
     async fn test_fast_forward_reports_same_change_id_state_divergence() -> Result<()> {
@@ -1178,34 +1125,23 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(any())]
+    // The four `_lists_cache_not_stale_after_*` tests previously probed
+    // `state.cache.row_ids("_lists")` and per-row prev/next/value cells
+    // directly. Under the KvCache, "not stale" is observed by the
+    // post-operation `list.get_all()` returning the expected sequence —
+    // any stale cell would produce wrong values or wrong ordering. We keep
+    // the same scenarios; the get_all assertion is the regression gate.
+
     #[tokio::test]
     async fn test_lists_cache_not_stale_after_append() -> Result<()> {
         let (space, row_id) = create_space_with_list().await?;
         let list: List<String> = space.list(TABLE, row_id, COL);
 
-        let first_key = list.append(&"first".to_string()).await?;
-        let first_id = list_row_id(&first_key);
+        list.append(&"first".to_string()).await?;
         let items = list.get_all().await?;
         assert_eq!(items.len(), 1);
 
-        let second_key = list.append(&"second".to_string()).await?;
-        let second_id = list_row_id(&second_key);
-        let cached_ids = space.with_state(|state| state.cache.row_ids("_lists"));
-        assert!(cached_ids.contains(&first_id));
-        assert!(cached_ids.contains(&second_id));
-        assert_eq!(
-            cached_ids.len(),
-            2,
-            "append should add the new _lists row without clearing existing cached rows"
-        );
-
-        let first_row = cached_list_row(&space, first_id);
-        let second_row = cached_list_row(&space, second_id);
-        assert_eq!(cached_i64(&first_row, "next_id"), second_id);
-        assert_eq!(cached_i64(&second_row, "prev_id"), first_id);
-        assert_eq!(cached_i64(&second_row, "next_id"), 0);
-
+        list.append(&"second".to_string()).await?;
         let items = list.get_all().await?;
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].value, "first");
@@ -1213,38 +1149,18 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(any())]
     #[tokio::test]
     async fn test_lists_cache_not_stale_after_delete() -> Result<()> {
         let (space, row_id) = create_space_with_list().await?;
         let list: List<String> = space.list(TABLE, row_id, COL);
 
-        let first_key = list.append(&"first".to_string()).await?;
+        list.append(&"first".to_string()).await?;
         let middle_key = list.append(&"middle".to_string()).await?;
-        let last_key = list.append(&"last".to_string()).await?;
-        let first_id = list_row_id(&first_key);
-        let middle_id = list_row_id(&middle_key);
-        let last_id = list_row_id(&last_key);
-
+        list.append(&"last".to_string()).await?;
         let items = list.get_all().await?;
         assert_eq!(items.len(), 3);
 
         list.delete_by_key(&middle_key).await?;
-        let cached_ids = space.with_state(|state| state.cache.row_ids("_lists"));
-        assert!(cached_ids.contains(&first_id));
-        assert!(!cached_ids.contains(&middle_id));
-        assert!(cached_ids.contains(&last_id));
-        assert_eq!(
-            cached_ids.len(),
-            2,
-            "delete should remove only the deleted _lists row"
-        );
-
-        let first_row = cached_list_row(&space, first_id);
-        let last_row = cached_list_row(&space, last_id);
-        assert_eq!(cached_i64(&first_row, "next_id"), last_id);
-        assert_eq!(cached_i64(&last_row, "prev_id"), first_id);
-
         let items = list.get_all().await?;
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].value, "first");
@@ -1252,77 +1168,32 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(any())]
     #[tokio::test]
     async fn test_lists_cache_not_stale_after_update() -> Result<()> {
         let (space, row_id) = create_space_with_list().await?;
         let list: List<String> = space.list(TABLE, row_id, COL);
 
         let key = list.append(&"original".to_string()).await?;
-        let id = list_row_id(&key);
         let items = list.get_all().await?;
         assert_eq!(items[0].value, "original");
-        let cached_before = cached_list_row(&space, id);
-        let value_before = cached_string(&cached_before, "value");
-        let list_number_before = cached_i64(&cached_before, "list_number");
-        let prev_before = cached_i64(&cached_before, "prev_id");
-        let next_before = cached_i64(&cached_before, "next_id");
 
         list.update_by_key(&key, &"modified".to_string()).await?;
-        let cached_ids = space.with_state(|state| state.cache.row_ids("_lists"));
-        assert_eq!(
-            cached_ids,
-            [id].into_iter().collect(),
-            "update should preserve the cached _lists row set"
-        );
-        let cached_after = cached_list_row(&space, id);
-        assert_ne!(
-            cached_string(&cached_after, "value"),
-            value_before,
-            "update should replace the cached _lists value"
-        );
-        assert_eq!(cached_i64(&cached_after, "list_number"), list_number_before);
-        assert_eq!(cached_i64(&cached_after, "prev_id"), prev_before);
-        assert_eq!(cached_i64(&cached_after, "next_id"), next_before);
-
         let items = list.get_all().await?;
         assert_eq!(items[0].value, "modified");
         Ok(())
     }
 
-    #[cfg(any())]
     #[tokio::test]
     async fn test_lists_cache_not_stale_after_insert_after_key() -> Result<()> {
         let (space, row_id) = create_space_with_list().await?;
         let list: List<String> = space.list(TABLE, row_id, COL);
 
         let key_a = list.append(&"A".to_string()).await?;
-        let key_c = list.append(&"C".to_string()).await?;
-        let id_a = list_row_id(&key_a);
-        let id_c = list_row_id(&key_c);
+        list.append(&"C".to_string()).await?;
         let items = list.get_all().await?;
         assert_eq!(items.len(), 2);
 
-        let key_b = list.insert_after_key(&key_a, &"B".to_string()).await?;
-        let id_b = list_row_id(&key_b);
-        let cached_ids = space.with_state(|state| state.cache.row_ids("_lists"));
-        assert!(cached_ids.contains(&id_a));
-        assert!(cached_ids.contains(&id_b));
-        assert!(cached_ids.contains(&id_c));
-        assert_eq!(
-            cached_ids.len(),
-            3,
-            "insert_after_key should add the new _lists row without clearing existing cached rows"
-        );
-
-        let row_a = cached_list_row(&space, id_a);
-        let row_b = cached_list_row(&space, id_b);
-        let row_c = cached_list_row(&space, id_c);
-        assert_eq!(cached_i64(&row_a, "next_id"), id_b);
-        assert_eq!(cached_i64(&row_b, "prev_id"), id_a);
-        assert_eq!(cached_i64(&row_b, "next_id"), id_c);
-        assert_eq!(cached_i64(&row_c, "prev_id"), id_b);
-
+        list.insert_after_key(&key_a, &"B".to_string()).await?;
         let items = list.get_all().await?;
         assert_eq!(items.len(), 3);
         assert_eq!(items[0].value, "A");
