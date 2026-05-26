@@ -109,7 +109,20 @@ impl KvCache {
     /// Ingest a verified server SELECT into the cache: each `(key, value)`
     /// becomes a point entry, every `ReadOp` extends coverage (or records an
     /// authenticated absence for single-key reads).
-    pub fn apply_select(&mut self, verified: &VerifiedRows) {
+    ///
+    /// `expected_anchor` is the data commitment the proof was verified
+    /// against. If the cache anchor has advanced since then (e.g. a
+    /// broadcast applied during the await), the splice is dropped — we
+    /// must never land data verified at an old root under a newer anchor.
+    /// Returns `true` if the splice was applied.
+    pub fn apply_select(
+        &mut self,
+        expected_anchor: DataCommitment,
+        verified: &VerifiedRows,
+    ) -> bool {
+        if self.anchor != expected_anchor {
+            return false;
+        }
         for (k, v) in &verified.kv_pairs {
             self.storage.put_point(k.clone(), Some(v.clone()));
         }
@@ -134,6 +147,7 @@ impl KvCache {
                 }
             }
         }
+        true
     }
 
     /// Try to answer `query` from the cache. Returns `Hit(rows)` if every
@@ -395,7 +409,7 @@ mod tests {
                 (2, "text", serde_json::json!("world")),
             ],
         );
-        cache.apply_select(&verified);
+        cache.apply_select([0; 32], &verified);
         let result = cache
             .try_select(&select_all_query(TABLE))
             .unwrap();
@@ -419,7 +433,7 @@ mod tests {
                 (2, "text", serde_json::json!("world")),
             ],
         );
-        cache.apply_select(&verified);
+        cache.apply_select([0; 32], &verified);
         let result = cache
             .try_select(&select_by_id(TABLE, 2))
             .unwrap();
@@ -448,7 +462,7 @@ mod tests {
                 end: row1_end,
             }],
         };
-        cache.apply_select(&verified);
+        cache.apply_select([0; 32], &verified);
         let result = cache
             .try_select(&select_by_id(TABLE, 2))
             .unwrap();
@@ -465,7 +479,7 @@ mod tests {
             kv_pairs: Vec::new(),
             read_ops: vec![ReadOp::Key(row_key.clone())],
         };
-        cache.apply_select(&verified);
+        cache.apply_select([0; 32], &verified);
         assert_eq!(cache.storage.get_point(&row_key), Some(&None));
     }
 
@@ -486,10 +500,26 @@ mod tests {
     }
 
     #[test]
+    fn apply_select_drops_splice_when_anchor_advanced() {
+        // Regression: a SELECT awaits the network, a broadcast lands during
+        // the await and advances the cache anchor. Splicing the stale proof
+        // would land old-root data under the new anchor.
+        let mut cache = KvCache::new([1; 32]);
+        let verified = full_table_verified(TABLE, &[(1, "text", serde_json::json!("hi"))]);
+        // Pretend the broadcast already advanced the anchor.
+        cache.advance_anchor([2; 32], CacheUpdate::new());
+        // Splicing with the original commitment must report "not applied".
+        let applied = cache.apply_select([1; 32], &verified);
+        assert!(!applied, "splice must drop when anchor has advanced");
+        let result = cache.try_select(&select_all_query(TABLE)).unwrap();
+        assert!(matches!(result, CacheResult::Miss));
+    }
+
+    #[test]
     fn reanchor_clears_storage() {
         let mut cache = KvCache::new([1; 32]);
         let verified = full_table_verified(TABLE, &[(1, "text", serde_json::json!("x"))]);
-        cache.apply_select(&verified);
+        assert!(cache.apply_select([1; 32], &verified));
         cache.reanchor([2; 32]);
         assert_eq!(cache.anchor(), &[2; 32]);
         let result = cache

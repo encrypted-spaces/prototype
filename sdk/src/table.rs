@@ -700,9 +700,13 @@ impl<T, W> SelectBuilder<T, W> {
             .await?;
 
         // Splice raw (encrypted) KV pairs + coverage into the cache before
-        // decrypting the rows for the caller.
+        // decrypting the rows for the caller. The cache's `apply_select`
+        // drops the splice if its anchor has advanced since we captured
+        // `commitment` above (a broadcast may have applied during the
+        // await), guarding against landing old-root data under a newer
+        // anchor.
         self.space
-            .with_state_mut(|state| state.kv_cache.apply_select(&verified));
+            .with_state_mut(|state| state.kv_cache.apply_select(commitment, &verified));
 
 
         let mut main_rows = verified.main_rows;
@@ -955,9 +959,6 @@ impl<T, W> UpdateBuilder<T, W> {
         };
         let completed = self.space.submit_and_complete(change).await?;
 
-        if let Some(writes) = &completed.sequential_writes {
-            self.space.splice_writes_to_cache(&completed.change, writes);
-        }
         Ok(completed.response.rows_affected as usize)
     }
 }
@@ -1016,9 +1017,6 @@ impl<T, W> DeleteBuilder<T, W> {
         };
         let completed = self.space.submit_and_complete(change).await?;
 
-        if let Some(writes) = &completed.sequential_writes {
-            self.space.splice_writes_to_cache(&completed.change, writes);
-        }
         Ok(completed.response.rows_affected as usize)
     }
 }
@@ -1155,7 +1153,6 @@ impl<T> InsertBuilder<T> {
         // Sequential append: derive the new row id from the verified
         // sequential writes (and warm the cache).
         if let Some(writes) = &completed.sequential_writes {
-            self.space.splice_writes_to_cache(&completed.change, writes);
             return crate::kv_cache::new_row_id_for_table(writes, &self.query.table, &schema)
                 .ok_or_else(|| {
                     SdkError::InsertError(format!(
@@ -1190,8 +1187,7 @@ impl<T> InsertBuilder<T> {
         // https://github.com/encrypted-spaces/prototype/issues/232.
         let writes = self
             .space
-            .validate_and_apply_change(&completed.change.entry, &completed.response)?;
-        self.space.splice_writes_to_cache(&completed.change, &writes);
+            .validate_and_apply_change(&completed.change, &completed.response)?;
         crate::kv_cache::new_row_id_for_table(&writes, &self.query.table, &schema).ok_or_else(
             || {
                 SdkError::InsertError(format!(

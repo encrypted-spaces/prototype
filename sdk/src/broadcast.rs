@@ -123,6 +123,5 @@ impl Space {
             return;
         }
 
-        self.splice_writes_to_cache(change, writes);
     }
 }

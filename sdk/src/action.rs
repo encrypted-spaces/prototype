@@ -118,7 +118,6 @@ impl Space {
             SdkError::InvalidQuery(format!("table '{table}' is not registered locally"))
         })?;
         if let Some(writes) = &completed.sequential_writes {
-            self.splice_writes_to_cache(&completed.change, writes);
             return crate::kv_cache::new_row_id_for_table(writes, &table, &schema).ok_or_else(|| {
                 SdkError::InsertError(format!(
                     "action '{action_name}' produced no new row id on table '{table}'"
@@ -138,8 +137,7 @@ impl Space {
         // `InsertBuilder::execute_as` — not a false success; the entry is proven.
         // Tracked in https://github.com/encrypted-spaces/prototype/issues/232.
         let writes =
-            self.validate_and_apply_change(&completed.change.entry, &completed.response)?;
-        self.splice_writes_to_cache(&completed.change, &writes);
+            self.validate_and_apply_change(&completed.change, &completed.response)?;
         crate::kv_cache::new_row_id_for_table(&writes, &table, &schema).ok_or_else(|| {
             SdkError::InsertError(format!(
                 "action '{action_name}' produced no new row id on table '{table}'"
@@ -184,9 +182,6 @@ impl Space {
 
         let response = self.transport.submit_change(&change, vec![]).await?;
         let completed = self.complete_submitted(change, response).await?;
-        if let Some(writes) = &completed.sequential_writes {
-            self.splice_writes_to_cache(&completed.change, writes);
-        }
         Ok(completed.response.rows_affected as usize)
     }
 
@@ -270,9 +265,6 @@ impl Space {
 
         let response = self.transport.submit_change(&change, vec![]).await?;
         let completed = self.complete_submitted(change, response).await?;
-        if let Some(writes) = &completed.sequential_writes {
-            self.splice_writes_to_cache(&completed.change, writes);
-        }
         Ok(completed.response.rows_affected as usize)
     }
 }

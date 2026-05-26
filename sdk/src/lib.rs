@@ -154,21 +154,6 @@ pub struct Space {
 }
 
 impl Space {
-    /// Splice `writes` into the KV cache and advance the cache anchor to the
-    /// state's current data commitment. Call after `validate_and_apply_change`
-    /// successfully applied `change` (and thus bumped the commitment).
-    pub(crate) fn splice_writes_to_cache(
-        &self,
-        change: &encrypted_spaces_changelog_core::changelog::Change,
-        writes: &[encrypted_spaces_changelog_core::BatchOp],
-    ) {
-        let update = crate::kv_cache::cache_update_from_writes(change, writes);
-        self.with_state_mut(|state| {
-            let new_root = state.current_data_commitment;
-            state.kv_cache.advance_anchor(new_root, update);
-        });
-    }
-
     /// Send a generic ephemeral message to all peers in the space.
     ///
     /// The SDK automatically fills in the sender's UID from the auth context.
@@ -281,8 +266,7 @@ impl Space {
             .submit_change(&change, create_proofs)
             .await?;
 
-        let writes = space.validate_and_apply_change(&change.entry, &change_response)?;
-        space.splice_writes_to_cache(&change, &writes);
+        let writes = space.validate_and_apply_change(&change, &change_response)?;
         let users_schema = space
             .get_table_schema(users::USERS_TABLE_NAME)
             .ok_or_else(|| SdkError::InsertError("users schema not registered".to_string()))?;

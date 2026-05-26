@@ -284,7 +284,6 @@ impl Space {
             .get_table_schema(USERS_TABLE_NAME)
             .ok_or_else(|| SdkError::InsertError("users schema not registered".into()))?;
         let new_user_id = if let Some(writes) = &completed.sequential_writes {
-            self.splice_writes_to_cache(&completed.change, writes);
             crate::kv_cache::new_row_id_for_table(writes, USERS_TABLE_NAME, &users_schema).ok_or_else(
                 || {
                     SdkError::InsertError(
@@ -305,8 +304,7 @@ impl Space {
             // `InsertBuilder::execute_as` (not a false success; entry is proven).
             // Tracked in https://github.com/encrypted-spaces/prototype/issues/232.
             let writes =
-                self.validate_and_apply_change(&completed.change.entry, &completed.response)?;
-            self.splice_writes_to_cache(&completed.change, &writes);
+                self.validate_and_apply_change(&completed.change, &completed.response)?;
             crate::kv_cache::new_row_id_for_table(&writes, USERS_TABLE_NAME, &users_schema)
                 .ok_or_else(|| {
                     SdkError::InsertError(
@@ -447,9 +445,6 @@ impl Space {
         let completed = self
             .complete_submitted(delete_change, change_response)
             .await?;
-        if let Some(writes) = &completed.sequential_writes {
-            self.splice_writes_to_cache(&completed.change, writes);
-        }
 
         // 10. Post-apply delivery-slot recovery if the builder flagged it.
         self.post_apply_delivery_slot_recovery(rekey_output.needs_delivery)
@@ -579,9 +574,6 @@ impl Space {
         // accepted-but-not-sequential response `complete_submitted` recovers via
         // fast-forward and fails closed if the rotation entry is not proven.
         let completed = self.complete_submitted(change, change_response).await?;
-        if let Some(writes) = &completed.sequential_writes {
-            self.splice_writes_to_cache(&completed.change, writes);
-        }
 
         // Update key_valid_from_change_id to this rotation's change_id
         self.with_state_mut(|state| {

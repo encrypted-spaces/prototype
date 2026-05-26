@@ -186,6 +186,11 @@ impl Space {
     }
 
     fn rollback_changelog_state(&self, saved: &SavedChangelogState) {
+        // Reanchor the KV cache to the restored commitment in the same lock
+        // acquisition that restores the changelog fields. Without this a
+        // deferred-signature rollback (after the broadcast already spliced
+        // writes into the cache) would leave cache contents anchored to a
+        // DC we just rolled back from.
         self.with_state_mut(|state| {
             state.current_data_commitment = saved.data_commitment;
             state.current_change_id = saved.change_id;
@@ -201,6 +206,7 @@ impl Space {
                     p.discharged = false;
                 }
             }
+            state.kv_cache.reanchor(saved.data_commitment);
         });
     }
 
@@ -1330,7 +1336,7 @@ impl Space {
         // signature verification fails after the proof advances the DC.
         let saved = self.save_changelog_state();
 
-        match self.validate_and_apply_change(&change_entry, &change_response) {
+        match self.validate_and_apply_change(&Change { entry: change_entry.clone(), hashed_values: hashed_values.clone() }, &change_response) {
             Ok(writes) => {
                 if sig_deferred {
                     // Key resolution failed earlier (likely stale DC).
@@ -1449,9 +1455,11 @@ impl Space {
     /// otherwise the per-op `BatchOp` writes from the verified proof.
     pub fn validate_and_apply_change(
         &self,
-        change: &ChangelogEntry,
+        change: &Change,
         response: &ChangeResponse,
     ) -> Result<Vec<BatchOp>> {
+        let entry = &change.entry;
+
         // Read all state fields atomically in one lock to prevent races with
         // the broadcast listener (which can also call this method).
         // `expected_sig_ref` is the signer's last known change_id (0 if the
@@ -1468,7 +1476,7 @@ impl Space {
         ) = self.with_state(|state| {
             if let Some(uid) = state.auth_context.uid {
                 let clc_root: [u8; 32] = state.current_clc_state.root.into();
-                let expected_sig_ref = state.sigref_map.get(&change.uid).copied().unwrap_or(0);
+                let expected_sig_ref = state.sigref_map.get(&entry.uid).copied().unwrap_or(0);
                 Ok((
                     state.current_change_id,
                     state.current_data_commitment,
@@ -1485,7 +1493,7 @@ impl Space {
             }
         })?;
 
-        validate_replay_timestamp_policy(change, response)?;
+        validate_replay_timestamp_policy(entry, response)?;
 
         if response.change_id != current_change_id + 1 {
             // The broadcast listener may have already applied this change
@@ -1502,7 +1510,7 @@ impl Space {
                     return Ok(Vec::new());
                 }
                 return ChangeLog::verify_proof_and_validate(
-                    change,
+                    entry,
                     &response.pruned_merkle_tree,
                     &response.old_root,
                     &response.new_root,
@@ -1532,10 +1540,10 @@ impl Space {
         }
 
         let mut new_timestamp_hwm = timestamp_hwm;
-        validate_replay_timestamp_hwm(change, &mut new_timestamp_hwm)?;
+        validate_replay_timestamp_hwm(entry, &mut new_timestamp_hwm)?;
 
         let writes = ChangeLog::verify_proof_and_validate(
-            change,
+            entry,
             &response.pruned_merkle_tree,
             &response.old_root,
             &response.new_root,
@@ -1550,16 +1558,21 @@ impl Space {
         // the single-change broadcast / direct-response path so the client
         // does not advance on a tail that the next FF proof would reject.
         // See issue #30.
-        check_sigref_continuity(change, expected_sig_ref)?;
+        check_sigref_continuity(entry, expected_sig_ref)?;
+
+        // Build the cache splice outside the lock — it only reads the
+        // verified writes and the change's hashed_values sidecar.
+        let cache_update = crate::kv_cache::cache_update_from_writes(change, &writes);
 
         self.apply_state_update(
-            change,
+            entry,
             response,
             current_change_id,
             my_last_change_id,
             uid,
             current_clc,
             new_timestamp_hwm,
+            Some(cache_update),
         )?;
 
         Ok(writes)
@@ -1568,30 +1581,33 @@ impl Space {
     #[allow(clippy::too_many_arguments)]
     fn apply_state_update(
         &self,
-        change: &ChangelogEntry,
+        entry: &ChangelogEntry,
         response: &ChangeResponse,
         current_change_id: u32,
         my_last_change_id: u32,
         uid: u32,
         prev_clc: [u8; 32],
         new_timestamp_hwm: u64,
+        cache_update: Option<crate::kv_cache::CacheUpdate>,
     ) -> Result<()> {
         // Extend the client's changelog commitment with this entry.
         // prev_clc was captured atomically with current_change_id to prevent
         // races with the broadcast listener.
-        let entry_bytes = change.as_bytes();
+        let entry_bytes = entry.as_bytes();
 
         log::debug!(
             "[SDK] apply_state_update: change_id {} -> {} op={:?} entry_len={} prev_clc={}",
             current_change_id,
             current_change_id + 1,
-            change.message.op_type,
+            entry.message.op_type,
             entry_bytes.len(),
             hex::encode(prev_clc),
         );
         self.with_state_mut(|state| {
             // Compare-and-swap: if the broadcast listener already applied
             // this change (advanced current_change_id), skip the write.
+            // Skipping here keeps the cache splice in the same lock so a
+            // CAS-loser never splices writes at the wrong root.
             if state.current_change_id != current_change_id {
                 log::debug!(
                     "[SDK] apply_state_update: skipping write, state already advanced to change_id={}",
@@ -1625,8 +1641,8 @@ impl Space {
             state.current_clc_state.append(&entry_bytes);
             // Store the entry as the changelog anchor for the next FF cycle's
             // `from_inclusion_proof` check.
-            state.current_change_entry = Some(change.clone());
-            if change.uid == uid {
+            state.current_change_entry = Some(entry.clone());
+            if entry.uid == uid {
                 state.my_last_change_id = response.change_id;
             }
             // Issue #212: discharge any pending local submission whose exact
@@ -1640,6 +1656,15 @@ impl Space {
                 response.change_id,
                 &entry_bytes,
             );
+            // Splice the verified writes into the KV cache and advance its
+            // anchor in the same lock acquisition — no observable window
+            // where current_data_commitment is the new root while the cache
+            // is still anchored at the old one. FF ragged-change replay
+            // passes `None` because it reanchors the cache wholesale after
+            // the loop instead of splicing each ragged change.
+            if let Some(update) = cache_update {
+                state.kv_cache.advance_anchor(response.new_root, update);
+            }
         });
         Ok(())
     }
@@ -1736,7 +1761,7 @@ impl Space {
         // This is sound: the caller is told `0 rows affected`, nothing changed
         // on-chain, and no cryptographic state advances.
         if response.rows_affected == 0 && response.old_root == response.new_root {
-            match self.validate_and_apply_change(&change.entry, &response) {
+            match self.validate_and_apply_change(&change, &response) {
                 Ok(writes) => {
                     return Ok(CompletedChange {
                         change,
@@ -1809,7 +1834,7 @@ impl Space {
         response: &ChangeResponse,
         ack: u32,
     ) -> Result<CompletionWrites> {
-        match self.validate_and_apply_change(&change.entry, response) {
+        match self.validate_and_apply_change(change, response) {
             Ok(writes) => {
                 // A sequential append discharges inline (apply_state_update
                 // matched our pending entry). The "already applied" branch
@@ -2466,6 +2491,7 @@ impl Space {
                 uid,
                 current_clc,
                 new_timestamp_hwm,
+                None,
             ) {
                 return self.rollback_if_applied(&saved_state, applied_state, e);
             }
@@ -4046,7 +4072,7 @@ mod broadcast_cache_tests {
             .await?
             .unwrap();
         let change_response = space.transport.submit_change(&change, vec![]).await?;
-        let writes = space.validate_and_apply_change(&change.entry, &change_response)?;
+        let writes = space.validate_and_apply_change(&change, &change_response)?;
         let new_id = new_row_id_for_table(&space, &writes, "parent_table").unwrap();
 
         // At this point the cache still has row 1 from the normal insert.
