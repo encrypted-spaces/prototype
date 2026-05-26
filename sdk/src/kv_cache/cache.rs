@@ -34,10 +34,14 @@ pub enum CacheWrite {
     Delete(Vec<u8>),
 }
 
-/// Bundle of verified writes to apply atomically with an anchor advance.
+/// Bundle of verified writes plus optional coverage extensions to apply
+/// atomically with an anchor advance. Coverage extensions let a full-row
+/// insert/update/delete claim the row's byte range so subsequent id-reads
+/// hit without a server round-trip.
 #[derive(Debug, Default, Clone)]
 pub struct CacheUpdate {
     pub writes: Vec<CacheWrite>,
+    pub coverage_extensions: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 impl CacheUpdate {
@@ -51,6 +55,10 @@ impl CacheUpdate {
 
     pub fn delete(&mut self, key: Vec<u8>) {
         self.writes.push(CacheWrite::Delete(key));
+    }
+
+    pub fn extend_coverage(&mut self, start: Vec<u8>, end: Vec<u8>) {
+        self.coverage_extensions.push((start, end));
     }
 }
 
@@ -106,6 +114,9 @@ impl KvCache {
                 CacheWrite::Put(k, v) => self.storage.put_point(k, Some(v)),
                 CacheWrite::Delete(k) => self.storage.put_point(k, None),
             }
+        }
+        for (start, end) in update.coverage_extensions {
+            self.storage.extend_coverage(start, end);
         }
         self.anchor = new_root;
     }
@@ -966,6 +977,58 @@ mod tests {
             limit: None,
         };
         let result = cache.try_select(&q, &schemas).unwrap();
+        assert!(matches!(result, CacheResult::Miss));
+    }
+
+    #[test]
+    fn write_splice_with_coverage_extension_makes_id_read_hit() {
+        // Hand-built CacheUpdate that puts a row's column value AND
+        // extends coverage of the row range (what cache_update_from_writes
+        // emits for a full-row insert). Subsequent id-read must hit.
+        let schema =
+            schema_with_columns(TABLE, vec![("id", true, false), ("text", true, false)]);
+        let mut schemas = HashMap::new();
+        schemas.insert(TABLE.to_string(), schema);
+
+        let mut cache = KvCache::new([0; 32]);
+
+        let mut update = CacheUpdate::new();
+        let (key, value) = col_kv(TABLE, 7, "text", serde_json::json!("spliced"));
+        update.put(key, value);
+        let row_key = keys::row_key(TABLE, 7);
+        let row_end = prefix_successor(&row_key).unwrap();
+        update.extend_coverage(row_key, row_end);
+        cache.advance_anchor([1; 32], update);
+
+        let result = cache.try_select(&select_by_id(TABLE, 7), &schemas).unwrap();
+        match result {
+            CacheResult::Hit(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get("id").and_then(|v| v.as_i64()), Some(7));
+                assert_eq!(rows[0].get("text").and_then(|v| v.as_str()), Some("spliced"));
+            }
+            CacheResult::Miss => panic!("expected Hit after coverage-extending splice"),
+        }
+    }
+
+    #[test]
+    fn write_splice_without_coverage_extension_misses_id_read() {
+        // Same setup but no coverage extension — what
+        // cache_update_from_writes emits for a partial-column update.
+        let schema =
+            schema_with_columns(TABLE, vec![("id", true, false), ("text", true, false)]);
+        let mut schemas = HashMap::new();
+        schemas.insert(TABLE.to_string(), schema);
+
+        let mut cache = KvCache::new([0; 32]);
+
+        let mut update = CacheUpdate::new();
+        let (key, value) = col_kv(TABLE, 7, "text", serde_json::json!("partial"));
+        update.put(key, value);
+        // (no extend_coverage call)
+        cache.advance_anchor([1; 32], update);
+
+        let result = cache.try_select(&select_by_id(TABLE, 7), &schemas).unwrap();
         assert!(matches!(result, CacheResult::Miss));
     }
 

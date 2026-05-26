@@ -1473,6 +1473,7 @@ impl Space {
             current_clc,
             expected_sig_ref,
             timestamp_hwm,
+            schemas,
         ) = self.with_state(|state| {
             if let Some(uid) = state.auth_context.uid {
                 let clc_root: [u8; 32] = state.current_clc_state.root.into();
@@ -1485,6 +1486,7 @@ impl Space {
                     clc_root,
                     expected_sig_ref,
                     state.timestamp_hwm,
+                    state.table_schemas.clone(),
                 ))
             } else {
                 Err(SdkError::ValidationError(
@@ -1561,8 +1563,11 @@ impl Space {
         check_sigref_continuity(entry, expected_sig_ref)?;
 
         // Build the cache splice outside the lock — it only reads the
-        // verified writes and the change's hashed_values sidecar.
-        let cache_update = crate::kv_cache::cache_update_from_writes(change, &writes);
+        // verified writes, the change's hashed_values sidecar, and the
+        // schema snapshot we captured atomically above. The schema is used
+        // to recognize full-row writes so we can extend coverage of the
+        // row's byte range alongside the point puts.
+        let cache_update = crate::kv_cache::cache_update_from_writes(change, &writes, &schemas);
 
         self.apply_state_update(
             entry,
