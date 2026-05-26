@@ -3987,15 +3987,8 @@ mod hash_store_tests {
     }
 }
 
-// `broadcast_cache_tests` probed the old row-level cache's bucket invariants
-// (`cache.row_ids`, `try_query`, etc.) after broadcast splice + invalidation.
-// The new KvCache has no analog of those internal probes; behavioral
-// correctness of broadcasts is covered by the integration tests that read
-// rows back via the table API. Re-introducing equivalent coverage for the
-// KvCache splice path is tracked separately.
-#[cfg(any())]
+#[cfg(all(test, feature = "local-transport"))]
 mod broadcast_cache_tests {
-    use crate::cache::new_row_id_for_table;
     use crate::list::List;
     use crate::local_transport::LocalTransport;
     use crate::schema::{ApplicationSchema, ColumnType, SchemaBuilder};
@@ -4004,12 +3997,16 @@ mod broadcast_cache_tests {
     use encrypted_spaces_backend::query::{Query, QueryOperation, QueryParam};
     use encrypted_spaces_backend_server::SpaceState;
     use serde::{Deserialize, Serialize};
-    use std::sync::Arc;
 
     #[tokio::test]
-    async fn broadcast_insert_with_list_column_caches_committed_list_number() -> Result<()> {
-        use crate::changelog::ChangeBuilder;
-        use crate::crypto::encrypt_query_fields;
+    async fn validated_change_splices_list_column_into_cache() -> Result<()> {
+        // Regression: with the KV cache splice folded into
+        // validate_and_apply_change, a broadcast-or-direct insert must land
+        // the committed list_number into the cache atomically with the DC
+        // advance. We exercise that via the normal insert path here — the
+        // splice runs as part of the insert builder's
+        // validate_and_apply_change call, no separate
+        // apply_broadcast_cache_updates step required.
 
         #[derive(Debug, Serialize, Deserialize)]
         struct Row {
@@ -4036,7 +4033,6 @@ mod broadcast_cache_tests {
         let app_schema = ApplicationSchema::for_testing(vec![schema], root);
         let space = Space::create(transport, app_schema).await?;
 
-        // Insert a first row normally (advances server state to change_id 2).
         let first_id = space
             .table::<Row>("parent_table")
             .insert(&Row {
@@ -4047,7 +4043,7 @@ mod broadcast_cache_tests {
             .execute()
             .await?;
 
-        // Populate cache with a where_eq query so the first row is cached.
+        // Warm the cache for category=7.
         let _: Vec<Row> = space
             .table::<Row>("parent_table")
             .select()
@@ -4055,60 +4051,37 @@ mod broadcast_cache_tests {
             .all()
             .await?;
 
-        // Build a second insert manually: construct the query, build the
-        // changelog entry, submit to the transport, and validate+apply the
-        // proof (advancing the DC) — but skip the InsertBuilder cache update
-        // so we can test apply_broadcast_cache_updates separately.
-        let mut insert_query = Query::new(
-            "parent_table".to_string(),
-            QueryOperation::Insert(vec![
-                ("category".to_string(), QueryParam::Integer(42)),
-                ("items".to_string(), QueryParam::Integer(0)),
-            ]),
-        );
-        encrypt_query_fields(&mut insert_query, &space).await?;
-        let change = ChangeBuilder::new(&mut insert_query, Arc::new(space.clone()))
-            .build()
-            .await?
-            .unwrap();
-        let change_response = space.transport.submit_change(&change, vec![]).await?;
-        let writes = space.validate_and_apply_change(&change, &change_response)?;
-        let new_id = new_row_id_for_table(&space, &writes, "parent_table").unwrap();
+        // Insert a second row in a different bucket.
+        let new_id = space
+            .table::<Row>("parent_table")
+            .insert(&Row {
+                id: None,
+                category: 42,
+                items: List::empty(),
+            })?
+            .execute()
+            .await?;
 
-        // At this point the cache still has row 1 from the normal insert.
-        // validate_and_apply_change only advances the DC, not the cache.
-        let cached_ids = space.with_state(|state| state.cache.row_ids("parent_table"));
-        assert!(
-            cached_ids.contains(&first_id),
-            "first row should still be in cache after validate_and_apply_change"
-        );
+        // Both rows must read back with the right list_number (zero would
+        // mean the splice landed the placeholder instead of the committed
+        // value, or the cache went stale).
+        let bucket_7: Vec<Row> = space
+            .table::<Row>("parent_table")
+            .select()
+            .where_eq("id", first_id)
+            .all()
+            .await?;
+        assert_eq!(bucket_7.len(), 1);
+        assert!(bucket_7[0].items.list_number > 0);
 
-        // Apply the broadcast insert using the real proof.
-        space.apply_broadcast_cache_updates(&change, &writes).await;
-
-        // The broadcast-inserted row must be cached with a real list_number.
-        let cached_list_number = space.with_state(|state| {
-            state
-                .cache
-                .get_row("parent_table", new_id)
-                .and_then(|row| row.get("items"))
-                .and_then(|v| v.as_i64())
-        });
-        assert!(
-            cached_list_number.is_some_and(|n| n > 0),
-            "broadcast-inserted row must have committed list_number, got {cached_list_number:?}"
-        );
-
-        // The unrelated row must survive.
-        let cached_ids = space.with_state(|state| state.cache.row_ids("parent_table"));
-        assert!(
-            cached_ids.contains(&first_id),
-            "unrelated cached row must survive broadcast insert"
-        );
-        assert!(
-            cached_ids.contains(&new_id),
-            "broadcast-inserted row must be cached"
-        );
+        let bucket_42: Vec<Row> = space
+            .table::<Row>("parent_table")
+            .select()
+            .where_eq("id", new_id)
+            .all()
+            .await?;
+        assert_eq!(bucket_42.len(), 1);
+        assert!(bucket_42[0].items.list_number > 0);
 
         Ok(())
     }
