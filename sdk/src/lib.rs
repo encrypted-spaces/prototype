@@ -1,8 +1,8 @@
 pub mod action;
 pub mod authentication;
 mod broadcast;
-pub(crate) mod cache;
 pub(crate) mod changelog;
+pub(crate) mod kv_cache;
 mod crypto;
 pub mod file;
 mod key_manager;
@@ -154,6 +154,21 @@ pub struct Space {
 }
 
 impl Space {
+    /// Splice `writes` into the KV cache and advance the cache anchor to the
+    /// state's current data commitment. Call after `validate_and_apply_change`
+    /// successfully applied `change` (and thus bumped the commitment).
+    pub(crate) fn splice_writes_to_cache(
+        &self,
+        change: &encrypted_spaces_changelog_core::changelog::Change,
+        writes: &[encrypted_spaces_changelog_core::BatchOp],
+    ) {
+        let update = crate::kv_cache::cache_update_from_writes(change, writes);
+        self.with_state_mut(|state| {
+            let new_root = state.current_data_commitment;
+            state.kv_cache.advance_anchor(new_root, update);
+        });
+    }
+
     /// Send a generic ephemeral message to all peers in the space.
     ///
     /// The SDK automatically fills in the sender's UID from the auth context.
@@ -229,7 +244,7 @@ impl Space {
                 current_change_entry: None,
                 ff_image_id,
                 pending_local_changes: Default::default(),
-                cache: Default::default(),
+                kv_cache: crate::kv_cache::KvCache::new(dc),
                 inviter_anchor: None,
             })),
             key_manager: Arc::new(tokio::sync::Mutex::new(key_manager)),
@@ -267,12 +282,18 @@ impl Space {
             .await?;
 
         let writes = space.validate_and_apply_change(&change.entry, &change_response)?;
-        crate::cache::update_cache_from_proven_writes(&space, &change, &writes).await;
-        let new_user_id =
-            crate::cache::new_row_id_for_table(&space, &writes, users::USERS_TABLE_NAME)
-                .ok_or_else(|| {
-                    SdkError::InsertError("missing new user id in change response".to_string())
-                })?;
+        space.splice_writes_to_cache(&change, &writes);
+        let users_schema = space
+            .get_table_schema(users::USERS_TABLE_NAME)
+            .ok_or_else(|| SdkError::InsertError("users schema not registered".to_string()))?;
+        let new_user_id = crate::kv_cache::new_row_id_for_table(
+            &writes,
+            users::USERS_TABLE_NAME,
+            &users_schema,
+        )
+        .ok_or_else(|| {
+            SdkError::InsertError("missing new user id in change response".to_string())
+        })?;
         assert!(Some(new_user_id) == user.id);
 
         crate::broadcast::start_listener(&space);
@@ -342,7 +363,7 @@ impl Space {
                 current_change_entry: None,
                 ff_image_id,
                 pending_local_changes: Default::default(),
-                cache: Default::default(),
+                kv_cache: crate::kv_cache::KvCache::new(dc),
                 inviter_anchor: Some(inviter_anchor),
             },
             key_manager,
@@ -409,7 +430,8 @@ impl Space {
             );
             space.with_state_mut(|state| {
                 state.reset_changelog_anchor_to_genesis();
-                state.cache.clear_all();
+                let dc = state.current_data_commitment;
+                state.kv_cache.reanchor(dc);
             });
         }
 

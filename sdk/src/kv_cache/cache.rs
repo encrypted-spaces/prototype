@@ -1,8 +1,5 @@
 //! [`KvCache`] — anchored, splice-updated key/value cache for SDK queries.
 
-use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
-
 use encrypted_spaces_backend::error::{Result, SdkError};
 use encrypted_spaces_backend::merk_storage::proofs::VerifiedRows;
 use encrypted_spaces_backend::merk_storage::{
@@ -13,7 +10,7 @@ use encrypted_spaces_backend::query::{Predicate, Query};
 use encrypted_spaces_changelog_core::{prefix_successor, ReadOp};
 use encrypted_spaces_storage_encoding::keys;
 
-use crate::coverage_store::CoverageStore;
+use super::coverage_store::CoverageStore;
 
 /// The state-commitment digest the cache is anchored to.
 pub type DataCommitment = [u8; 32];
@@ -53,23 +50,17 @@ impl CacheUpdate {
     }
 }
 
-/// Per-table set of indexed columns, used to validate non-id predicates while
-/// planning a query. Maps `table_name -> set of indexed column names`.
-pub type IndexedColumnsByTable = HashMap<String, BTreeSet<String>>;
-
 /// Anchored client-side KV cache. See crate-level docs for the model.
 pub struct KvCache {
     anchor: DataCommitment,
     storage: CoverageStore,
-    indexed_columns: Arc<IndexedColumnsByTable>,
 }
 
 impl KvCache {
-    pub fn new(anchor: DataCommitment, indexed_columns: Arc<IndexedColumnsByTable>) -> Self {
+    pub fn new(anchor: DataCommitment) -> Self {
         Self {
             anchor,
             storage: CoverageStore::new(),
-            indexed_columns,
         }
     }
 
@@ -82,6 +73,24 @@ impl KvCache {
     pub fn reanchor(&mut self, new_root: DataCommitment) {
         self.storage.clear();
         self.anchor = new_root;
+    }
+
+    /// Lower-level: insert raw `(key, value)` point entries and extend
+    /// coverage by half-open `[start, end)` ranges. Caller is responsible for
+    /// ensuring the inputs reflect state at the current anchor — used by
+    /// SDK code paths that bootstrap or seed the cache without a server
+    /// proof (e.g. local-transport tests).
+    pub fn splice(
+        &mut self,
+        kv_pairs: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
+        coverage_ranges: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
+    ) {
+        for (k, v) in kv_pairs {
+            self.storage.put_point(k, Some(v));
+        }
+        for (s, e) in coverage_ranges {
+            self.storage.extend_coverage(s, e);
+        }
     }
 
     /// Splice `update`'s writes into the cache and advance the anchor in one
@@ -130,11 +139,15 @@ impl KvCache {
     /// Try to answer `query` from the cache. Returns `Hit(rows)` if every
     /// byte range the planned query would touch is fully covered; `Miss`
     /// otherwise.
-    pub fn try_select(
-        &self,
-        query: &Query,
-    ) -> Result<CacheResult<Vec<serde_json::Value>>> {
-        let strategy = determine_query_strategy(self, query)?;
+    ///
+    /// The cache is schema-agnostic: non-id predicates always plan as
+    /// `ByIndex` and resolve to `Miss`, so the eventual server fetch is the
+    /// one that validates whether the referenced column is actually indexed.
+    pub fn try_select(&self, query: &Query) -> Result<CacheResult<Vec<serde_json::Value>>> {
+        let reader = KvCacheReader {
+            storage: &self.storage,
+        };
+        let strategy = determine_query_strategy(&reader, query)?;
         let required = match required_ranges_for_strategy(&strategy, &query.table)? {
             Some(r) => r,
             // ByIndex (and any other shape we don't model here) falls through
@@ -147,9 +160,16 @@ impl KvCache {
         {
             return Ok(CacheResult::Miss);
         }
-        let rows = execute_query(self, query)?;
+        let rows = execute_query(&reader, query)?;
         Ok(CacheResult::Hit(rows))
     }
+}
+
+/// Borrowed `RowReadSource` over a `CoverageStore`. The cache delegates
+/// schema validation (which column is indexed) to the eventual server fetch
+/// triggered on `Miss`, so this reader has no schema state.
+struct KvCacheReader<'a> {
+    storage: &'a CoverageStore,
 }
 
 type KeyRange = (Vec<u8>, Vec<u8>);
@@ -210,19 +230,13 @@ fn prefix_succ_required(prefix: &[u8]) -> Result<Vec<u8>> {
     })
 }
 
-impl RowReadSource for KvCache {
-    fn validate_column_indexed(&self, table_name: &str, column: &str) -> Result<()> {
-        let ok = self
-            .indexed_columns
-            .get(table_name)
-            .is_some_and(|cols| cols.contains(column));
-        if ok {
-            Ok(())
-        } else {
-            Err(SdkError::InvalidQuery(format!(
-                "Predicate column '{column}' is not indexed on table '{table_name}'"
-            )))
-        }
+impl<'a> RowReadSource for KvCacheReader<'a> {
+    fn validate_column_indexed(&self, _table_name: &str, _column: &str) -> Result<()> {
+        // Schema-agnostic: planner returns `ByIndex` for any non-id predicate
+        // and `try_select` will then return `Miss`, so the server-side fetch
+        // is what actually validates indexedness. Saying Ok here keeps the
+        // planner from spuriously erroring before we get to the Miss step.
+        Ok(())
     }
 
     fn get_row_by_id(
@@ -277,7 +291,7 @@ impl RowReadSource for KvCache {
         // unreachable on the hit path. If `execute_query` ever reaches this,
         // the planner has diverged from `try_select`; fail loudly.
         Err(SdkError::DatabaseError(
-            "KvCache::index_row_keys_for_predicate called but try_select \
+            "KvCacheReader::index_row_keys_for_predicate called but try_select \
              rejects indexed predicates"
                 .into(),
         ))
@@ -309,12 +323,9 @@ mod tests {
         ComparisonOperator, Order, QueryOperation, QueryParam,
     };
     use encrypted_spaces_storage_encoding::stored_value;
+    use std::collections::HashMap;
 
     const TABLE: &str = "msgs";
-
-    fn empty_indexed() -> Arc<IndexedColumnsByTable> {
-        Arc::new(HashMap::new())
-    }
 
     fn col_kv(table: &str, id: i64, col: &str, value: serde_json::Value) -> (Vec<u8>, Vec<u8>) {
         let key = keys::column_key(table, id, col);
@@ -367,14 +378,16 @@ mod tests {
 
     #[test]
     fn miss_when_empty() {
-        let cache = KvCache::new([0; 32], empty_indexed());
-        let result = cache.try_select(&select_all_query(TABLE)).unwrap();
+        let cache = KvCache::new([0; 32]);
+        let result = cache
+            .try_select(&select_all_query(TABLE))
+            .unwrap();
         assert!(matches!(result, CacheResult::Miss));
     }
 
     #[test]
     fn hit_after_full_table_ingest() {
-        let mut cache = KvCache::new([0; 32], empty_indexed());
+        let mut cache = KvCache::new([0; 32]);
         let verified = full_table_verified(
             TABLE,
             &[
@@ -383,7 +396,9 @@ mod tests {
             ],
         );
         cache.apply_select(&verified);
-        let result = cache.try_select(&select_all_query(TABLE)).unwrap();
+        let result = cache
+            .try_select(&select_all_query(TABLE))
+            .unwrap();
         match result {
             CacheResult::Hit(rows) => {
                 assert_eq!(rows.len(), 2);
@@ -396,7 +411,7 @@ mod tests {
 
     #[test]
     fn hit_by_id_after_full_table_ingest() {
-        let mut cache = KvCache::new([0; 32], empty_indexed());
+        let mut cache = KvCache::new([0; 32]);
         let verified = full_table_verified(
             TABLE,
             &[
@@ -405,7 +420,9 @@ mod tests {
             ],
         );
         cache.apply_select(&verified);
-        let result = cache.try_select(&select_by_id(TABLE, 2)).unwrap();
+        let result = cache
+            .try_select(&select_by_id(TABLE, 2))
+            .unwrap();
         match result {
             CacheResult::Hit(rows) => {
                 assert_eq!(rows.len(), 1);
@@ -418,7 +435,7 @@ mod tests {
 
     #[test]
     fn miss_by_id_when_only_neighbor_covered() {
-        let mut cache = KvCache::new([0; 32], empty_indexed());
+        let mut cache = KvCache::new([0; 32]);
         // Coverage only over row 1.
         let row1_key = keys::row_key(TABLE, 1);
         let row1_end = prefix_successor(&row1_key).unwrap();
@@ -432,13 +449,15 @@ mod tests {
             }],
         };
         cache.apply_select(&verified);
-        let result = cache.try_select(&select_by_id(TABLE, 2)).unwrap();
+        let result = cache
+            .try_select(&select_by_id(TABLE, 2))
+            .unwrap();
         assert!(matches!(result, CacheResult::Miss));
     }
 
     #[test]
     fn key_read_with_no_kv_pair_records_tombstone() {
-        let mut cache = KvCache::new([0; 32], empty_indexed());
+        let mut cache = KvCache::new([0; 32]);
         let row_key = keys::row_key(TABLE, 7);
         let verified = VerifiedRows {
             main_rows: Vec::new(),
@@ -452,7 +471,7 @@ mod tests {
 
     #[test]
     fn advance_anchor_splices_writes_and_bumps_anchor() {
-        let mut cache = KvCache::new([0; 32], empty_indexed());
+        let mut cache = KvCache::new([0; 32]);
         let mut update = CacheUpdate::new();
         let (k, v) = col_kv(TABLE, 5, "text", serde_json::json!("spliced"));
         update.put(k.clone(), v.clone());
@@ -468,20 +487,20 @@ mod tests {
 
     #[test]
     fn reanchor_clears_storage() {
-        let mut cache = KvCache::new([1; 32], empty_indexed());
+        let mut cache = KvCache::new([1; 32]);
         let verified = full_table_verified(TABLE, &[(1, "text", serde_json::json!("x"))]);
         cache.apply_select(&verified);
         cache.reanchor([2; 32]);
         assert_eq!(cache.anchor(), &[2; 32]);
-        let result = cache.try_select(&select_all_query(TABLE)).unwrap();
+        let result = cache
+            .try_select(&select_all_query(TABLE))
+            .unwrap();
         assert!(matches!(result, CacheResult::Miss));
     }
 
     #[test]
     fn indexed_predicate_returns_miss() {
-        let mut cols = HashMap::new();
-        cols.insert(TABLE.to_string(), BTreeSet::from(["channel_id".to_string()]));
-        let cache = KvCache::new([0; 32], Arc::new(cols));
+        let cache = KvCache::new([0; 32]);
         let q = Query {
             table: TABLE.to_string(),
             operation: QueryOperation::Select(Vec::new()),

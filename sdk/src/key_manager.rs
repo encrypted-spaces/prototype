@@ -100,7 +100,7 @@ impl Space {
         //    unless the exact rekey entry is proven incorporated.
         let completed = self.complete_submitted(change, change_response).await?;
         if let Some(writes) = &completed.sequential_writes {
-            crate::cache::update_cache_from_proven_writes(self, &completed.change, writes).await;
+            self.splice_writes_to_cache(&completed.change, writes);
         }
 
         // 6. Post-apply delivery-slot recovery if the builder flagged it.
@@ -138,7 +138,7 @@ impl Space {
         //    unless the exact extend entry is proven incorporated.
         let completed = self.complete_submitted(change, change_response).await?;
         if let Some(writes) = &completed.sequential_writes {
-            crate::cache::update_cache_from_proven_writes(self, &completed.change, writes).await;
+            self.splice_writes_to_cache(&completed.change, writes);
         }
 
         // 5. Post-apply delivery-slot recovery if the builder flagged it.
@@ -181,7 +181,10 @@ impl Space {
         // 5. Reduce prunes old retention keys — data encrypted with
         //    those keys can no longer be decrypted, so just purge all
         //    cached plaintext rather than updating it from the writes.
-        self.with_state_mut(|state| state.cache.clear_all());
+        self.with_state_mut(|state| {
+            let dc = state.current_data_commitment;
+            state.kv_cache.reanchor(dc);
+        });
 
         // 6. Post-apply delivery-slot recovery if the builder flagged it.
         self.post_apply_delivery_slot_recovery(reduce_output.needs_delivery)

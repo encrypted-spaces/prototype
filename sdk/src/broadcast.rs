@@ -116,10 +116,13 @@ impl Space {
         // keys can no longer be decrypted, so just purge all cached
         // plaintext rather than spending time updating it.
         if change.entry.message.op_type == OpType::Reduce {
-            self.with_state_mut(|state| state.cache.clear_all());
+            self.with_state_mut(|state| {
+                let dc = state.current_data_commitment;
+                state.kv_cache.reanchor(dc);
+            });
             return;
         }
 
-        crate::cache::update_cache_from_proven_writes(self, change, writes).await;
+        self.splice_writes_to_cache(change, writes);
     }
 }

@@ -280,11 +280,18 @@ impl Space {
         //    InviteUser entry is proven incorporated (sequential append or a
         //    fast-forward ragged apply / inclusion proof); fail closed otherwise.
         let completed = self.complete_submitted(change, change_response).await?;
+        let users_schema = self
+            .get_table_schema(USERS_TABLE_NAME)
+            .ok_or_else(|| SdkError::InsertError("users schema not registered".into()))?;
         let new_user_id = if let Some(writes) = &completed.sequential_writes {
-            crate::cache::update_cache_from_proven_writes(self, &completed.change, writes).await;
-            crate::cache::new_row_id_for_table(self, writes, USERS_TABLE_NAME).ok_or_else(|| {
-                SdkError::InsertError("InviteUser proof did not write any new row to _users".into())
-            })?
+            self.splice_writes_to_cache(&completed.change, writes);
+            crate::kv_cache::new_row_id_for_table(writes, USERS_TABLE_NAME, &users_schema).ok_or_else(
+                || {
+                    SdkError::InsertError(
+                        "InviteUser proof did not write any new row to _users".into(),
+                    )
+                },
+            )?
         } else if let Some(id) = completed
             .ff_inserted_ids
             .get(&completed.change.entry.signature)
@@ -299,14 +306,13 @@ impl Space {
             // Tracked in https://github.com/encrypted-spaces/prototype/issues/232.
             let writes =
                 self.validate_and_apply_change(&completed.change.entry, &completed.response)?;
-            crate::cache::update_cache_from_proven_writes(self, &completed.change, &writes).await;
-            crate::cache::new_row_id_for_table(self, &writes, USERS_TABLE_NAME).ok_or_else(
-                || {
+            self.splice_writes_to_cache(&completed.change, &writes);
+            crate::kv_cache::new_row_id_for_table(&writes, USERS_TABLE_NAME, &users_schema)
+                .ok_or_else(|| {
                     SdkError::InsertError(
                         "InviteUser proof did not write any new row to _users".into(),
                     )
-                },
-            )?
+                })?
         };
 
         // 7. Post-apply delivery-slot recovery if the builder flagged it.
@@ -442,7 +448,7 @@ impl Space {
             .complete_submitted(delete_change, change_response)
             .await?;
         if let Some(writes) = &completed.sequential_writes {
-            crate::cache::update_cache_from_proven_writes(self, &completed.change, writes).await;
+            self.splice_writes_to_cache(&completed.change, writes);
         }
 
         // 10. Post-apply delivery-slot recovery if the builder flagged it.
@@ -574,7 +580,7 @@ impl Space {
         // fast-forward and fails closed if the rotation entry is not proven.
         let completed = self.complete_submitted(change, change_response).await?;
         if let Some(writes) = &completed.sequential_writes {
-            crate::cache::update_cache_from_proven_writes(self, &completed.change, writes).await;
+            self.splice_writes_to_cache(&completed.change, writes);
         }
 
         // Update key_valid_from_change_id to this rotation's change_id

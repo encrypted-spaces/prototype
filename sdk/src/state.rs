@@ -1,4 +1,3 @@
-use crate::cache::Cache;
 use crate::SpaceKeyManager;
 use crate::{DataCommitment, Space, SpaceId, Transport};
 use encrypted_spaces_acl_types::Action;
@@ -7,6 +6,7 @@ use encrypted_spaces_backend::{
     error::{Result, SdkError},
     schema::Schema,
 };
+use crate::kv_cache::KvCache;
 // `state` is a private module (`mod state;` in lib.rs), so `pub` items here
 // can never escape the crate. Use `pub(crate)` to make the visibility intent
 // explicit and consistent with PR #117.
@@ -96,9 +96,10 @@ pub(crate) struct State {
     #[serde(skip)]
     pub(crate) pending_local_changes: BTreeMap<u32, PendingLocalChange>,
 
-    /// Ephemeral index-based cache of decrypted rows. Never serialized.
-    #[serde(skip)]
-    pub(crate) cache: Cache,
+    /// Ephemeral KV cache anchored to `current_data_commitment`. Never
+    /// serialized — rebuilt from server proofs on demand.
+    #[serde(skip, default = "default_kv_cache")]
+    pub(crate) kv_cache: KvCache,
 
     /// Out-of-band anchor handed to a fresh joiner via `SpaceInvite`. Verified
     /// (and cleared) during the join's first fast-forward, either against the
@@ -107,6 +108,10 @@ pub(crate) struct State {
     /// or already-joined spaces.
     #[serde(skip)]
     pub(crate) inviter_anchor: Option<InviterAnchor>,
+}
+
+fn default_kv_cache() -> KvCache {
+    KvCache::new([0u8; 32])
 }
 
 #[derive(Clone, Debug)]
@@ -303,7 +308,7 @@ mod tests {
             current_change_entry: None,
             ff_image_id: EXTEND_FF_ID,
             pending_local_changes: Default::default(),
-            cache: Default::default(),
+            kv_cache: KvCache::new([0x22; 32]),
             inviter_anchor: None,
         }
     }

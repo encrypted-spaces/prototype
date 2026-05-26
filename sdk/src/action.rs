@@ -114,9 +114,12 @@ impl Space {
         // baked action-marker kv stays valid; discharge via fast-forward on an
         // accepted-but-not-sequential response.
         let completed = self.complete_submitted(change, response).await?;
+        let schema = self.get_table_schema(&table).ok_or_else(|| {
+            SdkError::InvalidQuery(format!("table '{table}' is not registered locally"))
+        })?;
         if let Some(writes) = &completed.sequential_writes {
-            crate::cache::update_cache_from_proven_writes(self, &completed.change, writes).await;
-            return crate::cache::new_row_id_for_table(self, writes, &table).ok_or_else(|| {
+            self.splice_writes_to_cache(&completed.change, writes);
+            return crate::kv_cache::new_row_id_for_table(writes, &table, &schema).ok_or_else(|| {
                 SdkError::InsertError(format!(
                     "action '{action_name}' produced no new row id on table '{table}'"
                 ))
@@ -136,8 +139,8 @@ impl Space {
         // Tracked in https://github.com/encrypted-spaces/prototype/issues/232.
         let writes =
             self.validate_and_apply_change(&completed.change.entry, &completed.response)?;
-        crate::cache::update_cache_from_proven_writes(self, &completed.change, &writes).await;
-        crate::cache::new_row_id_for_table(self, &writes, &table).ok_or_else(|| {
+        self.splice_writes_to_cache(&completed.change, &writes);
+        crate::kv_cache::new_row_id_for_table(&writes, &table, &schema).ok_or_else(|| {
             SdkError::InsertError(format!(
                 "action '{action_name}' produced no new row id on table '{table}'"
             ))
@@ -182,7 +185,7 @@ impl Space {
         let response = self.transport.submit_change(&change, vec![]).await?;
         let completed = self.complete_submitted(change, response).await?;
         if let Some(writes) = &completed.sequential_writes {
-            crate::cache::update_cache_from_proven_writes(self, &completed.change, writes).await;
+            self.splice_writes_to_cache(&completed.change, writes);
         }
         Ok(completed.response.rows_affected as usize)
     }
@@ -268,7 +271,7 @@ impl Space {
         let response = self.transport.submit_change(&change, vec![]).await?;
         let completed = self.complete_submitted(change, response).await?;
         if let Some(writes) = &completed.sequential_writes {
-            crate::cache::update_cache_from_proven_writes(self, &completed.change, writes).await;
+            self.splice_writes_to_cache(&completed.change, writes);
         }
         Ok(completed.response.rows_affected as usize)
     }

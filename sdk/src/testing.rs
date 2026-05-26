@@ -124,7 +124,7 @@ impl Space {
                 current_change_entry: None,
                 ff_image_id: EXTEND_FF_ID,
                 pending_local_changes: Default::default(),
-                cache: Default::default(),
+                kv_cache: crate::kv_cache::KvCache::new(initial_dc),
                 inviter_anchor: None,
             })),
             key_manager: Arc::new(tokio::sync::Mutex::new(key_manager)),
