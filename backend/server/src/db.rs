@@ -16,7 +16,7 @@ use encrypted_spaces_backend::{
     app_schema::{SchemaBundle, SchemaTable},
     error::SdkError,
     internal_schemas,
-    merk_storage::{stored_value, MerkStorage},
+    merk_storage::{execute_query, stored_value, MerkStorage},
     proto::{self, db_request, db_response, DbRequest, DbResponse},
     query::{ComparisonOperator, Predicate, Query, QueryOperation, QueryParam},
     schema::{ColumnType, Schema, MAX_STRING_COLUMN_BYTES},
@@ -1043,8 +1043,7 @@ impl SpaceState {
             values: vec![QueryParam::Integer(uid)],
             cursor_id: None,
         });
-        self.db
-            .query_rows(&query)
+        execute_query(&self.db, &query)
             .ok()
             .and_then(|rows| rows.first()?.get("status")?.as_i64())
             == Some(0)
@@ -2978,8 +2977,7 @@ impl SpaceState {
                     cursor_id: None,
                 });
 
-                let latest = db
-                    .query_rows(&query)
+                let latest = execute_query(&db, &query)
                     .map_err(|_| KeyManagerError)?
                     .into_iter()
                     .max_by_key(|row| row.get("id").and_then(|v| v.as_i64()).unwrap_or(0));

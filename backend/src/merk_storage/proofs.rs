@@ -623,12 +623,21 @@ pub fn verify_proof(
     verify_merk_query(proof, query, *expected_root)
 }
 
-/// Verified rows from a Merk proof, organized by table.
+/// Result of verifying a SELECT proof: the post-grouping rows the caller
+/// consumes, plus the raw KV pairs and the proven `ReadOp`s the client-side
+/// cache uses to extend its coverage.
+#[cfg(any(feature = "merk", feature = "merk_verify"))]
 pub struct VerifiedRows {
     /// Rows from the query's main table.
     pub main_rows: Vec<serde_json::Value>,
     /// Rows from other tables (used for JOINs), keyed by table name.
     pub rows_by_table: HashMap<String, Vec<serde_json::Value>>,
+    /// Every authenticated `(key, value)` pair returned by the proof, in
+    /// proof order. For the cache to populate point entries.
+    pub kv_pairs: Vec<(Vec<u8>, Vec<u8>)>,
+    /// The `ReadOp`s the proof made authoritative. The cache uses these to
+    /// mark the byte ranges it now knows completely.
+    pub read_ops: Vec<ReadOp>,
 }
 
 /// Tracer-based proof for SELECT queries that need targeted reads
@@ -732,10 +741,13 @@ fn verify_query_proof_inner(
     let results = verify_merk_query(proof, merk_query, expected_root)?;
     let mut rows_by_table = group_entries_for_verifier(&results, hash_context)?;
     let main_rows = rows_by_table.remove(&query.table).unwrap_or_default();
+    let read_ops = initial_read_ops_for_query(query)?;
 
     Ok(VerifiedRows {
         main_rows,
         rows_by_table,
+        kv_pairs: results,
+        read_ops,
     })
 }
 
@@ -1349,9 +1361,19 @@ fn verify_tracer_select_proof(
         rows_by_table.entry(table).or_default().extend(table_rows);
     }
 
+    let mut kv_pairs = main_all_entries;
+    kv_pairs.extend(join_all_entries);
+    let mut read_ops: Vec<ReadOp> = all_read_results[0]
+        .iter()
+        .map(|pr| pr.op.clone())
+        .collect();
+    read_ops.extend(all_read_results[1].iter().map(|pr| pr.op.clone()));
+
     Ok(VerifiedRows {
         main_rows,
         rows_by_table,
+        kv_pairs,
+        read_ops,
     })
 }
 

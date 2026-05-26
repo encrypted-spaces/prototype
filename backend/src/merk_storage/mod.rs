@@ -20,7 +20,7 @@ pub use encrypted_spaces_storage_encoding::stored_value;
 
 use crate::{
     error::{Result, SdkError},
-    query::{ComparisonOperator, Order, Query, QueryOperation, QueryParam},
+    query::{ComparisonOperator, Order, Predicate, Query, QueryOperation, QueryParam},
     schema::Schema,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -48,7 +48,6 @@ use std::{cmp::Ordering, collections::HashMap};
 use {
     crate::{
         access_control::{load_access_rule, AuthContext},
-        query::Predicate,
         storage::Storage,
     },
     merk::{InMemoryMerk, Node},
@@ -303,54 +302,6 @@ impl MerkStorage {
         reassemble_row(row_id, &column_entries).map(Some)
     }
 
-    /// Query rows from a table.
-    pub fn query_rows(&self, query: &Query) -> Result<Vec<serde_json::Value>> {
-        let strategy = self.determine_query_strategy(query)?;
-
-        let main_rows = match strategy {
-            QueryStrategy::ById(id) => {
-                if let Some(row) = self.get_row_by_id(&query.table, id)? {
-                    vec![row]
-                } else {
-                    vec![]
-                }
-            }
-            QueryStrategy::ByIds(ids) => {
-                let mut rows = Vec::new();
-                for id in ids {
-                    if let Some(row) = self.get_row_by_id(&query.table, id)? {
-                        rows.push(row);
-                    }
-                }
-                rows
-            }
-            QueryStrategy::ByIdRange {
-                start,
-                end,
-                inclusive_start,
-                inclusive_end,
-            } => self.query_rows_by_id_range(
-                &query.table,
-                start,
-                end,
-                inclusive_start,
-                inclusive_end,
-            )?,
-            QueryStrategy::ByIndex { ref predicate, .. } => {
-                let row_keys = self.index_row_keys_for_predicate(&query.table, predicate)?;
-                let mut all_entries = Vec::new();
-                for row_key in &row_keys {
-                    all_entries.extend(self.iter_prefix(row_key)?);
-                }
-                group_columns_into_rows(&all_entries)?
-            }
-            QueryStrategy::TableScan => self.scan_table(&query.table)?,
-        };
-
-        // Apply ORDER BY, LIMIT, OFFSET, column selection
-        process_query_results(main_rows, query)
-    }
-
     /// Query rows while decoding only the requested columns plus any predicate
     /// column needed for ordering/limit semantics.
     ///
@@ -362,7 +313,7 @@ impl MerkStorage {
         query: &Query,
         columns: &[String],
     ) -> Result<Vec<serde_json::Value>> {
-        let strategy = self.determine_query_strategy(query)?;
+        let strategy = determine_query_strategy(self, query)?;
         let mut required_columns: std::collections::BTreeSet<String> =
             columns.iter().cloned().collect();
         if let Some(predicate) = &query.predicate {
@@ -414,90 +365,6 @@ impl MerkStorage {
         };
 
         Ok(apply_server_view(main_rows, query))
-    }
-
-    /// Determine query strategy based on the predicate. Returns an error if
-    /// the predicate targets a non-id, non-indexed column.
-    fn determine_query_strategy(&self, query: &Query) -> Result<QueryStrategy> {
-        let pred = match &query.predicate {
-            Some(p) => p,
-            None => return Ok(QueryStrategy::TableScan),
-        };
-
-        let id_err = || SdkError::InvalidQuery("id predicate requires integer value(s)".into());
-
-        if pred.column == ID_FIELD {
-            return match &pred.operator {
-                ComparisonOperator::Equal => match pred.values.first() {
-                    Some(QueryParam::Integer(id)) => Ok(QueryStrategy::ById(*id)),
-                    _ => Err(id_err()),
-                },
-                ComparisonOperator::In => {
-                    let ids: Vec<i64> = pred
-                        .values
-                        .iter()
-                        .map(|v| match v {
-                            QueryParam::Integer(id) => Ok(*id),
-                            _ => Err(id_err()),
-                        })
-                        .collect::<Result<_>>()?;
-                    Ok(QueryStrategy::ByIds(ids))
-                }
-                ComparisonOperator::GreaterThan => match pred.values.first() {
-                    Some(QueryParam::Integer(id)) => Ok(QueryStrategy::ByIdRange {
-                        start: Some(*id),
-                        end: None,
-                        inclusive_start: false,
-                        inclusive_end: true,
-                    }),
-                    _ => Err(id_err()),
-                },
-                ComparisonOperator::GreaterThanOrEqual => match pred.values.first() {
-                    Some(QueryParam::Integer(id)) => Ok(QueryStrategy::ByIdRange {
-                        start: Some(*id),
-                        end: None,
-                        inclusive_start: true,
-                        inclusive_end: true,
-                    }),
-                    _ => Err(id_err()),
-                },
-                ComparisonOperator::LessThan => match pred.values.first() {
-                    Some(QueryParam::Integer(id)) => Ok(QueryStrategy::ByIdRange {
-                        start: None,
-                        end: Some(*id),
-                        inclusive_start: true,
-                        inclusive_end: false,
-                    }),
-                    _ => Err(id_err()),
-                },
-                ComparisonOperator::LessThanOrEqual => match pred.values.first() {
-                    Some(QueryParam::Integer(id)) => Ok(QueryStrategy::ByIdRange {
-                        start: None,
-                        end: Some(*id),
-                        inclusive_start: true,
-                        inclusive_end: true,
-                    }),
-                    _ => Err(id_err()),
-                },
-                ComparisonOperator::Between => match (pred.values.first(), pred.values.get(1)) {
-                    (Some(QueryParam::Integer(lo)), Some(QueryParam::Integer(hi))) => {
-                        Ok(QueryStrategy::ByIdRange {
-                            start: Some(*lo),
-                            end: Some(*hi),
-                            inclusive_start: true,
-                            inclusive_end: true,
-                        })
-                    }
-                    _ => Err(id_err()),
-                },
-            };
-        }
-
-        // Non-id column — must be indexed.
-        self.validate_column_indexed(&query.table, &pred.column)?;
-        Ok(QueryStrategy::ByIndex {
-            predicate: pred.clone(),
-        })
     }
 
     /// Scan all rows in a table using Merk's efficient prefix iteration.
@@ -1010,9 +877,10 @@ impl Default for MerkStorage {
     }
 }
 
-/// Query strategy based on predicate.
-#[cfg(feature = "merk")]
-enum QueryStrategy {
+/// How a `Query` resolves into reads against a `RowReadSource`. Computed by
+/// [`determine_query_strategy`] and consumed by [`execute_query`].
+#[derive(Debug, Clone)]
+pub enum QueryStrategy {
     ById(i64),
     ByIds(Vec<i64>),
     ByIdRange {
@@ -1025,6 +893,221 @@ enum QueryStrategy {
         predicate: Predicate,
     },
     TableScan,
+}
+
+/// Storage abstraction for [`execute_query`]. Both the server's `MerkStorage`
+/// and the SDK's `KvCache` implement this so a single executor serves proven
+/// backend reads and authenticated cache reads with identical semantics.
+pub trait RowReadSource {
+    /// Error if `column` on `table` is not indexed.
+    fn validate_column_indexed(&self, table_name: &str, column: &str) -> Result<()>;
+
+    /// Fetch a single row by primary key.
+    fn get_row_by_id(&self, table_name: &str, row_id: i64) -> Result<Option<serde_json::Value>>;
+
+    /// Fetch rows in a contiguous id range.
+    fn query_rows_by_id_range(
+        &self,
+        table_name: &str,
+        start: Option<i64>,
+        end: Option<i64>,
+        inclusive_start: bool,
+        inclusive_end: bool,
+    ) -> Result<Vec<serde_json::Value>>;
+
+    /// Resolve a predicate on an indexed column into row keys.
+    fn index_row_keys_for_predicate(
+        &self,
+        table_name: &str,
+        predicate: &Predicate,
+    ) -> Result<Vec<Vec<u8>>>;
+
+    /// Iterate raw key/value pairs whose key starts with `prefix`.
+    fn iter_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+
+    /// Scan and reassemble every row in `table`.
+    fn scan_table(&self, table_name: &str) -> Result<Vec<serde_json::Value>>;
+}
+
+/// Plan a query into a [`QueryStrategy`].
+pub fn determine_query_strategy<R: RowReadSource + ?Sized>(
+    reader: &R,
+    query: &Query,
+) -> Result<QueryStrategy> {
+    let pred = match &query.predicate {
+        Some(p) => p,
+        None => return Ok(QueryStrategy::TableScan),
+    };
+
+    let id_err = || SdkError::InvalidQuery("id predicate requires integer value(s)".into());
+
+    if pred.column == ID_FIELD {
+        return match &pred.operator {
+            ComparisonOperator::Equal => match pred.values.first() {
+                Some(QueryParam::Integer(id)) => Ok(QueryStrategy::ById(*id)),
+                _ => Err(id_err()),
+            },
+            ComparisonOperator::In => {
+                let ids: Vec<i64> = pred
+                    .values
+                    .iter()
+                    .map(|v| match v {
+                        QueryParam::Integer(id) => Ok(*id),
+                        _ => Err(id_err()),
+                    })
+                    .collect::<Result<_>>()?;
+                Ok(QueryStrategy::ByIds(ids))
+            }
+            ComparisonOperator::GreaterThan => match pred.values.first() {
+                Some(QueryParam::Integer(id)) => Ok(QueryStrategy::ByIdRange {
+                    start: Some(*id),
+                    end: None,
+                    inclusive_start: false,
+                    inclusive_end: true,
+                }),
+                _ => Err(id_err()),
+            },
+            ComparisonOperator::GreaterThanOrEqual => match pred.values.first() {
+                Some(QueryParam::Integer(id)) => Ok(QueryStrategy::ByIdRange {
+                    start: Some(*id),
+                    end: None,
+                    inclusive_start: true,
+                    inclusive_end: true,
+                }),
+                _ => Err(id_err()),
+            },
+            ComparisonOperator::LessThan => match pred.values.first() {
+                Some(QueryParam::Integer(id)) => Ok(QueryStrategy::ByIdRange {
+                    start: None,
+                    end: Some(*id),
+                    inclusive_start: true,
+                    inclusive_end: false,
+                }),
+                _ => Err(id_err()),
+            },
+            ComparisonOperator::LessThanOrEqual => match pred.values.first() {
+                Some(QueryParam::Integer(id)) => Ok(QueryStrategy::ByIdRange {
+                    start: None,
+                    end: Some(*id),
+                    inclusive_start: true,
+                    inclusive_end: true,
+                }),
+                _ => Err(id_err()),
+            },
+            ComparisonOperator::Between => match (pred.values.first(), pred.values.get(1)) {
+                (Some(QueryParam::Integer(lo)), Some(QueryParam::Integer(hi))) => {
+                    Ok(QueryStrategy::ByIdRange {
+                        start: Some(*lo),
+                        end: Some(*hi),
+                        inclusive_start: true,
+                        inclusive_end: true,
+                    })
+                }
+                _ => Err(id_err()),
+            },
+        };
+    }
+
+    reader.validate_column_indexed(&query.table, &pred.column)?;
+    Ok(QueryStrategy::ByIndex {
+        predicate: pred.clone(),
+    })
+}
+
+/// Execute a query against any [`RowReadSource`] and return the rows that
+/// pass the predicate, ordered and trimmed by the server view.
+pub fn execute_query<R: RowReadSource + ?Sized>(
+    reader: &R,
+    query: &Query,
+) -> Result<Vec<serde_json::Value>> {
+    let strategy = determine_query_strategy(reader, query)?;
+
+    let main_rows = match strategy {
+        QueryStrategy::ById(id) => {
+            if let Some(row) = reader.get_row_by_id(&query.table, id)? {
+                vec![row]
+            } else {
+                vec![]
+            }
+        }
+        QueryStrategy::ByIds(ids) => {
+            let mut rows = Vec::new();
+            for id in ids {
+                if let Some(row) = reader.get_row_by_id(&query.table, id)? {
+                    rows.push(row);
+                }
+            }
+            rows
+        }
+        QueryStrategy::ByIdRange {
+            start,
+            end,
+            inclusive_start,
+            inclusive_end,
+        } => reader.query_rows_by_id_range(
+            &query.table,
+            start,
+            end,
+            inclusive_start,
+            inclusive_end,
+        )?,
+        QueryStrategy::ByIndex { ref predicate } => {
+            let row_keys = reader.index_row_keys_for_predicate(&query.table, predicate)?;
+            let mut all_entries = Vec::new();
+            for row_key in &row_keys {
+                all_entries.extend(reader.iter_prefix(row_key)?);
+            }
+            group_columns_into_rows(&all_entries)?
+        }
+        QueryStrategy::TableScan => reader.scan_table(&query.table)?,
+    };
+
+    process_query_results(main_rows, query)
+}
+
+#[cfg(feature = "merk")]
+impl RowReadSource for MerkStorage {
+    fn validate_column_indexed(&self, table_name: &str, column: &str) -> Result<()> {
+        MerkStorage::validate_column_indexed(self, table_name, column)
+    }
+
+    fn get_row_by_id(&self, table_name: &str, row_id: i64) -> Result<Option<serde_json::Value>> {
+        MerkStorage::get_row_by_id(self, table_name, row_id)
+    }
+
+    fn query_rows_by_id_range(
+        &self,
+        table_name: &str,
+        start: Option<i64>,
+        end: Option<i64>,
+        inclusive_start: bool,
+        inclusive_end: bool,
+    ) -> Result<Vec<serde_json::Value>> {
+        MerkStorage::query_rows_by_id_range(
+            self,
+            table_name,
+            start,
+            end,
+            inclusive_start,
+            inclusive_end,
+        )
+    }
+
+    fn index_row_keys_for_predicate(
+        &self,
+        table_name: &str,
+        predicate: &Predicate,
+    ) -> Result<Vec<Vec<u8>>> {
+        MerkStorage::index_row_keys_for_predicate(self, table_name, predicate)
+    }
+
+    fn iter_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        MerkStorage::iter_prefix(self, prefix)
+    }
+
+    fn scan_table(&self, table_name: &str) -> Result<Vec<serde_json::Value>> {
+        MerkStorage::scan_table(self, table_name)
+    }
 }
 
 #[async_trait::async_trait]
@@ -1116,7 +1199,7 @@ impl Storage for MerkStorage {
     where
         T: for<'de> Deserialize<'de>,
     {
-        let rows = self.query_rows(&query)?;
+        let rows = execute_query(self, &query)?;
 
         if let Some(first) = rows.into_iter().next() {
             let result: T = serde_json::from_value(first)
@@ -1131,7 +1214,7 @@ impl Storage for MerkStorage {
     where
         T: for<'de> Deserialize<'de>,
     {
-        let rows = self.query_rows(&query)?;
+        let rows = execute_query(self, &query)?;
 
         let results: Vec<T> = rows
             .into_iter()
@@ -1151,7 +1234,7 @@ impl Storage for MerkStorage {
         let access_rule = load_access_rule(self, &query).await?;
 
         let access_control = access_rule.as_ref().map(|rule| (rule, auth_context));
-        let all_rows = self.query_rows(&query)?;
+        let all_rows = execute_query(self, &query)?;
 
         // Filter rows by access control if provided.
         let rows: Vec<Value> = if let Some((rule, auth)) = access_control {
@@ -2254,7 +2337,7 @@ mod tests {
             join: None,
         };
 
-        let results = storage.query_rows(&select_query).unwrap();
+        let results = execute_query(&storage, &select_query).unwrap();
         assert!(
             results.is_empty(),
             "id > 1 on test_table must not leak rows from later table prefixes: {results:?}"
