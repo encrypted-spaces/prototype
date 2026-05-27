@@ -154,6 +154,38 @@ async fn update_then_id_read_hits() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
+async fn delete_then_full_table_reread_hits() -> Result<(), Box<dyn std::error::Error>> {
+    // A full-row delete extends coverage just like a full-row insert.
+    // After the delete, a subsequent full-table read must hit and the
+    // deleted row must be gone from the result.
+    let (space, transport) = setup_space(5).await?;
+    let items = space.table::<Item>("items");
+    // Prime full-table coverage.
+    let _: Vec<Item> = items.select().all().await?;
+    items.delete().where_eq("id", 3).execute().await?;
+
+    let before = snapshot(&transport);
+    let rows: Vec<Item> = items.select().all().await?;
+    assert_eq!(rows.len(), 4);
+    assert!(rows.iter().all(|r| r.id != Some(3)));
+    assert!(
+        was_cache_hit(before, &transport),
+        "full-table read after a full-row delete should hit"
+    );
+
+    // And the id read of the deleted row must be an authenticated absence
+    // (cache hit returning zero rows) since the row range stays covered.
+    let before = snapshot(&transport);
+    let rows: Vec<Item> = items.select().where_eq("id", 3).all().await?;
+    assert!(rows.is_empty());
+    assert!(
+        was_cache_hit(before, &transport),
+        "id read of a deleted row must hit (authenticated absence)"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn indexed_range_reread_hits() -> Result<(), Box<dyn std::error::Error>> {
     // category is indexed. Prime a between scan, then reread — must hit.
     let (space, transport) = setup_space(10).await?;
