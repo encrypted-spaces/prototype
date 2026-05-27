@@ -968,7 +968,7 @@ mod tests {
         let app_schema = ApplicationSchema::for_testing(vec![schema], root);
         let space = Space::create(transport, app_schema).await?;
 
-        let first_id = space
+        space
             .table::<IndexedRow>("indexed_list_table")
             .insert(&IndexedRow {
                 id: None,
@@ -1004,7 +1004,7 @@ mod tests {
             .await?;
         assert_eq!(rows.len(), 1);
 
-        let second_id = space
+        space
             .table::<IndexedRow>("indexed_list_table")
             .insert(&IndexedRow {
                 id: None,
@@ -1047,11 +1047,6 @@ mod tests {
         assert_eq!(rows[0].id, Some(unrelated_id));
         Ok(())
     }
-
-    fn list_row_id(key: &[u8]) -> i64 {
-        i64::from_be_bytes(key.try_into().expect("list keys are always 8 bytes"))
-    }
-
 
     #[tokio::test]
     async fn test_fast_forward_reports_same_change_id_state_divergence() -> Result<()> {

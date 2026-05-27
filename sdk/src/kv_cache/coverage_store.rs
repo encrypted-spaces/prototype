@@ -34,6 +34,7 @@ impl CoverageStore {
     }
 
     /// Outer `None` means no point stored. Outer `Some(None)` is a tombstone.
+    #[cfg(test)]
     pub fn get_point(&self, key: &[u8]) -> Option<&Option<Vec<u8>>> {
         self.points.get(key)
     }
@@ -44,11 +45,7 @@ impl CoverageStore {
         if start >= end {
             return true;
         }
-        if let Some((s, e)) = self
-            .intervals
-            .range(..=start.to_vec())
-            .next_back()
-        {
+        if let Some((s, e)) = self.intervals.range(..=start.to_vec()).next_back() {
             s.as_slice() <= start && end <= e.as_slice()
         } else {
             false
@@ -88,10 +85,7 @@ impl CoverageStore {
 
     /// Iterate present (non-tombstone) point entries whose key starts with
     /// `prefix`, in sorted key order.
-    pub fn iter_prefix_present(
-        &self,
-        prefix: &[u8],
-    ) -> impl Iterator<Item = (&Vec<u8>, &Vec<u8>)> {
+    pub fn iter_prefix_present(&self, prefix: &[u8]) -> impl Iterator<Item = (&Vec<u8>, &Vec<u8>)> {
         let p = prefix.to_vec();
         self.points
             .range(p.clone()..)
@@ -152,11 +146,7 @@ impl CoverageStore {
         // The interval immediately before `end` (covers byte end-1 if any
         // interval starting at or before end-1 ends at or after end).
         let last_byte_bound = end.to_vec();
-        let Some((s, e)) = self
-            .intervals
-            .range(..last_byte_bound)
-            .next_back()
-        else {
+        let Some((s, e)) = self.intervals.range(..last_byte_bound).next_back() else {
             return end.to_vec();
         };
         if e.as_slice() < end {
@@ -164,14 +154,9 @@ impl CoverageStore {
         }
         // Walk backward as long as adjacent intervals continue the run.
         let mut covered_start = s.clone();
-        loop {
-            let Some((prev_start, prev_end)) = self
-                .intervals
-                .range(..covered_start.clone())
-                .next_back()
-            else {
-                break;
-            };
+        while let Some((prev_start, prev_end)) =
+            self.intervals.range(..covered_start.clone()).next_back()
+        {
             if prev_end.as_slice() < covered_start.as_slice() {
                 break;
             }
@@ -294,7 +279,10 @@ mod tests {
         cs.put_point(s(b"a"), Some(s(b"1")));
         cs.put_point(s(b"b"), Some(s(b"2")));
         cs.put_point(s(b"c"), Some(s(b"3")));
-        let got: Vec<_> = cs.iter_range_present(b"a", b"c").map(|(k, _)| k.clone()).collect();
+        let got: Vec<_> = cs
+            .iter_range_present(b"a", b"c")
+            .map(|(k, _)| k.clone())
+            .collect();
         assert_eq!(got, vec![s(b"a"), s(b"b")]);
     }
 

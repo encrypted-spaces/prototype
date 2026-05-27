@@ -3,6 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use encrypted_spaces_backend::error::{Result, SdkError};
+use encrypted_spaces_backend::merk_storage::keys::query_param_to_tuple_element;
 use encrypted_spaces_backend::merk_storage::proofs::VerifiedRows;
 use encrypted_spaces_backend::merk_storage::{
     determine_query_strategy, execute_query, group_columns_into_rows, index_ranges_for_predicate,
@@ -12,7 +13,6 @@ use encrypted_spaces_backend::merk_storage::{
 use encrypted_spaces_backend::query::{Order, Predicate, Query, QueryParam};
 use encrypted_spaces_backend::schema::Schema;
 use encrypted_spaces_changelog_core::{prefix_successor, ReadOp};
-use encrypted_spaces_backend::merk_storage::keys::query_param_to_tuple_element;
 use encrypted_spaces_storage_encoding::keys;
 
 use super::coverage_store::CoverageStore;
@@ -77,6 +77,7 @@ impl KvCache {
         }
     }
 
+    #[cfg(test)]
     pub fn anchor(&self) -> &DataCommitment {
         &self.anchor
     }
@@ -143,8 +144,11 @@ impl KvCache {
             self.storage.put_point(k.clone(), Some(v.clone()));
         }
 
-        let present: std::collections::HashSet<&[u8]> =
-            verified.kv_pairs.iter().map(|(k, _)| k.as_slice()).collect();
+        let present: std::collections::HashSet<&[u8]> = verified
+            .kv_pairs
+            .iter()
+            .map(|(k, _)| k.as_slice())
+            .collect();
 
         for op in &verified.read_ops {
             match op {
@@ -238,10 +242,7 @@ impl KvCache {
     /// row-key range, scan every row, filter client-side by the query's
     /// predicate, and apply order/cursor/limit/projection. Matches Trevor's
     /// `FullTableFallbackOptions` path.
-    fn full_table_fallback(
-        &self,
-        query: &Query,
-    ) -> Result<CacheResult<Vec<serde_json::Value>>> {
+    fn full_table_fallback(&self, query: &Query) -> Result<CacheResult<Vec<serde_json::Value>>> {
         let start = keys::row_prefix(&query.table);
         let end = prefix_succ_required(&start)?;
         if !self.storage.covers_range(&start, &end) {
@@ -548,11 +549,7 @@ impl<'a> RowReadSource for KvCacheReader<'a> {
         Ok(())
     }
 
-    fn get_row_by_id(
-        &self,
-        table_name: &str,
-        row_id: i64,
-    ) -> Result<Option<serde_json::Value>> {
+    fn get_row_by_id(&self, table_name: &str, row_id: i64) -> Result<Option<serde_json::Value>> {
         let prefix = keys::row_key(table_name, row_id);
         let columns: Vec<(Vec<u8>, Vec<u8>)> = self
             .storage
@@ -638,9 +635,7 @@ impl<'a> RowReadSource for KvCacheReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use encrypted_spaces_backend::query::{
-        ComparisonOperator, Order, QueryOperation, QueryParam,
-    };
+    use encrypted_spaces_backend::query::{ComparisonOperator, Order, QueryOperation, QueryParam};
     use encrypted_spaces_storage_encoding::stored_value;
     use std::collections::HashMap;
 
@@ -816,7 +811,9 @@ mod tests {
         // Splicing with the original commitment must report "not applied".
         let applied = cache.apply_select([1; 32], &verified);
         assert!(!applied, "splice must drop when anchor has advanced");
-        let result = cache.try_select(&select_all_query(TABLE), &HashMap::new()).unwrap();
+        let result = cache
+            .try_select(&select_all_query(TABLE), &HashMap::new())
+            .unwrap();
         assert!(matches!(result, CacheResult::Miss));
     }
 
@@ -873,10 +870,7 @@ mod tests {
     #[test]
     fn full_table_fallback_filters_non_indexed_predicate_when_table_covered() {
         // Schema: id (plaintext, not indexed), value (plaintext, NOT indexed).
-        let schema = schema_with_columns(
-            TABLE,
-            vec![("id", true, false), ("value", true, false)],
-        );
+        let schema = schema_with_columns(TABLE, vec![("id", true, false), ("value", true, false)]);
         let mut schemas = HashMap::new();
         schemas.insert(TABLE.to_string(), schema);
 
@@ -919,10 +913,7 @@ mod tests {
 
     #[test]
     fn full_table_fallback_misses_when_table_not_covered() {
-        let schema = schema_with_columns(
-            TABLE,
-            vec![("id", true, false), ("value", true, false)],
-        );
+        let schema = schema_with_columns(TABLE, vec![("id", true, false), ("value", true, false)]);
         let mut schemas = HashMap::new();
         schemas.insert(TABLE.to_string(), schema);
 
@@ -949,8 +940,7 @@ mod tests {
         // Hand-built CacheUpdate that puts a row's column value AND
         // extends coverage of the row range (what cache_update_from_writes
         // emits for a full-row insert). Subsequent id-read must hit.
-        let schema =
-            schema_with_columns(TABLE, vec![("id", true, false), ("text", true, false)]);
+        let schema = schema_with_columns(TABLE, vec![("id", true, false), ("text", true, false)]);
         let mut schemas = HashMap::new();
         schemas.insert(TABLE.to_string(), schema);
 
@@ -969,7 +959,10 @@ mod tests {
             CacheResult::Hit(rows) => {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].get("id").and_then(|v| v.as_i64()), Some(7));
-                assert_eq!(rows[0].get("text").and_then(|v| v.as_str()), Some("spliced"));
+                assert_eq!(
+                    rows[0].get("text").and_then(|v| v.as_str()),
+                    Some("spliced")
+                );
             }
             CacheResult::Miss => panic!("expected Hit after coverage-extending splice"),
         }
@@ -979,8 +972,7 @@ mod tests {
     fn write_splice_without_coverage_extension_misses_id_read() {
         // Same setup but no coverage extension — what
         // cache_update_from_writes emits for a partial-column update.
-        let schema =
-            schema_with_columns(TABLE, vec![("id", true, false), ("text", true, false)]);
+        let schema = schema_with_columns(TABLE, vec![("id", true, false), ("text", true, false)]);
         let mut schemas = HashMap::new();
         schemas.insert(TABLE.to_string(), schema);
 

@@ -1363,10 +1363,7 @@ fn verify_tracer_select_proof(
 
     let mut kv_pairs = main_all_entries;
     kv_pairs.extend(join_all_entries);
-    let mut read_ops: Vec<ReadOp> = all_read_results[0]
-        .iter()
-        .map(|pr| pr.op.clone())
-        .collect();
+    let mut read_ops: Vec<ReadOp> = all_read_results[0].iter().map(|pr| pr.op.clone()).collect();
     read_ops.extend(all_read_results[1].iter().map(|pr| pr.op.clone()));
 
     Ok(VerifiedRows {

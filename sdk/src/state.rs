@@ -1,3 +1,4 @@
+use crate::kv_cache::KvCache;
 use crate::SpaceKeyManager;
 use crate::{DataCommitment, Space, SpaceId, Transport};
 use encrypted_spaces_acl_types::Action;
@@ -6,7 +7,6 @@ use encrypted_spaces_backend::{
     error::{Result, SdkError},
     schema::Schema,
 };
-use crate::kv_cache::KvCache;
 // `state` is a private module (`mod state;` in lib.rs), so `pub` items here
 // can never escape the crate. Use `pub(crate)` to make the visibility intent
 // explicit and consistent with PR #117.

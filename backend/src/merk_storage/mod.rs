@@ -1010,9 +1010,8 @@ pub fn index_ranges_for_predicate(
             Ok(vec![(all_start, value_prefix(v)?)])
         }
         ComparisonOperator::LessThanOrEqual => {
-            let v = first.ok_or_else(|| {
-                SdkError::InvalidQuery("LessThanOrEqual requires a value".into())
-            })?;
+            let v = first
+                .ok_or_else(|| SdkError::InvalidQuery("LessThanOrEqual requires a value".into()))?;
             let p = value_prefix(v)?;
             let end = prefix_succ_required(&p)?;
             Ok(vec![(all_start, end)])

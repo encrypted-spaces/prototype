@@ -16,7 +16,6 @@
 mod cache_common;
 
 use cache_common::{setup_space, snapshot, was_cache_hit};
-use encrypted_spaces_sdk::testing as _;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -35,6 +34,7 @@ struct Tag {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ItemWithTag {
     name: String,
     label: String,
@@ -50,7 +50,10 @@ async fn full_table_reread_hits() -> Result<(), Box<dyn std::error::Error>> {
     // Reread — must hit
     let rows: Vec<Item> = items.select().all().await?;
     assert_eq!(rows.len(), 5);
-    assert!(was_cache_hit(before, &transport), "second full-table read should hit");
+    assert!(
+        was_cache_hit(before, &transport),
+        "second full-table read should hit"
+    );
     Ok(())
 }
 
@@ -62,7 +65,10 @@ async fn eq_predicate_reread_hits() -> Result<(), Box<dyn std::error::Error>> {
     let before = snapshot(&transport);
     let rows: Vec<Item> = items.select().where_eq("category", 1).all().await?;
     assert!(rows.iter().all(|r| r.category == 1));
-    assert!(was_cache_hit(before, &transport), "indexed eq reread should hit");
+    assert!(
+        was_cache_hit(before, &transport),
+        "indexed eq reread should hit"
+    );
     Ok(())
 }
 
@@ -101,7 +107,10 @@ async fn limit_reread_hits_on_partial_coverage() -> Result<(), Box<dyn std::erro
     let before = snapshot(&transport);
     let rows: Vec<Item> = items.select().limit(3).all().await?;
     assert_eq!(rows.len(), 3);
-    assert!(was_cache_hit(before, &transport), "limit reread on covered table should hit");
+    assert!(
+        was_cache_hit(before, &transport),
+        "limit reread on covered table should hit"
+    );
     Ok(())
 }
 
@@ -123,7 +132,10 @@ async fn pk_join_reread_hits() -> Result<(), Box<dyn std::error::Error>> {
         .all_as()
         .await?;
     assert_eq!(rows.len(), 10);
-    assert!(was_cache_hit(before, &transport), "PK join reread should hit");
+    assert!(
+        was_cache_hit(before, &transport),
+        "PK join reread should hit"
+    );
     Ok(())
 }
 
@@ -190,17 +202,9 @@ async fn indexed_range_reread_hits() -> Result<(), Box<dyn std::error::Error>> {
     // category is indexed. Prime a between scan, then reread — must hit.
     let (space, transport) = setup_space(10).await?;
     let items = space.table::<Item>("items");
-    let _: Vec<Item> = items
-        .select()
-        .where_between("category", 2, 4)
-        .all()
-        .await?;
+    let _: Vec<Item> = items.select().where_between("category", 2, 4).all().await?;
     let before = snapshot(&transport);
-    let rows: Vec<Item> = items
-        .select()
-        .where_between("category", 2, 4)
-        .all()
-        .await?;
+    let rows: Vec<Item> = items.select().where_between("category", 2, 4).all().await?;
     assert!(rows.iter().all(|r| (2..=4).contains(&r.category)));
     assert!(
         was_cache_hit(before, &transport),
@@ -210,8 +214,8 @@ async fn indexed_range_reread_hits() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn full_table_fallback_hits_on_non_indexed_predicate() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn full_table_fallback_hits_on_non_indexed_predicate(
+) -> Result<(), Box<dyn std::error::Error>> {
     // `name` is not indexed in items_schema. With the full table primed,
     // a where_eq on `name` must serve from cache via the fallback path.
     let (space, transport) = setup_space(5).await?;

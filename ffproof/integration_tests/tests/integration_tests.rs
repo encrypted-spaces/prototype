@@ -164,7 +164,7 @@ async fn test_basic_e2e_flow_inner() {
         let response = response.unwrap();
 
         // Client handles the response using SDK's validate_and_apply_change
-        let client_response = client1.validate_and_apply_change(&change.entry, &response);
+        let client_response = client1.validate_and_apply_change(&change,&response);
         assert!(client_response.is_ok());
     }
 
@@ -230,7 +230,7 @@ async fn test_basic_e2e_flow_inner() {
         // In the SDK the server notifies and broadcasts changes here
 
         // Client handles the response using SDK's validate_and_apply_change
-        let client_response = client1.validate_and_apply_change(&change.entry, &response.unwrap());
+        let client_response = client1.validate_and_apply_change(&change,&response.unwrap());
         assert!(client_response.is_ok());
     }
 
@@ -272,11 +272,11 @@ async fn test_basic_e2e_flow_inner() {
 
     // Now send the change to the server, process on client1
     let response = server.handle_change(&change, &auth1).await.unwrap();
-    let client_response = client1.validate_and_apply_change(&change.entry, &response);
+    let client_response = client1.validate_and_apply_change(&change,&response);
     assert!(client_response.is_ok());
 
     // Try to handle response on client2, expect it to fail because they're out of date
-    let client2_err = client2.validate_and_apply_change(&change.entry, &response);
+    let client2_err = client2.validate_and_apply_change(&change,&response);
     assert!(client2_err.is_err());
     println!("Error (expected) from client2: {client2_err:?}");
 
@@ -322,7 +322,7 @@ async fn insert_products(server: &Server, client: &Space, auth: &AuthContext, co
         sign_test_change(client.uid().unwrap(), &mut change);
         let response = server.handle_change(&change, auth).await.unwrap();
         client
-            .validate_and_apply_change(&change.entry, &response)
+            .validate_and_apply_change(&change,&response)
             .unwrap();
     }
 }
@@ -509,7 +509,7 @@ async fn delete_product(server: &Server, client: &Space, auth: &AuthContext, row
 
     let response = server.handle_change(&change, auth).await.unwrap();
     client
-        .validate_and_apply_change(&change.entry, &response)
+        .validate_and_apply_change(&change,&response)
         .unwrap();
 }
 
@@ -673,7 +673,7 @@ async fn delete_products(server: &Server, client: &Space, auth: &AuthContext, ro
 
     let response = server.handle_change(&change, auth).await.unwrap();
     client
-        .validate_and_apply_change(&change.entry, &response)
+        .validate_and_apply_change(&change,&response)
         .unwrap();
 }
 
@@ -876,7 +876,7 @@ async fn insert_product_with_author(
 
     let response = server.handle_change(&change, auth).await.unwrap();
     client
-        .validate_and_apply_change(&change.entry, &response)
+        .validate_and_apply_change(&change,&response)
         .unwrap();
 }
 
@@ -1218,7 +1218,7 @@ async fn test_proof_contains_reads_inner() {
 
     // Also verify through the SDK path
     client1
-        .validate_and_apply_change(&change.entry, &response)
+        .validate_and_apply_change(&change,&response)
         .unwrap();
     println!("✓ Proof with embedded reads validates correctly via SDK");
 

@@ -119,6 +119,44 @@ fn full_row_coverage(
         .collect()
 }
 
+/// Last new-row id touching `table` in `writes`. A row counts as new when its
+/// puts cover every non-id column declared in `schema`.
+pub fn new_row_id_for_table(writes: &[BatchOp], table: &str, schema: &Schema) -> Option<i64> {
+    let schema_non_id_cols: BTreeSet<String> = schema
+        .columns
+        .iter()
+        .filter(|c| c.name != "id")
+        .map(|c| c.name.clone())
+        .collect();
+    if schema_non_id_cols.is_empty() {
+        return None;
+    }
+
+    let mut per_row: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
+    for op in writes {
+        let key = match op {
+            BatchOp::Put { key, .. } | BatchOp::PutHash { key, .. } => key,
+            _ => continue,
+        };
+        if let Ok(ParsedKey::Column {
+            table: t,
+            row_id,
+            column,
+        }) = parse_key(key)
+        {
+            if t == table {
+                per_row.entry(row_id).or_default().insert(column);
+            }
+        }
+    }
+
+    per_row
+        .into_iter()
+        .filter(|(_, cols)| schema_non_id_cols.iter().all(|c| cols.contains(c)))
+        .map(|(row_id, _)| row_id)
+        .next_back()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,42 +258,4 @@ mod tests {
         assert_eq!(update.writes.len(), 2);
         assert_eq!(update.coverage_extensions.len(), 1);
     }
-}
-
-/// Last new-row id touching `table` in `writes`. A row counts as new when its
-/// puts cover every non-id column declared in `schema`.
-pub fn new_row_id_for_table(writes: &[BatchOp], table: &str, schema: &Schema) -> Option<i64> {
-    let schema_non_id_cols: BTreeSet<String> = schema
-        .columns
-        .iter()
-        .filter(|c| c.name != "id")
-        .map(|c| c.name.clone())
-        .collect();
-    if schema_non_id_cols.is_empty() {
-        return None;
-    }
-
-    let mut per_row: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
-    for op in writes {
-        let key = match op {
-            BatchOp::Put { key, .. } | BatchOp::PutHash { key, .. } => key,
-            _ => continue,
-        };
-        if let Ok(ParsedKey::Column {
-            table: t,
-            row_id,
-            column,
-        }) = parse_key(key)
-        {
-            if t == table {
-                per_row.entry(row_id).or_default().insert(column);
-            }
-        }
-    }
-
-    per_row
-        .into_iter()
-        .filter(|(_, cols)| schema_non_id_cols.iter().all(|c| cols.contains(c)))
-        .map(|(row_id, _)| row_id)
-        .next_back()
 }

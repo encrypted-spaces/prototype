@@ -322,7 +322,7 @@ async fn insert_products(server: &Server, client: &Space, auth: &AuthContext, co
             .unwrap();
         let t_hc_elapsed = t_hc.elapsed();
         client
-            .validate_and_apply_change(&change.entry, &response)
+            .validate_and_apply_change(&change, &response)
             .unwrap();
         if (i + 1).is_multiple_of(20) || i + 1 == count {
             eprintln!(

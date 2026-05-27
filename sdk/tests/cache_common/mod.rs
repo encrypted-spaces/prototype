@@ -170,8 +170,7 @@ pub async fn setup_space(
     let transport = LocalTransport::in_memory().await?;
     let counting = CountingTransport::new(transport);
     let dc = initial_internal_data_commitment();
-    let space =
-        Space::create(counting.clone(), ApplicationSchema::for_testing(vec![], dc)).await?;
+    let space = Space::create(counting.clone(), ApplicationSchema::for_testing(vec![], dc)).await?;
 
     space.create_table(&items_schema()).await?;
     space.create_table(&tags_schema()).await?;
