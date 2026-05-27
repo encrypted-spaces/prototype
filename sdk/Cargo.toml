@@ -57,6 +57,7 @@ tokio = { workspace = true, features = ["rt","rt-multi-thread","macros","sync","
 criterion = { workspace = true, features = ["async_tokio"] }
 expect-test = "1"
 tempfile = "3"
+proptest = { workspace = true }
 
 # Self-dev-dep enables `local-transport` (in-process server for tests)
 # and `testing` (unlocks `ApplicationSchema::for_testing`, which bakes in

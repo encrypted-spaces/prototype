@@ -22,6 +22,9 @@ pub mod cache;
 pub mod coverage_store;
 pub mod helpers;
 
+#[cfg(test)]
+mod proptests;
+
 pub use cache::{CacheResult, CacheUpdate, CacheWrite, KvCache};
 pub use coverage_store::CoverageStore;
 pub use helpers::{cache_update_from_writes, new_row_id_for_table};
