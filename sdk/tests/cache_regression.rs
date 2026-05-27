@@ -154,6 +154,30 @@ async fn update_then_id_read_hits() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
+async fn indexed_range_reread_hits() -> Result<(), Box<dyn std::error::Error>> {
+    // category is indexed. Prime a between scan, then reread — must hit.
+    let (space, transport) = setup_space(10).await?;
+    let items = space.table::<Item>("items");
+    let _: Vec<Item> = items
+        .select()
+        .where_between("category", 2, 4)
+        .all()
+        .await?;
+    let before = snapshot(&transport);
+    let rows: Vec<Item> = items
+        .select()
+        .where_between("category", 2, 4)
+        .all()
+        .await?;
+    assert!(rows.iter().all(|r| (2..=4).contains(&r.category)));
+    assert!(
+        was_cache_hit(before, &transport),
+        "indexed Between reread should hit"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn full_table_fallback_hits_on_non_indexed_predicate() -> Result<(), Box<dyn std::error::Error>>
 {
     // `name` is not indexed in items_schema. With the full table primed,

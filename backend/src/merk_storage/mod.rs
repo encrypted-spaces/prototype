@@ -467,69 +467,13 @@ impl MerkStorage {
         table_name: &str,
         predicate: &Predicate,
     ) -> Result<Vec<Vec<u8>>> {
-        let column = &predicate.column;
-        let prefix_for = |v: &QueryParam| -> Result<Vec<u8>> {
-            keys::index_value_prefix(table_name, column, keys::query_param_to_tuple_element(v))
-                .map_err(|e| SdkError::InvalidQuery(format!("Invalid index value: {e}")))
-        };
-        let all_start = keys::index_column_prefix(table_name, column);
-        let all_end = proofs::prefix_successor_required(&all_start)?;
-        let first = predicate.values.first();
-
-        let index_entries = match &predicate.operator {
-            ComparisonOperator::Equal | ComparisonOperator::In => {
-                let mut entries = Vec::new();
-                for val in &predicate.values {
-                    entries.extend(self.iter_prefix(&prefix_for(val)?)?);
+        let ranges = index_ranges_for_predicate(table_name, predicate)?;
+        let mut row_keys = Vec::new();
+        for (start, end) in ranges {
+            for (key, _) in self.iter_range(&start, Some(&end))? {
+                if let Ok(keys::ParsedKey::Index { row_id, .. }) = keys::parse_key(&key) {
+                    row_keys.push(keys::row_key(table_name, row_id));
                 }
-                entries
-            }
-            ComparisonOperator::GreaterThan => {
-                let v = first
-                    .ok_or_else(|| SdkError::InvalidQuery("GreaterThan requires a value".into()))?;
-                self.iter_range(
-                    &proofs::prefix_successor_required(&prefix_for(v)?)?,
-                    Some(&all_end),
-                )?
-            }
-            ComparisonOperator::GreaterThanOrEqual => {
-                let v = first.ok_or_else(|| {
-                    SdkError::InvalidQuery("GreaterThanOrEqual requires a value".into())
-                })?;
-                self.iter_range(&prefix_for(v)?, Some(&all_end))?
-            }
-            ComparisonOperator::LessThan => {
-                let v = first
-                    .ok_or_else(|| SdkError::InvalidQuery("LessThan requires a value".into()))?;
-                self.iter_range(&all_start, Some(&prefix_for(v)?))?
-            }
-            ComparisonOperator::LessThanOrEqual => {
-                let v = first.ok_or_else(|| {
-                    SdkError::InvalidQuery("LessThanOrEqual requires a value".into())
-                })?;
-                self.iter_range(
-                    &all_start,
-                    Some(&proofs::prefix_successor_required(&prefix_for(v)?)?),
-                )?
-            }
-            ComparisonOperator::Between => {
-                let lo = first
-                    .ok_or_else(|| SdkError::InvalidQuery("Between requires two values".into()))?;
-                let hi = predicate
-                    .values
-                    .get(1)
-                    .ok_or_else(|| SdkError::InvalidQuery("Between requires two values".into()))?;
-                self.iter_range(
-                    &prefix_for(lo)?,
-                    Some(&proofs::prefix_successor_required(&prefix_for(hi)?)?),
-                )?
-            }
-        };
-
-        let mut row_keys = Vec::with_capacity(index_entries.len());
-        for (key, _) in &index_entries {
-            if let Ok(keys::ParsedKey::Index { row_id, .. }) = keys::parse_key(key) {
-                row_keys.push(keys::row_key(table_name, row_id));
             }
         }
         Ok(row_keys)
@@ -1011,6 +955,92 @@ pub fn determine_query_strategy<R: RowReadSource + ?Sized>(
     reader.validate_column_indexed(&query.table, &pred.column)?;
     Ok(QueryStrategy::ByIndex {
         predicate: pred.clone(),
+    })
+}
+
+/// Byte ranges over a table's secondary-index key space that `predicate`
+/// would scan to enumerate matching row ids. Shared by `MerkStorage`'s
+/// proven index scan and the SDK KV cache's coverage check so both compute
+/// the same bounds.
+pub fn index_ranges_for_predicate(
+    table: &str,
+    predicate: &Predicate,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let col = &predicate.column;
+    let value_prefix = |v: &QueryParam| -> Result<Vec<u8>> {
+        keys::index_value_prefix(table, col, keys::query_param_to_tuple_element(v))
+            .map_err(|e| SdkError::InvalidQuery(format!("Invalid index value: {e}")))
+    };
+    let all_start = keys::index_column_prefix(table, col);
+    let all_end = prefix_succ_required(&all_start)?;
+    let first = predicate.values.first();
+
+    match &predicate.operator {
+        ComparisonOperator::Equal => {
+            let v = first.ok_or_else(|| SdkError::InvalidQuery("Equal requires a value".into()))?;
+            let p = value_prefix(v)?;
+            let end = prefix_succ_required(&p)?;
+            Ok(vec![(p, end)])
+        }
+        ComparisonOperator::In => predicate
+            .values
+            .iter()
+            .map(|v| {
+                let p = value_prefix(v)?;
+                let end = prefix_succ_required(&p)?;
+                Ok((p, end))
+            })
+            .collect(),
+        ComparisonOperator::GreaterThan => {
+            let v = first
+                .ok_or_else(|| SdkError::InvalidQuery("GreaterThan requires a value".into()))?;
+            let p = value_prefix(v)?;
+            let start = prefix_succ_required(&p)?;
+            Ok(vec![(start, all_end)])
+        }
+        ComparisonOperator::GreaterThanOrEqual => {
+            let v = first.ok_or_else(|| {
+                SdkError::InvalidQuery("GreaterThanOrEqual requires a value".into())
+            })?;
+            Ok(vec![(value_prefix(v)?, all_end)])
+        }
+        ComparisonOperator::LessThan => {
+            let v =
+                first.ok_or_else(|| SdkError::InvalidQuery("LessThan requires a value".into()))?;
+            Ok(vec![(all_start, value_prefix(v)?)])
+        }
+        ComparisonOperator::LessThanOrEqual => {
+            let v = first.ok_or_else(|| {
+                SdkError::InvalidQuery("LessThanOrEqual requires a value".into())
+            })?;
+            let p = value_prefix(v)?;
+            let end = prefix_succ_required(&p)?;
+            Ok(vec![(all_start, end)])
+        }
+        ComparisonOperator::Between => {
+            let lo = first
+                .ok_or_else(|| SdkError::InvalidQuery("Between requires two values".into()))?;
+            let hi = predicate
+                .values
+                .get(1)
+                .ok_or_else(|| SdkError::InvalidQuery("Between requires two values".into()))?;
+            let lo_p = value_prefix(lo)?;
+            let hi_p = value_prefix(hi)?;
+            let hi_end = prefix_succ_required(&hi_p)?;
+            Ok(vec![(lo_p, hi_end)])
+        }
+    }
+}
+
+/// Lexicographic successor of `prefix`, or a friendly error if the prefix
+/// has no finite successor (empty or all-`0xFF`). Shared by the proof
+/// path, `index_ranges_for_predicate`, and the SDK's cache range checks
+/// so they all surface the same error message.
+pub fn prefix_succ_required(prefix: &[u8]) -> Result<Vec<u8>> {
+    encrypted_spaces_changelog_core::prefix_successor(prefix).ok_or_else(|| {
+        SdkError::DatabaseError(format!(
+            "no lexicographic successor for prefix {prefix:02x?}"
+        ))
     })
 }
 

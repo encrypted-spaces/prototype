@@ -5,8 +5,9 @@ use std::collections::{BTreeSet, HashMap};
 use encrypted_spaces_backend::error::{Result, SdkError};
 use encrypted_spaces_backend::merk_storage::proofs::VerifiedRows;
 use encrypted_spaces_backend::merk_storage::{
-    determine_query_strategy, execute_query, group_columns_into_rows, parse_key,
-    process_query_results, reassemble_row, ParsedKey, QueryStrategy, RowReadSource, ID_FIELD,
+    determine_query_strategy, execute_query, group_columns_into_rows, index_ranges_for_predicate,
+    parse_key, prefix_succ_required, process_query_results, reassemble_row, ParsedKey,
+    QueryStrategy, RowReadSource, ID_FIELD,
 };
 use encrypted_spaces_backend::query::{Order, Predicate, Query, QueryParam};
 use encrypted_spaces_backend::schema::Schema;
@@ -322,36 +323,22 @@ impl KvCache {
         }
     }
 
-    /// Coverage check for `ByIndex` predicates. The index value range must
-    /// be fully covered, and every row id the index points at must have
-    /// its row range fully covered too. Range/comparison operators
-    /// (Gt/Lt/Between/In) report Missing for now — those need ordered
-    /// index scans we don't model yet.
+    /// Coverage check for `ByIndex` predicates. Computes the index byte
+    /// range the operator scans, requires it covered, enumerates matching
+    /// row ids from the cached index entries, and confirms each row range
+    /// is also covered.
     fn indexed_predicate_coverage(
         &self,
         table: &str,
         predicate: &Predicate,
     ) -> Result<IndexedCoverage> {
-        use encrypted_spaces_backend::query::ComparisonOperator;
-        let values: &[QueryParam] = match predicate.operator {
-            ComparisonOperator::Equal => &predicate.values[..1.min(predicate.values.len())],
-            ComparisonOperator::In => &predicate.values,
-            _ => return Ok(IndexedCoverage::Missing),
-        };
-        if values.is_empty() {
-            return Ok(IndexedCoverage::Missing);
-        }
-
+        let index_ranges = index_ranges_for_predicate(table, predicate)?;
         let mut row_ids: BTreeSet<i64> = BTreeSet::new();
-        for value in values {
-            let tuple_element = query_param_to_tuple_element(value);
-            let index_prefix = keys::index_value_prefix(table, &predicate.column, tuple_element)
-                .map_err(|e| SdkError::InvalidQuery(format!("Invalid index value: {e}")))?;
-            let index_end = prefix_succ_required(&index_prefix)?;
-            if !self.storage.covers_range(&index_prefix, &index_end) {
+        for (start, end) in &index_ranges {
+            if !self.storage.covers_range(start, end) {
                 return Ok(IndexedCoverage::Missing);
             }
-            for (key, _) in self.storage.iter_prefix_present(&index_prefix) {
+            for (key, _) in self.storage.iter_range_present(start, end) {
                 if let Ok(ParsedKey::Index { row_id, .. }) = parse_key(key) {
                     row_ids.insert(row_id);
                 }
@@ -552,14 +539,6 @@ fn required_ranges_for_strategy(strategy: &QueryStrategy, table: &str) -> Result
     }
 }
 
-fn prefix_succ_required(prefix: &[u8]) -> Result<Vec<u8>> {
-    prefix_successor(prefix).ok_or_else(|| {
-        SdkError::DatabaseError(format!(
-            "no lexicographic successor for prefix {prefix:02x?}"
-        ))
-    })
-}
-
 impl<'a> RowReadSource for KvCacheReader<'a> {
     fn validate_column_indexed(&self, _table_name: &str, _column: &str) -> Result<()> {
         // Schema-agnostic: planner returns `ByIndex` for any non-id predicate
@@ -617,30 +596,15 @@ impl<'a> RowReadSource for KvCacheReader<'a> {
         table_name: &str,
         predicate: &Predicate,
     ) -> Result<Vec<Vec<u8>>> {
-        use encrypted_spaces_backend::query::ComparisonOperator;
-        // Only Equal/In are supported on the cache side — Gt/Lt/Between
-        // need ordered range scans we don't yet model. `try_select`'s
-        // coverage gate (`indexed_predicate_coverage`) reports Missing for
-        // other operators, so callers never reach this path with one.
-        let values: &[QueryParam] = match predicate.operator {
-            ComparisonOperator::Equal => &predicate.values[..1.min(predicate.values.len())],
-            ComparisonOperator::In => &predicate.values,
-            _ => {
-                return Err(SdkError::DatabaseError(format!(
-                    "KvCacheReader: unsupported indexed predicate operator {:?}",
-                    predicate.operator
-                )));
-            }
-        };
-
+        // `try_select`'s indexed_predicate_coverage already enforced
+        // coverage of these ranges, so iter_range_present here is reading
+        // an authoritative window.
+        let ranges = index_ranges_for_predicate(table_name, predicate)?;
         let mut row_keys = Vec::new();
-        for value in values {
-            let tuple_element = query_param_to_tuple_element(value);
-            let index_prefix = keys::index_value_prefix(table_name, &predicate.column, tuple_element)
-                .map_err(|e| SdkError::InvalidQuery(format!("Invalid index value: {e}")))?;
+        for (start, end) in ranges {
             for (key, _) in self
                 .storage
-                .iter_prefix_present(&index_prefix)
+                .iter_range_present(&start, &end)
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect::<Vec<_>>()
             {
