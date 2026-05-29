@@ -1551,12 +1551,16 @@ impl Space {
         // See issue #30.
         check_sigref_continuity(entry, expected_sig_ref)?;
 
-        // Build the cache splice outside the lock — it only reads the
-        // verified writes, the change's hashed_values sidecar, and the
-        // schema snapshot we captured atomically above. The schema is used
-        // to recognize full-row writes so we can extend coverage of the
-        // row's byte range alongside the point puts.
-        let cache_update = crate::kv_cache::cache_update_from_writes(change, &writes, &schemas);
+        // Reduce prunes retention keys — data encrypted with those keys
+        // can no longer be decrypted. Skip the splice and let
+        // apply_state_update reanchor (clear) the cache instead.
+        let cache_update = if entry.message.op_type == OpType::Reduce {
+            None
+        } else {
+            Some(crate::kv_cache::cache_update_from_writes(
+                change, &writes, &schemas,
+            ))
+        };
 
         self.apply_state_update(
             entry,
@@ -1566,7 +1570,7 @@ impl Space {
             uid,
             current_clc,
             new_timestamp_hwm,
-            Some(cache_update),
+            cache_update,
         )?;
 
         Ok(writes)
@@ -1653,11 +1657,17 @@ impl Space {
             // Splice the verified writes into the KV cache and advance its
             // anchor in the same lock acquisition — no observable window
             // where current_data_commitment is the new root while the cache
-            // is still anchored at the old one. FF ragged-change replay
-            // passes `None` because it reanchors the cache wholesale after
-            // the loop instead of splicing each ragged change.
-            if let Some(update) = cache_update {
-                state.kv_cache.advance_anchor(response.new_root, update);
+            // is still anchored at the old one.
+            match cache_update {
+                Some(update) => {
+                    state.kv_cache.advance_anchor(response.new_root, update);
+                }
+                None => {
+                    // Reduce and FF ragged-change replay pass None.
+                    // Reanchor (clear + set new root) so the cache doesn't
+                    // hold data anchored to the old commitment.
+                    state.kv_cache.reanchor(response.new_root);
+                }
             }
         });
         Ok(())
