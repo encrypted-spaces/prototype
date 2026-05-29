@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use encrypted_spaces_changelog_core::changelog::OpType;
-
 use crate::changelog::BroadcastApplyOutcome;
 use crate::websocket_transport::BroadcastEvent;
 use crate::Space;
@@ -9,9 +7,9 @@ use crate::Space;
 /// Spawn the broadcast listener for this Space.
 ///
 /// Subscribes to transport-level broadcast events, drives each one through
-/// [`Space::handle_broadcast`] (signature verification, change application,
-/// cache update), then republishes the applied event on the Space's
-/// `updates_tx` channel for app consumers.
+/// [`Space::handle_broadcast`] (signature verification, change application),
+/// then republishes the applied event on the Space's `updates_tx` channel
+/// for app consumers.
 ///
 /// Holds a `Weak<dyn Transport>` and re-constructs a temporary `Space` only
 /// while processing an event, so the task does not pin the transport. When
@@ -85,10 +83,7 @@ impl Space {
 
         match self.apply_broadcast_change(change, change_response).await {
             BroadcastApplyOutcome::Skipped => return false,
-            BroadcastApplyOutcome::Applied { change, writes } => {
-                self.apply_broadcast_cache_updates(&change, &writes).await;
-            }
-            BroadcastApplyOutcome::AppliedCacheInvalidated => {}
+            BroadcastApplyOutcome::Applied => {}
         }
 
         // A failure here means the local HGK is now stale relative to the
@@ -105,23 +100,5 @@ impl Space {
         }
 
         true
-    }
-
-    pub(crate) async fn apply_broadcast_cache_updates(
-        &self,
-        change: &encrypted_spaces_changelog_core::changelog::Change,
-        writes: &[encrypted_spaces_changelog_core::BatchOp],
-    ) {
-        // Reduce prunes old retention keys — data encrypted with those
-        // keys can no longer be decrypted, so just purge all cached
-        // plaintext rather than spending time updating it.
-        if change.entry.message.op_type == OpType::Reduce {
-            self.with_state_mut(|state| {
-                let dc = state.current_data_commitment;
-                state.kv_cache.reanchor(dc);
-            });
-            return;
-        }
-
     }
 }

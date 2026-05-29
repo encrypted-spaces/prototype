@@ -1257,18 +1257,9 @@ fn extract_auth_key_from_create_space_change(
 }
 
 /// Outcome of applying a broadcast change to changelog state.
-///
-/// Tells the broadcast pipeline whether granular cache updates are still
-/// needed: the deferred-sig-retry path invalidates touched-table caches
-/// internally; the upfront-verified path leaves cache updates to the
-/// caller.
 pub(crate) enum BroadcastApplyOutcome {
     Skipped,
-    Applied {
-        change: Change,
-        writes: Vec<BatchOp>,
-    },
-    AppliedCacheInvalidated,
+    Applied,
 }
 
 impl Space {
@@ -1336,8 +1327,8 @@ impl Space {
         // signature verification fails after the proof advances the DC.
         let saved = self.save_changelog_state();
 
-        match self.validate_and_apply_change(&Change { entry: change_entry.clone(), hashed_values: hashed_values.clone() }, &change_response) {
-            Ok(writes) => {
+        match self.validate_and_apply_change(&change, &change_response) {
+            Ok(_writes) => {
                 if sig_deferred {
                     // Key resolution failed earlier (likely stale DC).
                     // Now that validate_and_apply_change has advanced
@@ -1367,10 +1358,8 @@ impl Space {
                         let dc = state.current_data_commitment;
                         state.kv_cache.reanchor(dc);
                     });
-                    BroadcastApplyOutcome::AppliedCacheInvalidated
-                } else {
-                    BroadcastApplyOutcome::Applied { change, writes }
                 }
+                BroadcastApplyOutcome::Applied
             }
             Err(SdkError::FastForwardRequired { ref reason }) => {
                 log::debug!(
@@ -4006,12 +3995,9 @@ mod broadcast_cache_tests {
     #[tokio::test]
     async fn validated_change_splices_list_column_into_cache() -> Result<()> {
         // Regression: with the KV cache splice folded into
-        // validate_and_apply_change, a broadcast-or-direct insert must land
-        // the committed list_number into the cache atomically with the DC
-        // advance. We exercise that via the normal insert path here — the
-        // splice runs as part of the insert builder's
-        // validate_and_apply_change call, no separate
-        // apply_broadcast_cache_updates step required.
+        // validate_and_apply_change splices the cache atomically with the DC
+        // advance, so a broadcast-or-direct insert lands the committed
+        // list_number into the cache in the same lock acquisition.
 
         #[derive(Debug, Serialize, Deserialize)]
         struct Row {
