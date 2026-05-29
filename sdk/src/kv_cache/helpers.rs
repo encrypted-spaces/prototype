@@ -39,8 +39,20 @@ pub fn cache_update_from_writes(
         match op {
             BatchOp::Put { key, value } => update.put(key.clone(), value.clone()),
             BatchOp::PutHash { key, value_hash } => {
+                use encrypted_spaces_changelog_core::changelog::ValueOrHash;
                 if let Some(bytes) = change.hashed_values.get(value_hash) {
-                    update.put(key.clone(), bytes.clone());
+                    if ValueOrHash::from_value(bytes).value_hash() != *value_hash {
+                        log::warn!(
+                            "cache_update_from_writes: PutHash for {} has mismatched hash; \
+                             key not spliced and the row will not be coverage-extended",
+                            hex::encode(key)
+                        );
+                        if let Ok(ParsedKey::Column { table, row_id, .. }) = parse_key(key) {
+                            tainted_rows.insert((table, row_id));
+                        }
+                    } else {
+                        update.put(key.clone(), bytes.clone());
+                    }
                 } else {
                     log::warn!(
                         "cache_update_from_writes: PutHash for {} missing from sidecar; \
