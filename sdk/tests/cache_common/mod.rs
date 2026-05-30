@@ -21,7 +21,8 @@ use encrypted_spaces_sdk::{
     ApplicationSchema, ColumnType, LocalTransport, Schema, SchemaBuilder, Space, Transport,
 };
 
-/// `items` table: id, indexed `category`, indexed `price` (real), `name`.
+/// `items` table: id, indexed `category`, indexed `price` (real), `name`,
+/// encrypted `secret`.
 pub fn items_schema() -> Schema {
     SchemaBuilder::new("items")
         .column("id", ColumnType::Integer)
@@ -37,6 +38,9 @@ pub fn items_schema() -> Schema {
         .column("name", ColumnType::Text)
         .unwrap()
         .plaintext()
+        .column("secret", ColumnType::Text)
+        .unwrap()
+        .encrypted()
         .build()
         .unwrap()
 }
@@ -184,12 +188,13 @@ pub async fn setup_space(
             "category": category as i64,
             "price": price,
             "name": format!("item_{i}"),
+            "secret": format!("secret_{i}"),
         });
         items.insert(&row)?.execute().await?;
     }
 
     let tags = space.table::<serde_json::Value>("tags");
-    let tag_count = std::cmp::min(n_items, 5);
+    let tag_count = std::cmp::min(n_items, 10);
     for i in 1..=tag_count {
         for t in 1..=2 {
             let row = serde_json::json!({
@@ -202,6 +207,27 @@ pub async fn setup_space(
     }
 
     Ok((space, counting))
+}
+
+pub async fn setup_two_actors(
+    n_items: usize,
+) -> std::result::Result<(Space, Space, CountingTransport), Box<dyn std::error::Error>> {
+    let (alice_space, counting) = setup_space(n_items).await?;
+
+    let invite = alice_space.invite_user().await?;
+    let dc = initial_internal_data_commitment();
+    let bob_space = Space::join(
+        counting.clone(),
+        invite,
+        ApplicationSchema::for_testing(vec![], dc),
+    )
+    .await?;
+
+    bob_space.register_table_schema(items_schema());
+    bob_space.register_table_schema(tags_schema());
+    bob_space.sync().await?;
+
+    Ok((alice_space, bob_space, counting))
 }
 
 pub fn snapshot(transport: &CountingTransport) -> usize {

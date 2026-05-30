@@ -186,9 +186,6 @@ impl KvCache {
             storage: &self.storage,
         };
 
-        // Predicate-on-non-indexed-non-id-column would mis-plan as ByIndex
-        // (our reader's validate_column_indexed is schema-agnostic). Catch
-        // it here: route to the full-table fallback or Miss.
         if let Some(pred) = &query.predicate {
             if pred.column != ID_FIELD
                 && !schemas
