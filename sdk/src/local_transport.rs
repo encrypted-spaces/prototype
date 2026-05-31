@@ -39,6 +39,7 @@ pub(crate) async fn bootstrap_restore_state_if_local(
         state.current_data_commitment = root;
         state.initial_dc = root;
         state.current_clc_state = crate::state::initial_clc_state(&root);
+        state.kv_cache.advance_anchor(root, Default::default());
     }
 }
 
@@ -500,6 +501,7 @@ impl crate::Space {
             // (sig_ref=0) is accepted by `check_sigref_continuity`.
             state.sigref_map.clear();
             state.current_clc_state = crate::state::initial_clc_state(&new_root);
+            state.kv_cache.advance_anchor(new_root, Default::default());
         });
         Ok(())
     }
@@ -541,6 +543,7 @@ impl crate::Space {
             // (sig_ref=0) is accepted by `check_sigref_continuity`.
             state.sigref_map.clear();
             state.current_clc_state = crate::state::initial_clc_state(&new_root);
+            state.kv_cache.advance_anchor(new_root, Default::default());
         });
         Ok(())
     }
@@ -594,6 +597,7 @@ impl crate::Space {
             // (sig_ref=0) is accepted by `check_sigref_continuity`.
             state.sigref_map.clear();
             state.current_clc_state = crate::state::initial_clc_state(&new_root);
+            state.kv_cache.advance_anchor(new_root, Default::default());
         });
         Ok(())
     }

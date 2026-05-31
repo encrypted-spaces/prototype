@@ -607,7 +607,7 @@ async fn encrypted_column_reread() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-#[ignore = "nt/kvcache: cache anchor not reanchored after create_table"]
+#[ignore = "nt/kvcache: FF ragged-change replay reanchors cache after post-FF select populates it"]
 async fn remote_insert_ff_recovery() -> Result<(), Box<dyn std::error::Error>> {
     let (alice_space, bob_space, transport) = setup_two_actors(50).await?;
     let alice_items = alice_space.table::<Value>("items");
@@ -675,7 +675,6 @@ async fn cache_cleared_on_ff() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-#[ignore = "nt/kvcache: cache anchor not reanchored after create_table"]
 async fn empty_table_reread() -> Result<(), Box<dyn std::error::Error>> {
     let (space, transport) = setup_space(0).await?;
     let items = space.table::<Value>("items");
