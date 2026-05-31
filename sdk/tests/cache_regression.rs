@@ -607,7 +607,6 @@ async fn encrypted_column_reread() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-#[ignore = "nt/kvcache: FF ragged-change replay reanchors cache after post-FF select populates it"]
 async fn remote_insert_ff_recovery() -> Result<(), Box<dyn std::error::Error>> {
     let (alice_space, bob_space, transport) = setup_two_actors(50).await?;
     let alice_items = alice_space.table::<Value>("items");

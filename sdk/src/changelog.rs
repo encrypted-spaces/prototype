@@ -2052,8 +2052,10 @@ impl Space {
             hex::encode::<[u8; 32]>(clc.into())
         );
         // Re-warm internal table caches so that subsequent
-        // validate_and_apply_change calls can resolve user/schema reads.
+        // validate_and_apply_change calls can resolve user/schema reads
+        // and retention lookups (for decryption) hit locally.
         self.initialize_users().await?;
+        self.initialize_retention().await?;
 
         // At most one post-apply hook per FF batch, against the final
         // retention snapshot now present in the cache.
@@ -2487,6 +2489,9 @@ impl Space {
                 return self.rollback_if_applied(&saved_state, applied_state, e);
             }
 
+            // Pass an empty CacheUpdate so advance_anchor moves the
+            // anchor without clearing cached data. None would reanchor
+            // (clear), which is only correct for Reduce ops.
             if let Err(e) = self.apply_state_update(
                 change,
                 response,
@@ -2495,7 +2500,7 @@ impl Space {
                 uid,
                 current_clc,
                 new_timestamp_hwm,
-                None,
+                Some(Default::default()),
             ) {
                 return self.rollback_if_applied(&saved_state, applied_state, e);
             }
