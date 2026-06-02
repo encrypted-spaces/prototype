@@ -12,6 +12,7 @@ pub mod local_transport;
 pub(crate) mod retention;
 pub mod schema;
 mod state;
+pub(crate) mod sync_decrypt;
 pub mod table;
 #[cfg(feature = "testing")]
 pub mod testing;
@@ -231,6 +232,7 @@ impl Space {
                 pending_local_changes: Default::default(),
                 kv_cache: crate::kv_cache::KvCache::new(dc),
                 inviter_anchor: None,
+                cached_decrypt_context: None,
             })),
             key_manager: Arc::new(tokio::sync::Mutex::new(key_manager)),
             updates_tx: tokio::sync::broadcast::channel(64).0,
@@ -349,6 +351,7 @@ impl Space {
                 pending_local_changes: Default::default(),
                 kv_cache: crate::kv_cache::KvCache::new(dc),
                 inviter_anchor: Some(inviter_anchor),
+                cached_decrypt_context: None,
             },
             key_manager,
         )
@@ -552,6 +555,37 @@ mod tests {
                     .is_test(true)
                     .try_init();
         });
+    }
+
+    /// Read a `_users` column straight out of the KV cache via an id-eq
+    /// `try_select`. Returns `None` if the row isn't cache-resolvable (a miss).
+    /// Used to assert that hash-backed key material was resolved into the cache.
+    fn cached_users_column(space: &Space, uid: i64, column: &str) -> Option<serde_json::Value> {
+        use crate::kv_cache::CacheResult;
+        use encrypted_spaces_backend::internal_schemas::USERS_TABLE_NAME;
+        use encrypted_spaces_backend::query::{
+            ComparisonOperator, Predicate, Query, QueryOperation, QueryParam,
+        };
+
+        space.with_state(|state| {
+            let mut query =
+                Query::new(USERS_TABLE_NAME.to_string(), QueryOperation::Select(vec![]));
+            query.predicate = Some(Predicate {
+                column: "id".to_string(),
+                operator: ComparisonOperator::Equal,
+                values: vec![QueryParam::Integer(uid)],
+                cursor_id: None,
+            });
+            match state
+                .kv_cache
+                .try_select(&query, &state.table_schemas, None)
+            {
+                Ok(CacheResult::Hit(rows)) => {
+                    rows.into_iter().next().and_then(|r| r.get(column).cloned())
+                }
+                _ => None,
+            }
+        })
     }
 
     /// Build a schema using the transport's actual current root as the initial

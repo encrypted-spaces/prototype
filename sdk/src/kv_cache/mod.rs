@@ -18,6 +18,11 @@
 //! Lives inside the SDK rather than as its own crate so it can read SDK
 //! schema state directly without ceremony.
 
+use encrypted_spaces_backend::error::Result as SdkResult;
+use encrypted_spaces_crypto::encryption::FieldType;
+
+use crate::DataCommitment;
+
 pub mod cache;
 pub mod coverage_store;
 pub mod helpers;
@@ -27,3 +32,14 @@ mod proptests;
 
 pub use cache::{CacheResult, CacheUpdate, KvCache};
 pub use helpers::{cache_update_from_writes, new_row_id_for_table};
+
+/// Synchronous encrypted-field resolver used during cache-hit materialization.
+///
+/// The production implementation is `SyncDecryptContext` in `sync_decrypt.rs`.
+/// The cache core only needs this narrow contract: anchor checking and
+/// converting one encrypted stored string into stored plaintext bytes.
+pub(crate) trait SyncDecryptResolver {
+    fn anchor(&self) -> DataCommitment;
+
+    fn decrypt_column_bytes(&self, encoded: &str, field_type: &FieldType) -> SdkResult<Vec<u8>>;
+}

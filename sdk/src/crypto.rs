@@ -31,6 +31,13 @@ fn encrypted_columns_from_schema(schema: &Schema) -> Vec<EncryptedColumn> {
         .collect()
 }
 
+pub(crate) fn encrypted_field_types(schema: &Schema) -> HashMap<String, FieldType> {
+    encrypted_columns_from_schema(schema)
+        .into_iter()
+        .map(|column| (column.name, column.field_type))
+        .collect()
+}
+
 /// Derive the encryption key for the current key id from the space's key manager.
 pub(crate) async fn current_encryption_key(space: &Space) -> Result<EncryptionKey> {
     let builder = space.retention_builder();

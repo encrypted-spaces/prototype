@@ -1,4 +1,5 @@
 use crate::kv_cache::KvCache;
+use crate::sync_decrypt::SyncDecryptContext;
 use crate::SpaceKeyManager;
 use crate::{DataCommitment, Space, SpaceId, Transport};
 use encrypted_spaces_acl_types::Action;
@@ -108,6 +109,14 @@ pub(crate) struct State {
     /// or already-joined spaces.
     #[serde(skip)]
     pub(crate) inviter_anchor: Option<InviterAnchor>,
+
+    /// Per-anchor cache of the synchronous decrypt context. Built once per data
+    /// anchor (the expensive async key-manager lock + key scan) and reused by
+    /// repeated encrypted-table cache reads, so memoized hits don't re-pay that
+    /// cost. Transient runtime state — never serialized; stale entries are
+    /// ignored because the stored anchor must match the current one.
+    #[serde(skip)]
+    pub(crate) cached_decrypt_context: Option<(DataCommitment, SyncDecryptContext)>,
 }
 
 fn default_kv_cache() -> KvCache {
@@ -310,6 +319,7 @@ mod tests {
             pending_local_changes: Default::default(),
             kv_cache: KvCache::new([0x22; 32]),
             inviter_anchor: None,
+            cached_decrypt_context: None,
         }
     }
 

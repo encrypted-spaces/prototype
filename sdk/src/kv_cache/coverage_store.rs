@@ -1,8 +1,8 @@
 //! Interval algebra + point map underlying [`crate::KvCache`].
 //!
 //! Two pieces of state:
-//! - `points: BTreeMap<key, Option<value>>` — explicit `(key, value)` (Some) or
-//!   tombstone (None).
+//! - `points: BTreeMap<key, DataEntry>` — a `Value { bytes, .. }` presence or a
+//!   `Deleted` tombstone.
 //! - `intervals: BTreeMap<start, end>` — half-open `[start, end)` byte ranges
 //!   that are fully known. Invariant: intervals are non-overlapping and
 //!   non-adjacent (adjacent ranges merge on insert).
@@ -11,10 +11,57 @@
 //! means "we don't know".
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
-#[derive(Debug, Default, Clone)]
+/// A cache data entry.
+///
+/// `Value::decrypted` is a lazy per-entry decrypted-bytes memoization slot.
+/// It is not soundness-bearing: equality and debug output ignore it.
+pub(crate) enum DataEntry {
+    Value {
+        /// Raw bytes authenticated by the proof at the cache anchor.
+        bytes: Vec<u8>,
+        /// Lazily populated decrypted bytes for encrypted columns.
+        decrypted: OnceLock<Vec<u8>>,
+    },
+    Deleted,
+}
+
+impl DataEntry {
+    pub(crate) fn value(bytes: Vec<u8>) -> Self {
+        Self::Value {
+            bytes,
+            decrypted: OnceLock::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for DataEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DataEntry::Value { bytes, .. } => {
+                f.debug_struct("Value").field("bytes", bytes).finish()
+            }
+            DataEntry::Deleted => f.write_str("Deleted"),
+        }
+    }
+}
+
+impl PartialEq for DataEntry {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (DataEntry::Value { bytes: a, .. }, DataEntry::Value { bytes: b, .. }) => a == b,
+            (DataEntry::Deleted, DataEntry::Deleted) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for DataEntry {}
+
+#[derive(Debug, Default)]
 pub struct CoverageStore {
-    points: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    points: BTreeMap<Vec<u8>, DataEntry>,
     intervals: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
@@ -30,12 +77,17 @@ impl CoverageStore {
 
     /// Record `key → Some(value)` (presence) or `key → None` (tombstone).
     pub fn put_point(&mut self, key: Vec<u8>, value: Option<Vec<u8>>) {
-        self.points.insert(key, value);
+        let entry = match value {
+            Some(bytes) => DataEntry::value(bytes),
+            None => DataEntry::Deleted,
+        };
+        self.points.insert(key, entry);
     }
 
-    /// Outer `None` means no point stored. Outer `Some(None)` is a tombstone.
+    /// `None` means no point stored; `Some(DataEntry::Deleted)` is a tombstone;
+    /// `Some(DataEntry::Value { .. })` is a stored value.
     #[cfg(test)]
-    pub fn get_point(&self, key: &[u8]) -> Option<&Option<Vec<u8>>> {
+    pub fn get_point(&self, key: &[u8]) -> Option<&DataEntry> {
         self.points.get(key)
     }
 
@@ -90,7 +142,23 @@ impl CoverageStore {
         self.points
             .range(p.clone()..)
             .take_while(move |(k, _)| k.starts_with(&p))
-            .filter_map(|(k, v)| v.as_ref().map(|v| (k, v)))
+            .filter_map(|(k, v)| match v {
+                DataEntry::Value { bytes, .. } => Some((k, bytes)),
+                DataEntry::Deleted => None,
+            })
+    }
+
+    /// Iterate present entries whose key starts with `prefix`, preserving
+    /// access to the entry identity for per-entry decryption memoization.
+    pub fn iter_prefix_entries(
+        &self,
+        prefix: &[u8],
+    ) -> impl Iterator<Item = (&Vec<u8>, &DataEntry)> {
+        let p = prefix.to_vec();
+        self.points
+            .range(p.clone()..)
+            .take_while(move |(k, _)| k.starts_with(&p))
+            .filter(|(_, v)| matches!(v, DataEntry::Value { .. }))
     }
 
     /// Iterate present (non-tombstone) point entries in the half-open range
@@ -102,7 +170,23 @@ impl CoverageStore {
     ) -> impl Iterator<Item = (&Vec<u8>, &Vec<u8>)> {
         self.points
             .range(start.to_vec()..end.to_vec())
-            .filter_map(|(k, v)| v.as_ref().map(|v| (k, v)))
+            .filter_map(|(k, v)| match v {
+                DataEntry::Value { bytes, .. } => Some((k, bytes)),
+                DataEntry::Deleted => None,
+            })
+    }
+
+    /// Iterate present entries in the half-open range `[start, end)`,
+    /// preserving access to the entry identity for per-entry decryption
+    /// memoization.
+    pub fn iter_range_entries(
+        &self,
+        start: &[u8],
+        end: &[u8],
+    ) -> impl Iterator<Item = (&Vec<u8>, &DataEntry)> {
+        self.points
+            .range(start.to_vec()..end.to_vec())
+            .filter(|(_, v)| matches!(v, DataEntry::Value { .. }))
     }
 
     /// Largest covered prefix of `[start, end)` walking forward from
@@ -254,8 +338,8 @@ mod tests {
         let mut cs = CoverageStore::new();
         cs.put_point(s(b"a"), Some(s(b"1")));
         cs.put_point(s(b"b"), None);
-        assert_eq!(cs.get_point(b"a"), Some(&Some(s(b"1"))));
-        assert_eq!(cs.get_point(b"b"), Some(&None));
+        assert_eq!(cs.get_point(b"a"), Some(&DataEntry::value(s(b"1"))));
+        assert_eq!(cs.get_point(b"b"), Some(&DataEntry::Deleted));
         assert_eq!(cs.get_point(b"c"), None);
     }
 

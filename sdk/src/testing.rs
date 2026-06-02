@@ -126,6 +126,7 @@ impl Space {
                 pending_local_changes: Default::default(),
                 kv_cache: crate::kv_cache::KvCache::new(initial_dc),
                 inviter_anchor: None,
+                cached_decrypt_context: None,
             })),
             key_manager: Arc::new(tokio::sync::Mutex::new(key_manager)),
             updates_tx: tokio::sync::broadcast::channel(64).0,

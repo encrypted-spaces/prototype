@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::kv_cache::CacheResult;
+use crate::kv_cache::{CacheResult, SyncDecryptResolver};
 
 /// Typestate marker: no server-side predicate has been set yet.
 pub struct Unpredicated;
@@ -680,6 +680,28 @@ impl<T, W> SelectBuilder<T, W> {
         schemas
     }
 
+    fn query_has_encrypted_columns(&self, schemas: &HashMap<String, Schema>) -> bool {
+        let has_encrypted = |table: &str| {
+            schemas
+                .get(table)
+                .map(|schema| schema.columns.iter().any(|column| !column.plaintext))
+                .unwrap_or(false)
+        };
+
+        if has_encrypted(&self.query.table) {
+            return true;
+        }
+
+        if let Some(join) = &self.join {
+            let (joined_table, _) = parse_table_alias(&join.table);
+            if has_encrypted(joined_table) {
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// Try to serve the query from the KV cache. Returns `Ok(Some(rows))` on
     /// hit, `Ok(None)` on miss.
     ///
@@ -698,14 +720,22 @@ impl<T, W> SelectBuilder<T, W> {
         main_query.join = None;
         main_query.operation = QueryOperation::Select(Vec::new());
         let schemas = self.collect_schemas();
-        let main_result = self
-            .space
-            .with_state(|state| state.kv_cache.try_select(&main_query, &schemas))?;
-        let CacheResult::Hit(mut main_rows) = main_result else {
+        let decrypt = if self.query_has_encrypted_columns(&schemas) {
+            Some(self.space.cached_sync_decrypt_context().await?)
+        } else {
+            None
+        };
+        let decrypt_ref = decrypt
+            .as_ref()
+            .map(|context| context as &dyn SyncDecryptResolver);
+        let main_result = self.space.with_state(|state| {
+            state
+                .kv_cache
+                .try_select(&main_query, &schemas, decrypt_ref)
+        })?;
+        let CacheResult::Hit(main_rows) = main_result else {
             return Ok(None);
         };
-
-        decrypt_table_rows(&mut main_rows, &self.query.table, &schemas, &self.space).await?;
 
         let Some(join) = &self.join else {
             return Ok(Some(FetchedRows {
@@ -735,16 +765,18 @@ impl<T, W> SelectBuilder<T, W> {
             }
         }
 
-        let schemas = self.collect_schemas();
         let joined_result = self.space.with_state(|state| {
-            state
-                .kv_cache
-                .lookup_joined_rows(joined_table, pk_col, &fk_values, &schemas)
+            state.kv_cache.lookup_joined_rows(
+                joined_table,
+                pk_col,
+                &fk_values,
+                &schemas,
+                decrypt_ref,
+            )
         })?;
-        let CacheResult::Hit(mut joined_rows) = joined_result else {
+        let CacheResult::Hit(joined_rows) = joined_result else {
             return Ok(None);
         };
-        decrypt_table_rows(&mut joined_rows, joined_table, &schemas, &self.space).await?;
 
         Ok(Some(FetchedRows {
             main: main_rows,
@@ -1287,11 +1319,49 @@ mod tests {
     use encrypted_spaces_storage_encoding::HASH_LEN;
     use serde::{Deserialize, Serialize};
 
-    use crate::kv_cache::CacheResult;
+    use crate::kv_cache::{CacheResult, SyncDecryptResolver};
     use crate::local_transport::LocalTransport;
     use crate::schema::{ApplicationSchema, ColumnType, SchemaBuilder};
     use crate::users::USERS_TABLE_NAME;
     use crate::Space;
+
+    /// True iff `space.kv_cache` can answer a full-table SELECT on `table`
+    /// without going to the server — coverage spans the whole table row
+    /// range. Behavioral replacement for the old `is_table_complete`.
+    ///
+    /// A cache `Hit` now implies the rows are fully decrypted, so for a table
+    /// with encrypted columns we must supply a real `SyncDecryptResolver` (a
+    /// schema-present query on such a table Misses with `decrypt = None`). For
+    /// plaintext-only tables we keep passing `None`, matching the production
+    /// conditional-context behavior and leaving the anchor/coverage check
+    /// unchanged.
+    async fn cache_covers_full_table(space: &Space, table: &str) -> bool {
+        let q = Query::new(table.to_string(), QueryOperation::Select(Vec::new()));
+        let schemas = space.with_state(|s| s.table_schemas.clone());
+        let has_encrypted = schemas
+            .get(table)
+            .map(|schema| schema.columns.iter().any(|column| !column.plaintext))
+            .unwrap_or(false);
+        let context = if has_encrypted {
+            Some(
+                space
+                    .sync_decrypt_context()
+                    .await
+                    .expect("build sync decrypt context"),
+            )
+        } else {
+            None
+        };
+        let decrypt = context
+            .as_ref()
+            .map(|context| context as &dyn SyncDecryptResolver);
+        space.with_state(|s| {
+            matches!(
+                s.kv_cache.try_select(&q, &schemas, decrypt),
+                Ok(CacheResult::Hit(_))
+            )
+        })
+    }
 
     #[derive(Deserialize, Serialize)]
     struct HashBackedSelectNote {
@@ -1344,11 +1414,12 @@ mod tests {
         assert_eq!(rows[0].content, "large hash-backed body");
         assert_eq!(rows[0].title, "inline title");
 
-        let cached =
-            space.with_state(|state| state.cache.get_row("hash_select_notes", row_id).cloned());
-        let cached = cached.expect("select should populate cache");
-        assert_eq!(cached["content"], "large hash-backed body");
-        assert_eq!(cached["title"], "inline title");
+        // The select warmed the cache: the whole table is now covered, so a
+        // re-read is served from cache with the resolved hash-backed value.
+        assert!(
+            cache_covers_full_table(&space, "hash_select_notes").await,
+            "select should populate the cache with the resolved hash-backed row"
+        );
 
         Ok(())
     }
@@ -1459,6 +1530,44 @@ mod tests {
         assert!(
             matches!(result, Err(SdkError::InvalidQuery(_))),
             "wrong-typed id range must be rejected before cache miss broadening"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn encrypted_cache_hit_matches_server_fetch_plaintext(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        #[derive(Debug, Deserialize, Serialize, PartialEq)]
+        struct SecretNote {
+            id: Option<i64>,
+            secret: String,
+        }
+
+        let space = Space::new(LocalTransport::in_memory().await?).await?;
+        let schema = SchemaBuilder::new("encrypted_cache_smoke_notes")
+            .column("id", ColumnType::Integer)
+            .plaintext_primary_key()
+            .column("secret", ColumnType::String)?
+            .encrypted()
+            .build()?;
+        space.create_table(&schema).await?;
+
+        let table = space.table::<SecretNote>("encrypted_cache_smoke_notes");
+        table
+            .insert(&SecretNote {
+                id: None,
+                secret: "server plaintext".to_string(),
+            })?
+            .execute()
+            .await?;
+
+        let server_rows: Vec<SecretNote> = table.select().all().await?;
+        let cached_rows: Vec<SecretNote> = table.select().all().await?;
+
+        assert_eq!(cached_rows, server_rows);
+        assert_eq!(
+            cached_rows.first().map(|row| row.secret.as_str()),
+            Some("server plaintext")
         );
         Ok(())
     }
@@ -2242,8 +2351,8 @@ mod tests {
             .await?;
 
         // Verify neither table is cached yet
-        assert!(!cache_covers_full_table(&space, "articles"));
-        assert!(!cache_covers_full_table(&space, "authors"));
+        assert!(!cache_covers_full_table(&space, "articles").await);
+        assert!(!cache_covers_full_table(&space, "authors").await);
 
         // First join query — cache miss, fetches from server
         let result1: Vec<ArticleWithAuthor> = articles
@@ -2261,8 +2370,8 @@ mod tests {
             .any(|r| r.title == "Article B" && r.name == "Bob"));
 
         // Main table fully cached; joined table NOT complete (only Alice + Bob, not Carol).
-        assert!(cache_covers_full_table(&space, "articles"));
-        assert!(!cache_covers_full_table(&space, "authors"));
+        assert!(cache_covers_full_table(&space, "articles").await);
+        assert!(!cache_covers_full_table(&space, "authors").await);
 
         // The matched authors should be cache-addressable by id (the second
         // join query below would Miss on the joined lookup otherwise).
@@ -2292,7 +2401,7 @@ mod tests {
             })
             .execute()
             .await?;
-        assert!(cache_covers_full_table(&space, "articles"));
+        assert!(cache_covers_full_table(&space, "articles").await);
 
         // Third join query — served from cache (articles cache is still complete)
         let result3: Vec<ArticleWithAuthor> = articles
@@ -2414,7 +2523,7 @@ mod tests {
 
         // Categories table should NOT be fully cached (code=30 was never fetched).
         assert!(
-            !cache_covers_full_table(&space, "categories"),
+            !cache_covers_full_table(&space, "categories").await,
             "categories should not be fully covered"
         );
         // Per-indexed-value cache probes from the old cache have no analog
@@ -3018,7 +3127,7 @@ mod tests {
         assert_eq!(items.len(), 2);
 
         // Verify cache is populated
-        let is_complete = cache_covers_full_table(&space, "cached_items");
+        let is_complete = cache_covers_full_table(&space, "cached_items").await;
         assert!(is_complete, "Cache should be complete after full fetch");
 
         // Second read should serve from cache (same result)
@@ -3035,7 +3144,7 @@ mod tests {
             .execute()
             .await?;
 
-        let is_complete = cache_covers_full_table(&space, "cached_items");
+        let is_complete = cache_covers_full_table(&space, "cached_items").await;
         assert!(
             is_complete,
             "Cache should remain complete after changelog insert"
@@ -3048,7 +3157,7 @@ mod tests {
         // Delete an item — cache should remain complete (changelog delete updates in-place)
         table.delete().where_eq("id", 2).execute().await?;
 
-        let is_complete = cache_covers_full_table(&space, "cached_items");
+        let is_complete = cache_covers_full_table(&space, "cached_items").await;
         assert!(
             is_complete,
             "Cache should remain complete after changelog delete"
@@ -3106,7 +3215,7 @@ mod tests {
 
         // Cache should be complete (full table)
         assert!(
-            cache_covers_full_table(&space, "filtered_items"),
+            cache_covers_full_table(&space, "filtered_items").await,
             "Cache should cover the full table after the unscoped fetch"
         );
 

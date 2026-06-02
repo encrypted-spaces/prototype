@@ -178,6 +178,10 @@ impl Space {
         self.with_state_mut(|state| {
             let dc = state.current_data_commitment;
             state.kv_cache.reanchor(dc);
+            // Reduce pruned retention keys. Drop any cached decrypt context so a
+            // stale key map (still holding pruned key bytes) can't be reused to
+            // decrypt re-fetched ciphertext at the same anchor.
+            state.cached_decrypt_context = None;
         });
 
         // 6. Post-apply delivery-slot recovery if the builder flagged it.
@@ -230,20 +234,34 @@ impl Space {
         let envelope: GkDeliveryEnvelope = serde_json::from_slice(&envelope_bytes)?;
 
         // Re-acquire and re-check in case another caller already recovered.
-        let mut km = self.key_manager.lock().await;
-        match km
-            .sync_group_key(&builder)
-            .await
-            .map_err(|_| SdkError::ValidationError("group key sync failed".to_string()))?
-        {
-            GroupKeySync::AlreadyCurrent | GroupKeySync::DerivedForward => Ok(()),
-            GroupKeySync::NeedsDelivery => km
-                .recover_group_key_from_delivery(&envelope, &builder)
+        let recovered = {
+            let mut km = self.key_manager.lock().await;
+            match km
+                .sync_group_key(&builder)
                 .await
-                .map_err(|_| {
-                    SdkError::ValidationError("delivery-slot recovery failed".to_string())
-                }),
+                .map_err(|_| SdkError::ValidationError("group key sync failed".to_string()))?
+            {
+                GroupKeySync::AlreadyCurrent | GroupKeySync::DerivedForward => false,
+                GroupKeySync::NeedsDelivery => {
+                    km.recover_group_key_from_delivery(&envelope, &builder)
+                        .await
+                        .map_err(|_| {
+                            SdkError::ValidationError("delivery-slot recovery failed".to_string())
+                        })?;
+                    true
+                }
+            }
+        };
+
+        // Recovery resolved key material at the current anchor — which FF may
+        // have already advanced to the final commitment, so the data anchor is
+        // unchanged. Invalidate any cached decrypt context (keyed only by
+        // anchor) so the newly-resolvable keys are picked up instead of serving
+        // persistent cache misses. Done after releasing the key-manager lock.
+        if recovered {
+            self.with_state_mut(|state| state.cached_decrypt_context = None);
         }
+        Ok(())
     }
 
     /// Run delivery-slot-driven group key recovery iff the caller's detection
