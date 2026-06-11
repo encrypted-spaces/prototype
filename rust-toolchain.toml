@@ -1,0 +1,6 @@
+[toolchain]
+channel = "nightly-2026-02-01"
+# note: last (tested) working version for multithreading in wasm + plonky3 was:
+# channel = "nightly-2025-05-05"
+components = ["clippy", "rust-src", "rustfmt"]
+targets = ["wasm32-unknown-unknown"]

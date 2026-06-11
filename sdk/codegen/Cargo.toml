@@ -1,0 +1,19 @@
+[package]
+name = "encrypted-spaces-sdk-codegen"
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+encrypted-spaces-acl-types = { workspace = true }
+encrypted-spaces-backend = { workspace = true }
+encrypted-spaces-sdk = { workspace = true, features = ["local-transport"] }
+# `prove` re-exports `EXTEND_FF_ID` from the methods crate so codegen
+# can bake `FF_GUEST_IMAGE_ID` into the generated module alongside
+# `DATA_COMMITMENT`.
+encrypted-spaces-ffproof = { workspace = true, features = ["prove"] }
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[dev-dependencies]
+tempfile = "3"

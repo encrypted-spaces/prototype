@@ -1,0 +1,17 @@
+# Next.js
+.next
+out
+node_modules
+
+# Tauri
+src-tauri/gen
+src-tauri/target
+
+# OS
+.DS_Store
+
+# python script launcher
+.launcher-venv/
+
+# log files
+logs/

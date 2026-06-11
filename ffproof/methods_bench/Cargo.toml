@@ -1,0 +1,10 @@
+[package]
+name = "encrypted-spaces-ffproof-methods-bench"
+version = "0.1.0"
+edition = "2021"
+
+[build-dependencies]
+risc0-build = "3.0.5"
+
+[package.metadata.risc0]
+methods = ["guest"]

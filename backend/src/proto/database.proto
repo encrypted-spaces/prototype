@@ -1,0 +1,306 @@
+syntax = "proto3";
+
+package database;
+
+message DbRequest {
+  string request_id = 1;
+  oneof operation {
+    SelectRequest select = 2;
+    ChangeRequest change = 3;
+    FastForwardRequest fast_forward = 4;
+    AddMemberRequest add_member = 5;
+    RemoveMemberRequest remove_member = 6;
+    FetchMyKeyDeliveryRequest fetch_my_key_delivery = 8;
+    RetentionRequest retention = 9;
+  }
+}
+
+message DbResponse {
+  string request_id = 1;
+  string status = 2;
+  string error = 3;
+  oneof result {
+    SelectResponse select = 4;
+    ChangeResponse change = 5;
+    FastForwardResponse fast_forward = 6;
+    AddMemberResponse add_member = 7;
+    RemoveMemberResponse remove_member = 8;
+    FetchMyKeyDeliveryResponse fetch_my_key_delivery = 10;
+    RetentionResponse retention = 11;
+  }
+}
+
+message SelectRequest {
+  Query query = 1;
+  bool return_one = 2;
+  bytes commitment = 3;
+}
+
+message SelectResponse {
+  bytes proof = 1;
+  repeated bytes values_sidecar = 2;    // Full bytes for hash-backed columns; receiver re-hashes.
+}
+
+message ChangeRequest {
+  ChangelogEntry change = 1;            // The changelog entry only has a hash for hash-backed values
+  repeated bytes values_sidecar = 2;    // Raw bytes for hash-backed entries. The receiver computes
+                                        // `hashstore_hash(value)` itself and indexes by the result,
+                                        // so a peer can't ship (signed_hash, garbage_value) pairs.
+  repeated bytes retention_proofs = 3;  // Serialized retention proofs for server verification
+}
+
+message ChangeResponse {
+  uint32 change_id = 1;
+  bytes old_root = 2;
+  bytes new_root = 3;
+  bytes pruned_merkle_tree = 4;
+  uint64 rows_affected = 5;
+  repeated bytes values_sidecar = 6;    // Full bytes echoed for broadcast recipients; receiver re-hashes.
+  uint64 accepted_at_server_time = 7;
+}
+
+message FastForwardRequest {
+  uint32 from_change_id = 1;
+  // Acknowledged change_ids of local submissions the client needs proven
+  // incorporated by this fast-forward. The server returns an inclusion
+  // proof for any of these that fall inside the proven range (see
+  // FastForwardProof.expected_inclusion_proofs); ones beyond the proof
+  // boundary are matched directly against the returned ragged changes.
+  repeated uint32 expected_change_ids = 2;
+}
+
+message FastForwardResponse {
+  repeated ChangelogEntry changes = 1;
+  repeated ChangeResponse responses = 2;
+  optional FastForwardProof proof = 3;
+  // Server's view of (change_id, CLC, DC) at the moment this response
+  // was prepared. The CLC/DC values are 16-byte prefixes only — enough
+  // for the client to detect divergence, never enough to be adopted as
+  // an authoritative root. Empty when the server doesn't populate them
+  // (older servers).
+  uint32 server_change_id = 4;
+  bytes server_clc_prefix = 5;
+  bytes server_data_commitment_prefix = 6;
+}
+
+message FastForwardProof {
+  uint32 end_change_id = 2;
+  bytes proof = 3;
+  // Postcard-serialized BTreeMap<u32, ChangelogEntry> for sigref signature verification.
+  bytes sigref_entries = 4;
+  // Postcard-serialized Option<InclusionProof> binding the client's
+  // from_change_id entry to end_clc_state. Empty bytes => None (the
+  // request was from_change_id == 0).
+  bytes from_inclusion_proof = 5;
+  // Postcard-serialized ChangelogEntry at end_change_id. Empty when ragged
+  // changes follow the proof, because the last ragged change becomes the next changelog anchor.
+  bytes end_entry = 6;
+  // Postcard-serialized InclusionProof for end_entry against end_clc_state.
+  // Empty whenever end_entry is empty.
+  bytes end_entry_inclusion_proof = 7;
+  // Postcard-serialized BTreeMap<u32, InclusionProof> binding the client's
+  // requested expected local entries (acknowledged change_id -> proof) to
+  // end_clc_state. Empty map when no expected entries fall in the proven
+  // range. See issue #212.
+  bytes expected_inclusion_proofs = 8;
+}
+
+
+message Schema {
+  string name = 1;
+  repeated ColumnDefinition columns = 2;
+  bool auto_increment = 3;
+}
+
+message ColumnDefinition {
+  string name = 1;
+  ColumnType column_type = 2;
+  bool plaintext = 3;
+  bool indexed = 4;
+}
+
+enum ColumnType {
+  INTEGER = 0;
+  REAL = 1;
+  STRING = 2;
+  TEXT = 3;
+  BLOB = 4;
+  FILE_REF = 5;
+  LIST = 6;
+}
+
+message QueryParam {
+  oneof value {
+    int64 int_value = 1;
+    string text_value = 2;
+    double real_value = 3;
+    bytes blob_value = 4;
+    bool bool_value = 5;
+  }
+}
+
+message Query {
+  string table = 1;
+  QueryOperation operation = 2;
+  optional Predicate predicate = 3;
+  Order order = 4;
+  optional uint32 limit = 5;
+  optional JoinClause join = 7;
+}
+
+message QueryOperation {
+  oneof operation {
+    SelectOperation select = 1;
+    InsertOperation insert = 2;
+    UpdateOperation update = 3;
+    DeleteOperation delete = 4;
+  }
+}
+
+message SelectOperation {
+  repeated string columns = 1;
+}
+
+message InsertOperation {
+  repeated FieldValue fields = 1;
+}
+
+message UpdateOperation {
+  repeated UpdateField fields = 1;
+}
+
+message DeleteOperation {
+}
+
+message FieldValue {
+  string name = 1;
+  QueryParam value = 2;
+}
+
+message UpdateField {
+  string name = 1;
+  QueryParam value = 2;
+}
+
+message Predicate {
+  string column = 1;
+  int32 operator = 2;
+  repeated QueryParam values = 3;
+  // Cursor id for pagination. Meaningful only when `operator == EQUAL` on a
+  // non-id column. With Order::Asc the predicate also requires `id > cursor`
+  // (next page); with Order::Desc, `id < cursor` (older page).
+  optional int64 cursor_id = 4;
+}
+
+enum ComparisonOperator {
+  EQUAL = 0;
+  GREATER_THAN = 2;
+  GREATER_THAN_OR_EQUAL = 3;
+  LESS_THAN = 4;
+  LESS_THAN_OR_EQUAL = 5;
+  IN = 6;
+  BETWEEN = 7;
+}
+
+enum Order {
+  ASC = 0;
+  DESC = 1;
+}
+
+message JoinClause {
+  string table = 1;
+  string left_column = 2;
+  string right_column = 3;
+}
+
+message AuthContext {
+  optional int64 uid = 1;
+  bytes space_id = 2;
+}
+
+message Broadcast {
+  ChangeResponse change_response = 1;
+  ChangelogEntry change_entry = 2;
+}
+
+// Generic ephemeral message — relayed by the server to all connections in the
+// space but never persisted or recorded in the changelog.  Applications use
+// the `kind` discriminator to multiplex different message types (e.g.
+// "cursor", "typing", "read", "presence").
+message Ephemeral {
+  uint32 uid = 1;
+  string kind = 2;
+  bytes  payload = 3;
+}
+
+message WsFrame {
+  oneof payload {
+    DbRequest db_request = 1;
+    DbResponse db_response = 2;
+    Broadcast broadcast = 3;
+    Ephemeral ephemeral = 7;
+  }
+}
+
+message ChangelogEntry {
+  uint64 timestamp = 1;
+  uint32 uid = 2;
+  uint32 parent_change = 3;
+  LogMessage message = 4;
+  uint32 sig_ref = 5;
+  bytes parent_clc = 6;
+  bytes signature = 7;
+}
+
+message LogMessage {
+  uint32 op_type = 1;
+  bytes tree_path = 2;
+  repeated KvData entries = 3;
+}
+
+message KvData {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message AddMemberRequest {
+  bytes payload = 1;              // JSON-serialized InviteRequest
+  ChangeRequest insert = 2;       // Insert query + changelog entry for the new user record
+  repeated bytes retention_proofs = 3; // Serialized retention proofs for server verification
+}
+
+message AddMemberResponse {
+  ChangeResponse change = 1;      // ChangeResponse from inserting the new user record
+}
+
+message RemoveMemberRequest {
+  bytes payload = 1;                // JSON-serialized UserDeleteRequest<DefaultMkem>
+  repeated int64 remaining_uids = 2; // UIDs of members who will remain, same order as crypto request
+  ChangeRequest delete = 3;         // Delete query + changelog entry for the removed user record
+  repeated bytes retention_proofs = 4; // Serialized retention proofs for server verification
+}
+
+message RemoveMemberResponse {
+  ChangeResponse change = 1;        // ChangeResponse from deleting the user record
+}
+
+message RetentionRequest {
+  ChangeRequest change = 1;          // Retention queries + changelog entry
+  repeated bytes retention_proofs = 2; // Serialized retention proofs for server verification
+  optional bytes rekey_payload = 3;  // JSON-serialized RekeyRequest (only for Rekey ops)
+}
+
+message RetentionResponse {
+  ChangeResponse change = 1;        // ChangeResponse from the retention operation
+}
+
+// --- GK delivery slot ---
+
+message FetchMyKeyDeliveryRequest {
+  // No fields needed; recipient is derived from the authenticated user.
+}
+
+message FetchMyKeyDeliveryResponse {
+  bool has_delivery = 1;
+  bytes payload = 2;    // Serialized GkDeliveryEnvelope (empty if has_delivery is false)
+}

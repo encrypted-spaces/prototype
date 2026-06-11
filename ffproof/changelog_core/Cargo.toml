@@ -1,0 +1,33 @@
+[package]
+name = "encrypted-spaces-changelog-core"
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+postcard = { workspace = true }
+encrypted-spaces-acl-types = { workspace = true }
+hex.workspace = true
+instant.workspace = true
+risc0-zkvm = { workspace = true, features = ["std"] }
+thiserror = { workspace = true }
+rand = { workspace = true, features = ["os_rng"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+merk = { workspace = true }
+
+# Tracer dependencies for create_trace re-export
+ffproof-tracer = { path = "../tracer" }
+ffproof-tracer-shared = { path = "../tracer/shared" }
+
+# Storage encoding for key construction (users_row_key, etc.)
+encrypted-spaces-storage-encoding = { workspace = true }
+
+[features]
+bench-timing = []
+
+[dev-dependencies]
+serde = { workspace = true }
+tokio = { workspace = true }

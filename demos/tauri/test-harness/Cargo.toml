@@ -1,0 +1,33 @@
+[package]
+name = "encrypted-spaces-demo-test-harness"
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+edition.workspace = true
+publish = false
+
+[lib]
+name = "encrypted_spaces_demo_test_harness"
+path = "src/lib.rs"
+
+[[bin]]
+name = "demo-harness"
+path = "src/bin/harness.rs"
+
+[dependencies]
+encrypted-spaces-acl-types = { workspace = true }
+encrypted-spaces-demo = { path = "../src-tauri" }
+# Use `local-transport` so the harness can spin up an in-process server.
+encrypted-spaces-sdk = { workspace = true, features = ["local-transport", "testing"] }
+anyhow = { workspace = true }
+clap = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+rand = { workspace = true, features = ["std", "std_rng"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3"

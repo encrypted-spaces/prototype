@@ -1,0 +1,48 @@
+[package]
+name = "encrypted-spaces-backend"
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[features]
+default = ["merk_verify"]
+merk_verify = ["dep:merk", "dep:encrypted-spaces-changelog-core"]
+merk = ["merk_verify", "dep:merk", "dep:encrypted-spaces-changelog-core"]
+
+[dependencies]
+encrypted-spaces-acl-types = { workspace = true }
+encrypted-spaces-changelog-core = { path = "../ffproof/changelog_core", default-features = false, optional = true }
+encrypted-spaces-crypto = { workspace = true }
+encrypted-spaces-retention = { workspace = true }
+encrypted-spaces-storage-encoding = { workspace = true }
+ffproof-tracer-shared = { path = "../ffproof/tracer/shared" }
+merk = { workspace = true, optional = true }
+prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+kdl = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+base64 = { workspace = true }
+uuid = { workspace = true }
+hex = { workspace = true }
+log = { workspace = true }
+postcard = { workspace = true }
+sha2 = { workspace = true }
+integer-encoding = {workspace = true}
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt","rt-multi-thread","macros","sync","time"] }
+criterion = { workspace = true, features = ["async_tokio"] }
+tempfile = "3"
+
+# use merk feature in tests/benches
+encrypted-spaces-backend = { path = ".", features = ["merk"] }
+
+[[bench]]
+name = "storage_benchmarks"
+harness = false
+
+[build-dependencies]
+prost-build = "0.14"

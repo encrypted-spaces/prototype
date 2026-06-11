@@ -1,0 +1,27 @@
+{
+    "rust-analyzer.cargo.allTargets": false,
+    "rust-analyzer.check.workspace": false,
+    "rust-analyzer.cargo.targetDir": "./target/ra",
+    
+    // Make rust-analyzer just run "cargo check" quickly
+    "rust-analyzer.check.command": "check",
+    "rust-analyzer.check.extraArgs": ["--tests"],
+    "rust-analyzer.check.allTargets": false,
+    "rust-analyzer.check.invocationLocation": "workspace",
+    "rust-analyzer.check.invocationStrategy": "once",
+    
+    // Disable features that slow things down
+    "rust-analyzer.cargo.buildScripts.enable": false,
+    "rust-analyzer.procMacro.enable": false,
+    
+    "rust-analyzer.completion.autoimport.exclude": [
+        {
+            "path": "core::borrow::Borrow",
+            "type": "methods"
+        },
+        {
+            "path": "core::borrow::BorrowMut",
+            "type": "methods"
+        }
+    ]
+}

@@ -1,0 +1,15 @@
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 3
+
+[target.'cfg(all(not(target_env = "msvc"), not(target_arch = "wasm32")))']
+rustflags = ["-C", "target-cpu=native"]
+
+[target.'cfg(all(target_env = "msvc", not(target_arch = "wasm32")))']
+rustflags = ["-C", "target-cpu=native"]

@@ -1,0 +1,74 @@
+[package]
+name = "encrypted-spaces-ff-test"
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+encrypted-spaces-changelog-core = { workspace = true, features = ["bench-timing"] }
+encrypted-spaces-changelog-test-utils = { workspace = true }
+encrypted-spaces-backend = { workspace = true }
+encrypted-spaces-storage-encoding = { workspace = true }
+encrypted-spaces-backend-server ={ workspace = true }
+encrypted-spaces-ffproof = { workspace = true, features = ["prove"] }
+encrypted-spaces-sdk = { workspace = true, features = ["local-transport", "testing"] }
+hex = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+serde_json = { workspace = true }
+temp-env = { workspace = true }
+merk = {workspace = true}
+
+[dev-dependencies]
+temp-env = { workspace = true, features = ["async_closure"] }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+criterion = { workspace = true }
+encrypted-spaces-acl-types = { workspace = true }
+encrypted-spaces-key-manager = { workspace = true }
+ffproof-tracer-shared = { path = "../tracer/shared" }
+libc = "0.2"
+postcard = { workspace = true }
+rand = { workspace = true }
+risc0-zkvm = { workspace = true, features = ["client"] }
+encrypted-spaces-ffproof-methods-bench = { path = "../methods_bench" }
+
+[features]
+# Passthrough features so the wall-clock bench can be invoked as:
+#   cargo bench -p encrypted-spaces-ff-test --features real-proofs,cuda
+real-proofs = ["encrypted-spaces-ffproof/real-proofs"]
+cuda = ["encrypted-spaces-ffproof/cuda"]
+
+[[bench]]
+name = "ff_cycle_benchmarks"
+harness = false
+
+[[bench]]
+name = "ff_time_benchmarks"
+harness = false
+
+[[bench]]
+name = "update_proof_size_benchmarks"
+harness = false
+
+[[bench]]
+name = "select_proof_size_benchmarks"
+harness = false
+
+[[bench]]
+name = "action_proof_size_benchmarks"
+harness = false
+
+[[bench]]
+name = "action_cycle_benchmarks"
+harness = false
+
+[[bench]]
+name = "ffchat_cycle_benchmarks"
+harness = false
+
+[[bench]]
+name = "ff_profile"
+harness = false

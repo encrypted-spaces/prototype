@@ -1,0 +1,20 @@
+[package]
+name = "encrypted-spaces-changelog-test-utils"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+encrypted-spaces-changelog-core = { workspace = true }
+encrypted-spaces-backend = { workspace = true }
+encrypted-spaces-backend-server = { workspace = true }
+encrypted-spaces-crypto = { workspace = true }
+tokio = { workspace = true }
+merk = { workspace = true }
+postcard = { workspace = true }
+serde_json = { workspace = true }
+
+[lib]
+path = "src/test_server.rs"

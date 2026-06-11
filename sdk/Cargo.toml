@@ -1,0 +1,92 @@
+[package]
+name = "encrypted-spaces-sdk"
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+merk = ["encrypted-spaces-backend/merk"]
+local-transport = ["merk", "dep:encrypted-spaces-backend-server"]
+# Activates the prover-side surface of `encrypted-spaces-ffproof` (and thus
+# the RISC-V guest binary build) and unlocks the in-crate `testing`
+# module — most notably `ApplicationSchema::for_testing` — so downstream
+# test/fuzz/bench crates can build spaces against the in-tree FF guest
+# image ID.  Off by default so production SDK builds skip the guest
+# compile.
+testing = ["encrypted-spaces-ffproof/prove"]
+
+[dependencies]
+aes = { workspace = true }
+async-trait = { workspace = true }
+async-tungstenite = { workspace = true }
+base64 = { workspace = true }
+bincode = {workspace = true}
+ctr = { workspace = true }
+encrypted-spaces-acl-types = { workspace = true }
+encrypted-spaces-backend = { workspace = true }
+encrypted-spaces-backend-server = { workspace = true, optional = true }
+encrypted-spaces-changelog-core = { workspace = true }
+encrypted-spaces-crypto = { workspace = true }
+curve25519-dalek = { workspace = true }
+ed25519-dalek = { workspace = true }
+encrypted-spaces-ffproof = { workspace = true }
+encrypted-spaces-key-manager = { workspace = true }
+encrypted-spaces-retention = { workspace = true }
+encrypted-spaces-storage-encoding = { workspace = true }
+futures-util = { workspace = true }
+hex = {workspace = true}
+hyper = { workspace = true }
+hyper-tls = { workspace = true }
+libcrux-ml-kem = { workspace = true }
+log = { workspace = true }
+native-tls = { workspace = true }
+prost = { workspace = true }
+rand = { workspace = true, features = ["std", "std_rng", "os_rng"] }
+serde = { workspace = true }
+serde_json.workspace = true
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tokio-native-tls = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+env_logger = { workspace = true }
+tokio = { workspace = true, features = ["rt","rt-multi-thread","macros","sync","time"] }
+criterion = { workspace = true, features = ["async_tokio"] }
+expect-test = "1"
+tempfile = "3"
+
+# Self-dev-dep enables `local-transport` (in-process server for tests)
+# and `testing` (unlocks `ApplicationSchema::for_testing`, which bakes in
+# the real `EXTEND_FF_ID`).  Resolver v2 keeps dev-dep features separate
+# from regular-dep features for `cargo build`, so plain
+# `cargo build -p encrypted-spaces-sdk` still gets the lean ffproof
+# (`verify` only, no methods compile).  Dev-dep features only activate
+# under `cargo test`, where they're wanted.
+encrypted-spaces-sdk = { path = ".", features = ["local-transport", "testing"] }
+
+[[example]]
+name = "basic_local"
+required-features = ["local-transport", "testing"]
+
+[[example]]
+name = "tables"
+required-features = ["local-transport", "testing"]
+
+[[example]]
+name = "textarea"
+required-features = ["local-transport", "testing"]
+
+[[example]]
+name = "pagination"
+required-features = ["local-transport", "testing"]
+
+[[example]]
+name = "basic_ws"
+required-features = ["testing"]
+
+[[example]]
+name = "task_list"
+required-features = ["local-transport", "testing"]

@@ -1,0 +1,18 @@
+// Schema for the `basic_ws` example.  Mirrors the in-memory schema used
+// by `basic_local`, but is consumed by a real backend server started
+// with `--schema sdk/examples/schemas/basic_ws.kdl`.
+
+table "projects" {
+    column "id"        type="int"     plaintext=#true
+    column "name"      type="string"
+    column "owner_id"  type="int"     plaintext=#true indexed=#true
+}
+
+table "notes" {
+    column "id"         type="int"     plaintext=#true
+    column "title"      type="string"
+    column "body"       type="string"
+    column "author_id"  type="int"     plaintext=#true indexed=#true
+    column "priority"   type="int"
+    column "pinned"     type="int"
+}

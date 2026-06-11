@@ -1,0 +1,42 @@
+[package]
+name = "encrypted-spaces-backend-server"
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+clap = { workspace = true }
+encrypted-spaces-acl-types = { workspace = true }
+encrypted-spaces-crypto = { workspace = true }
+encrypted-spaces-ffproof = { workspace = true, features = ["prove"] }
+encrypted-spaces-storage-encoding = { workspace = true }
+postcard = { workspace = true }
+encrypted-spaces-key-manager = { workspace = true }
+encrypted-spaces-retention = { workspace = true }
+env_logger = { workspace = true }
+futures = { workspace = true }
+futures-util = { workspace = true }
+encrypted-spaces-changelog-core = { workspace = true }
+hex = { workspace = true }
+hyper = { workspace = true }
+hyper-tungstenite = { workspace = true }
+log = { workspace = true }
+merk = { workspace = true }
+once_cell = { workspace = true }
+prost = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+encrypted-spaces-backend = { workspace = true, features = ["merk"] }
+tokio = { workspace = true, features = ["signal", "net"] }
+tokio-rustls = { workspace = true }
+uuid = { workspace = true }
+
+[features]
+# Passthrough features so the server can be built as:
+#   cargo build -p encrypted-spaces-backend-server --features real-proofs,cuda
+real-proofs = ["encrypted-spaces-ffproof/real-proofs"]
+cuda = ["encrypted-spaces-ffproof/cuda"]

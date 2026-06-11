@@ -1,0 +1,27 @@
+{
+  "steps": [
+    { "actor": "alice",   "type": "create_space", "channel": "general" },
+    { "actor": "alice",   "type": "invite",       "invitee": "bob" },
+    { "actor": "bob",     "type": "join",         "from": "alice", "channel": "general" },
+    { "actor": "alice",   "type": "send_message", "text": "hi" },
+    { "actor": "bob",     "type": "add_task",     "title": "milestone 1" },
+    { "actor": "alice",   "type": "add_calendar_event",
+      "start_time": 1700000000, "end_time": 1700003600,
+      "title": "dev meeting", "description": "weekly sync" },
+    { "actor": "bob",     "type": "invite",       "invitee": "charlie" },
+    { "actor": "charlie", "type": "join",         "from": "bob", "channel": "general" },
+    { "actor": "charlie", "type": "send_message", "text": "👋 hello" },
+    { "actor": "alice",   "type": "reply_to_last","text": "welcome charlie" },
+    { "actor": "bob",     "type": "toggle_reaction_on_last", "emoji": "tada" },
+    { "actor": "alice",   "type": "notes_insert", "pos": 0,  "text": "Project plan:\n" },
+    { "actor": "bob",     "type": "notes_insert", "pos": 14, "text": "- ship MVE\n" },
+    { "actor": "bob",     "type": "toggle_last_task" },
+    { "actor": "alice",   "type": "edit_last_message", "text": "hello team" },
+    { "actor": "alice",   "type": "create_folder", "parent_id": 0, "name": "shared" },
+    { "actor": "alice",   "type": "upload_file",   "parent_id": 0, "name": "notes.txt", "content": "team notes" },
+    { "actor": "bob",     "type": "save_snapshot", "slot": "bob-checkpoint" },
+    { "actor": "bob",     "type": "send_message",  "text": "after checkpoint" },
+    { "actor": "bob",     "type": "restore_snapshot", "slot": "bob-checkpoint" },
+    { "actor": "alice",   "type": "sync_all" }
+  ]
+}

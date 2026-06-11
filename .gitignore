@@ -1,0 +1,17 @@
+.cargo/
+.next/
+*.a
+zkp/bridge/ios/EncryptedSpacesApp.xcodeproj/xcuserdata/
+zkp/bridge/ios/EncryptedSpacesApp.xcodeproj/project.xcworkspace/xcuserdata/
+zkp/bridge/ios/EncryptedSpacesBindings/EncryptedSpacesFFI.xcframework/
+backend/server/certs/*.pem
+backend/server/certs/*.key
+backend/server/certs/*.crt
+spaces/
+space_*.json
+schema_*.json
+.DS_Store
+logfile.txt
+target
+**/node_modules/**
+vendor/

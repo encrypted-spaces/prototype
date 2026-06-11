@@ -1,0 +1,35 @@
+[package]
+name = "encrypted-spaces-demo"
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+encrypted-spaces-sdk-codegen = { workspace = true }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+encrypted-spaces-sdk = { workspace = true }
+encrypted-spaces-storage-encoding = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+
+[dev-dependencies]
+# `local-transport` is needed by the inline `#[cfg(test)] mod tests {}` blocks
+# in chat.rs / tasks.rs / notes.rs / state.rs.  `testing` unlocks
+# `ApplicationSchema::for_testing` for those test blocks.  Production
+# builds pull in neither.
+encrypted-spaces-sdk = { workspace = true, features = ["local-transport", "testing"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+tempfile = "3"

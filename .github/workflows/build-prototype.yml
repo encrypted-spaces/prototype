@@ -1,0 +1,133 @@
+name: CI
+
+# No trigger-level `paths:` filter. `ci-pass` is a required status check, so
+# the workflow must run on every PR — a `paths:` filter that excluded a PR
+# would leave `ci-pass` permanently "Expected" and block the merge (e.g. a
+# docs-only PR). Path scoping happens *inside* the workflow instead: the
+# `changes` job runs `affected_crates.py`, and a change touching no workspace
+# crate yields `has_work=false` → `test` is skipped → `ci-pass` reports green.
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - "main"
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  ROCKSDB_LIB_DIR: /usr/lib
+  ROCKSDB_INCLUDE_DIR: /usr/include
+  CARGO_INCREMENTAL: 0
+  RISC0_SKIP_BUILD: 1
+  CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+
+  # Build the test matrix for this run. On PRs the script diffs base..head,
+  # maps changed files onto workspace crates, walks the transitive reverse
+  # dependency closure (via `cargo metadata`), and emits only the affected
+  # matrix entries — so this stays correct as crates are added, moved, or
+  # their deps change, with no hand-maintained globs. The group -> crates
+  # definition lives in `.github/scripts/ci_matrix.json` (single source of
+  # truth; the `test` job below consumes whatever this job emits).
+  #
+  # Outputs:
+  #   matrix   — {"include":[ …entries… ]} consumed by `test`'s dynamic matrix
+  #   has_work — "true" unless the matrix is empty (orphan change / draft PR)
+  #
+  # For push/dispatch the full matrix runs; draft PRs emit an empty matrix so
+  # the `test` job is skipped and contributors can iterate without burning CI.
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.affected.outputs.matrix }}
+      has_work: ${{ steps.affected.outputs.has_work }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Need both base and head commits available locally so the script
+          # can `git diff` between them.
+          fetch-depth: 0
+      - name: Build test matrix
+        id: affected
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ] && \
+             [ "${{ github.event.pull_request.draft }}" = "true" ]; then
+            # Draft PR — run nothing; `has_work=false` skips the test job.
+            {
+              echo 'matrix={"include":[]}'
+              echo "has_work=false"
+            } >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            python3 .github/scripts/affected_crates.py \
+              --base "${{ github.event.pull_request.base.sha }}" \
+              --head "${{ github.event.pull_request.head.sha }}"
+          else
+            # push:main, workflow_dispatch, etc. — run the full matrix.
+            python3 .github/scripts/affected_crates.py --all
+          fi
+
+  test:
+    needs: changes
+    # Skipped when the matrix is empty (draft PR, or a change that touches no
+    # workspace crate). The job-level `if` guards against expanding an empty
+    # matrix; `ci-pass` treats a skipped `test` as success.
+    if: needs.changes.outputs.has_work == 'true'
+    runs-on: ubuntu-24.04
+    name: ${{ matrix.group }}
+    strategy:
+      fail-fast: ${{ github.event_name == 'pull_request' }}
+      # Dynamic matrix: only the affected groups are instantiated as jobs.
+      matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up CI environment
+        uses: ./.github/actions/setup-rust-ci
+        with:
+          ssh-private-key: ${{ secrets.MERK_NOMIC_SSH_KEY }}
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Cargo nextest run (${{ matrix.group }})
+        run: cargo nextest run ${{ matrix.packages }} --locked ${{ matrix.filter }}
+
+      - name: Report disk usage before cache save
+        run: |
+          du -sh target/ || true
+          df -h /
+
+  # Single required status check for branch protection. Decouples the protection
+  # settings from the matrix shape: skipped entries (no relevant changes) are
+  # treated as success; only an actual `test` failure or cancellation fails
+  # this gate. Also fails if the `changes` job didn't succeed, so we don't
+  # merge on broken filter detection.
+  ci-pass:
+    needs: [changes, test]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Aggregate test job results
+        run: |
+          echo "changes job: ${{ needs.changes.result }}"
+          echo "test job:    ${{ needs.test.result }}"
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "::error::changes job did not succeed"
+            exit 1
+          fi
+          case "${{ needs.test.result }}" in
+            success|skipped) ;;
+            *) echo "::error::test job result: ${{ needs.test.result }}"; exit 1 ;;
+          esac

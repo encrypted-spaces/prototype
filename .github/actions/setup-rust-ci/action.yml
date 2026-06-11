@@ -1,0 +1,73 @@
+name: Setup Rust CI environment
+description: >
+  Frees disk, installs toolchain + system deps, restores the rust-cache.
+  Intended to be invoked after actions/checkout in each CI job.
+
+inputs:
+  ssh-private-key:
+    required: false
+    default: ""
+    description: >
+      SSH key for the encrypted-spaces/merk-private repo. Optional — when
+      empty (e.g. on forks without access to the secret), the SSH setup and
+      access-check steps are skipped.
+
+runs:
+  using: composite
+  steps:
+    - name: Free disk space
+      shell: bash
+      run: |
+        sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost
+        sudo apt-get clean
+        df -h /
+
+    - name: Install Protoc
+      uses: arduino/setup-protoc@v3
+
+    - name: Setup SSH for encrypted-spaces/merk-private
+      if: inputs.ssh-private-key != ''
+      uses: webfactory/ssh-agent@v0.9.0
+      with:
+        ssh-private-key: ${{ inputs.ssh-private-key }}
+
+    - name: Trust github.com host key
+      if: inputs.ssh-private-key != ''
+      shell: bash
+      run: |
+        mkdir -p ~/.ssh
+        echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" >> ~/.ssh/known_hosts
+
+    - name: Verify access to encrypted-spaces/merk-private
+      if: inputs.ssh-private-key != ''
+      shell: bash
+      run: |
+        git ls-remote git@github.com:encrypted-spaces/merk-private.git HEAD
+
+    - name: Resolve prototype Rust toolchain
+      id: rust-toolchain
+      shell: bash
+      run: |
+        cargo --version >/dev/null
+        echo "toolchain=$(rustup show active-toolchain | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+    - name: Use Rust Cache
+      uses: Swatinem/rust-cache@v2
+      env:
+        RUSTUP_TOOLCHAIN: ${{ steps.rust-toolchain.outputs.toolchain }}
+      with:
+        workspaces: . -> target
+
+    - name: Cache apt packages
+      uses: actions/cache@v4
+      id: apt-cache
+      with:
+        path: /var/cache/apt/archives/*.deb
+        key: apt-deps-${{ runner.os }}-noble-v1
+
+    - name: Install system dependencies (Tauri/WebKitGTK)
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --fix-missing \
+          libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev

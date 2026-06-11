@@ -1,0 +1,22 @@
+[
+  {
+    "group": "core",
+    "packages": "-p encrypted-spaces-crypto -p encrypted-spaces-key-manager -p encrypted-spaces-retention -p encrypted-spaces-acl-types -p encrypted-spaces-storage-encoding -p encrypted-spaces-changelog-test-utils -p encrypted-spaces-changelog-core -p encrypted-spaces-zkp -p encrypted-spaces-ffproof -p ffproof-tracer -p encrypted-spaces-ff-test",
+    "filter": ""
+  },
+  {
+    "group": "backend",
+    "packages": "-p encrypted-spaces-backend -p encrypted-spaces-backend-server",
+    "filter": ""
+  },
+  {
+    "group": "sdk",
+    "packages": "-p encrypted-spaces-sdk -p encrypted-spaces-sdk-fuzzer",
+    "filter": "-E 'not test(/fuzz_smoke/)'"
+  },
+  {
+    "group": "demo",
+    "packages": "-p encrypted-spaces-demo -p encrypted-spaces-demo-test-harness",
+    "filter": ""
+  }
+]

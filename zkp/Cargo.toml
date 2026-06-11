@@ -1,0 +1,68 @@
+[package]
+name = "encrypted-spaces-zkp"
+version = { workspace = true }
+license = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+encrypted-spaces-crypto = { workspace = true }
+rand =  {workspace = true, features = ["std", "std_rng", "os_rng", "thread_rng"]}
+rand_10 = { workspace = true }
+thiserror = { workspace = true }
+rand_core = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true, features = ["alloc"] }
+p3-air = { workspace = true }
+p3-blake3-air = { workspace = true }
+p3-challenger = { workspace = true }
+p3-commit = { workspace = true }
+p3-dft = { workspace = true }
+p3-field = { workspace = true }
+p3-fri = { workspace = true }
+p3-keccak = { workspace = true }
+p3-keccak-air = { workspace = true }
+p3-koala-bear = { workspace = true }
+p3-matrix = { workspace = true }
+p3-maybe-rayon = { workspace = true }
+p3-merkle-tree = { workspace = true }
+p3-poseidon2-air = { workspace = true }
+p3-sha256 = { workspace = true }
+p3-symmetric = { workspace = true }
+p3-uni-stark = { workspace = true }
+p3-baby-bear = { workspace = true }
+tracing = { workspace = true, default-features = false, features = ["attributes"] }
+tracing-forest = { workspace = true, optional = true }
+tracing-subscriber = { workspace=true, features = ["std", "env-filter"], optional = true }
+spongefish = { workspace = true, features = ["derive", "p3-koala-bear"] }
+spongefish-circuit = { workspace = true }
+spongefish-stark = { workspace = true }
+#libcrux = {git = "https://github.com/cryspen/libcrux.git", rev = "8ebe73237378c80b86a953ec8a77bdd3299918e7"}  # commit for release on Jun 30, 2025
+
+rand_chacha = { workspace = true }
+bytesize = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+
+[[bench]]
+name = "mve_poseidon"
+harness = false
+
+
+[features]
+default = ["std", "parallel"]
+std = [
+    "tracing/std",
+    "dep:tracing-forest",
+    "dep:tracing-subscriber",
+    "rand/std",
+    "rand/thread_rng"
+]
+parallel = ["p3-maybe-rayon/parallel", "p3-dft/parallel", "p3-uni-stark/parallel"]
+
+[[bin]]
+name = "zkp"
+path = "src/bin/zkp.rs"
+required-features = ["std"]

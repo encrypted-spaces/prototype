@@ -1,0 +1,50 @@
+// Canonical schema definitions for built-in ("internal") tables.
+//
+// Parsed once at startup and used both by the backend server (which
+// auto-creates the tables on space init) and by callers that reference
+// individual schemas by name (e.g. `users_schema()`).
+//
+// The Rust wrapper at `backend/src/internal_schemas.rs` re-exports
+// table name constants and provides typed accessors backed by the
+// parsed result.
+
+table "_users" {
+    column "id"         type="int"  plaintext=#true
+    column "update_key" type="blob" plaintext=#true
+    column "auth_key"   type="blob" plaintext=#true
+    column "status"     type="int"  plaintext=#true
+}
+
+table "_access_control" {
+    column "id"            type="int"  plaintext=#true
+    column "resource_name" type="string" plaintext=#true indexed=#true
+    column "operation"     type="string" plaintext=#true
+    column "rule_json"     type="string" plaintext=#true
+}
+
+// `_key_history` rows are always queried by `uid` (full-table scan
+// over the secondary index), never by row id.
+table "_key_history" {
+    column "uid"                  type="int"  plaintext=#true indexed=#true
+    column "old_auth_key"         type="blob" plaintext=#true
+    column "valid_from_change_id" type="int"  plaintext=#true
+    column "valid_to_change_id"   type="int"  plaintext=#true
+}
+
+// Temporary KV-store shim for retention system metadata (commitments,
+// indices, ciphertext rows, etc.).  Once the query/proof system gains
+// native support for ordered range queries and first/last-key lookups,
+// retention state should move to purpose-built storage primitives.
+table "_retention" {
+    column "key"   type="string" plaintext=#true indexed=#true
+    column "value" type="string" plaintext=#true
+}
+
+// Doubly-linked list items.  `value` is encrypted by the SDK crypto
+// layer.
+table "_lists" {
+    column "list_number" type="int"  plaintext=#true indexed=#true
+    column "prev_id"     type="int"  plaintext=#true
+    column "next_id"     type="int"  plaintext=#true
+    column "value"       type="blob"
+}

@@ -1,0 +1,155 @@
+// Application schema for the Tauri demo chat app.
+//
+// Tables marked `auto_increment=#false` require the client to supply an
+// explicit `id` on every insert.  Internal tables (`_users`, `_retention`,
+// `_access_control`, `_key_history`) are created automatically and must not
+// be declared here.
+
+table "channels" {
+    column "id"          type="int"  plaintext=#true
+    column "name"        type="text"
+    column "description" type="text"
+    column "tasks"       type="list"
+    column "notes"       type="list"
+}
+
+table "messages" {
+    column "id"         type="int"  plaintext=#true
+    column "channel_id" type="int"  plaintext=#true indexed=#true
+    column "user_id"    type="int"  plaintext=#true indexed=#true
+    column "content"    type="text"
+    column "timestamp"  type="int"
+    column "thread_id"  type="int"  plaintext=#true indexed=#true
+
+    rules {
+        allow write  "auth.user_id == row.user_id"
+        allow delete "auth.user_id == row.user_id"
+
+        only_via_actions write  "send_message" "update_message"
+        only_via_actions delete "delete_message"
+
+        // Top-level messages have thread_id == 0; replies have
+        // thread_id == <parent_message_id>.  The assertion rejects
+        // replies that target a non-existent message, a reply
+        // (replies-of-replies aren't allowed), or a message in a
+        // different channel.
+        action "send_message" {
+            assert "self.thread_id == 0 || exists(messages, row.id == self.thread_id && row.thread_id == 0 && row.channel_id == self.channel_id)"
+            insert
+        }
+
+        // Locked to `content`; ownership is enforced by the `allow
+        // write` predicate above.
+        action "update_message" {
+            update cols="content"
+        }
+
+        action "delete_message" {
+            delete
+            cascade_delete table="reactions"   where="row.message_id == self.id"
+            cascade_delete table="attachments" where="row.message_id == self.id"
+            cascade_delete table="messages"    where="row.thread_id == self.id"
+        }
+    }
+}
+
+table "users_meta" auto_increment=#false {
+    column "id"   type="int"  plaintext=#true
+    column "name" type="text"
+
+    rules {
+        allow write  "auth.user_id == row.id"
+        allow delete "auth.user_id == row.id"
+    }
+}
+
+table "reactions" {
+    column "id"         type="int"  plaintext=#true
+    column "channel_id" type="int"  plaintext=#true indexed=#true
+    column "message_id" type="int"  plaintext=#true indexed=#true
+    column "user_id"    type="int"  plaintext=#true indexed=#true
+    column "emoji"      type="text"
+
+    rules {
+        allow write  "auth.user_id == row.user_id"
+        allow delete "auth.user_id == row.user_id"
+
+        only_via_actions write "add_reaction"
+
+        // Reactions must target a real message in the channel the
+        // reaction claims to belong to (prevents cross-channel
+        // reaction leaks).
+        action "add_reaction" {
+            assert "exists(messages, row.id == self.message_id && row.channel_id == self.channel_id)"
+            insert
+        }
+    }
+}
+
+table "attachments" {
+    column "id"         type="int"     plaintext=#true
+    column "message_id" type="int"     plaintext=#true indexed=#true
+    column "file_hash"  type="fileref"
+    column "filename"   type="text"
+    column "mime_type"  type="text"
+    column "size"       type="int"
+
+    rules {
+        only_via_actions write "add_attachment"
+
+        // Attachments must target a message the caller authored.
+        action "add_attachment" {
+            assert "exists(messages, row.id == self.message_id && row.user_id == auth.user_id)"
+            insert
+        }
+    }
+}
+
+table "calendar_events" {
+    column "id"          type="int" plaintext=#true
+    column "start_time"  type="int"
+    column "end_time"    type="int"
+    column "title"       type="text"
+    column "description" type="text"
+}
+
+table "inodes" {
+    column "id"        type="int"     plaintext=#true
+    column "parent_id" type="int"     plaintext=#true indexed=#true
+    column "author_id" type="int"     plaintext=#true indexed=#true
+    column "name"      type="text"
+    column "type"      type="int"     plaintext=#true
+    column "size"      type="int"
+    column "ctime"     type="int"
+    column "mtime"     type="int"
+    column "mime_type" type="text"
+    column "file_hash" type="fileref"
+
+    rules {
+        only_via_actions write "add_inode" "move_inode" "rename_inode"
+
+        // Inodes form a tree.  parent_id == 0 is the root; otherwise
+        // the parent must be an existing folder (type == 2) and an
+        // inode can't be its own parent.  type is 1 (file) or 2
+        // (folder).
+        action "add_inode" {
+            assert "self.parent_id == 0 || (exists(inodes, row.id == self.parent_id && row.type == 2) && self.id != self.parent_id)"
+            assert "self.type == 1 || self.type == 2"
+            insert
+        }
+
+        // Moves an inode to a new parent.  Same parent-folder
+        // invariant as `add_inode`.  Locked to the columns a move
+        // actually touches so `self.parent_id` always resolves.
+        action "move_inode" {
+            assert "self.parent_id == 0 || (exists(inodes, row.id == self.parent_id && row.type == 2) && self.id != self.parent_id)"
+            update cols="parent_id,mtime"
+        }
+
+        // Renames an inode in place.  No parent-folder invariant,
+        // since parent_id isn't touched.
+        action "rename_inode" {
+            update cols="name,mtime"
+        }
+    }
+}

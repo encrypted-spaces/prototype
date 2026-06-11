@@ -1,0 +1,36 @@
+# Build artifacts
+target/
+**/target/
+
+# Node / Next.js (Tauri demo only — not needed for the server image)
+**/node_modules/
+demos/**/dist/
+demos/**/.next/
+demos/**/out/
+
+# Runtime / scratch
+**/*.log
+**/logs/
+logfile.txt
+*.exported.json
+spaces/
+data/
+
+# Local TLS material — must be mounted at runtime, never baked in
+certs/
+
+# Editor / OS junk
+.DS_Store
+.idea/
+.vscode/
+
+# VCS metadata — Cargo doesn't need it for this build, and including it
+# bloats the build context. Remote git deps are resolved from Cargo.lock.
+.git/
+.gitignore
+.gitattributes
+.github/
+
+# Python helper scripts that ship with the demo launcher
+demos/tauri/demo_launcher.py
+demos/tauri/test-harness/scenarios/

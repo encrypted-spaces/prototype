@@ -1,0 +1,28 @@
+[package]
+name = "encrypted-spaces-sdk-fuzzer"
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+# Excluded from CI's `CI_PACKAGES` list (see
+# `.github/workflows/build-prototype.yml`) — the smoke test is too slow for
+# every PR. Run it on demand with `cargo test -p encrypted-spaces-sdk-fuzzer`.
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "sdk_fuzzer"
+path = "src/main.rs"
+
+[dependencies]
+encrypted-spaces-acl-types = { workspace = true }
+encrypted-spaces-backend = { workspace = true }
+encrypted-spaces-sdk = { workspace = true, features = ["local-transport", "testing"] }
+rand = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

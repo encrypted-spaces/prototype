@@ -1,0 +1,863 @@
+{
+  "steps": [
+    {
+      "actor": "alice",
+      "type": "create_space",
+      "channel": "general"
+    },
+    {
+      "actor": "alice",
+      "type": "invite",
+      "invitee": "bob"
+    },
+    {
+      "actor": "bob",
+      "type": "join",
+      "from": "alice",
+      "channel": "general"
+    },
+    {
+      "actor": "alice",
+      "type": "invite",
+      "invitee": "charlie"
+    },
+    {
+      "actor": "charlie",
+      "type": "join",
+      "from": "alice",
+      "channel": "general"
+    },
+    {
+      "actor": "alice",
+      "type": "invite",
+      "invitee": "dave"
+    },
+    {
+      "actor": "dave",
+      "type": "join",
+      "from": "alice",
+      "channel": "general"
+    },
+    {
+      "actor": "alice",
+      "type": "update_channel_description",
+      "description": "Founders' general channel"
+    },
+    {
+      "actor": "alice",
+      "type": "switch_channel",
+      "name": "design"
+    },
+    {
+      "actor": "alice",
+      "type": "send_message",
+      "text": "hey from alice in #design"
+    },
+    {
+      "actor": "bob",
+      "type": "switch_channel",
+      "name": "design"
+    },
+    {
+      "actor": "bob",
+      "type": "send_message",
+      "text": "hey from bob in #design"
+    },
+    {
+      "actor": "charlie",
+      "type": "switch_channel",
+      "name": "design"
+    },
+    {
+      "actor": "charlie",
+      "type": "send_message",
+      "text": "hey from charlie in #design"
+    },
+    {
+      "actor": "dave",
+      "type": "switch_channel",
+      "name": "design"
+    },
+    {
+      "actor": "dave",
+      "type": "send_message",
+      "text": "hey from dave in #design"
+    },
+    {
+      "actor": "alice",
+      "type": "update_channel_description",
+      "description": "UI/UX discussion"
+    },
+    {
+      "actor": "alice",
+      "type": "switch_channel",
+      "name": "general"
+    },
+    {
+      "actor": "bob",
+      "type": "switch_channel",
+      "name": "general"
+    },
+    {
+      "actor": "charlie",
+      "type": "switch_channel",
+      "name": "general"
+    },
+    {
+      "actor": "dave",
+      "type": "switch_channel",
+      "name": "general"
+    },
+    {
+      "actor": "alice",
+      "type": "send_message",
+      "text": "kickoff: any blockers?"
+    },
+    {
+      "actor": "bob",
+      "type": "reply_to_last",
+      "text": "i'm blocked on the storage layer"
+    },
+    {
+      "actor": "charlie",
+      "type": "reply_to_last",
+      "text": "@bob i can pair this afternoon"
+    },
+    {
+      "actor": "dave",
+      "type": "toggle_reaction_on_last",
+      "emoji": "\ud83d\udc4d"
+    },
+    {
+      "actor": "alice",
+      "type": "toggle_reaction_on_last",
+      "emoji": "\ud83c\udf89"
+    },
+    {
+      "actor": "bob",
+      "type": "send_message",
+      "text": "typo fixed soon"
+    },
+    {
+      "actor": "bob",
+      "type": "edit_last_message",
+      "text": "(edited) typo fixed"
+    },
+    {
+      "actor": "bob",
+      "type": "send_message",
+      "text": "oops wrong channel"
+    },
+    {
+      "actor": "bob",
+      "type": "delete_last_message"
+    },
+    {
+      "actor": "alice",
+      "type": "switch_channel",
+      "name": "planning"
+    },
+    {
+      "actor": "alice",
+      "type": "switch_channel",
+      "name": "planning"
+    },
+    {
+      "actor": "alice",
+      "type": "add_task",
+      "title": "ship MVP"
+    },
+    {
+      "actor": "bob",
+      "type": "switch_channel",
+      "name": "planning"
+    },
+    {
+      "actor": "bob",
+      "type": "add_task",
+      "title": "write docs"
+    },
+    {
+      "actor": "charlie",
+      "type": "switch_channel",
+      "name": "planning"
+    },
+    {
+      "actor": "charlie",
+      "type": "add_task",
+      "title": "add tests"
+    },
+    {
+      "actor": "dave",
+      "type": "switch_channel",
+      "name": "planning"
+    },
+    {
+      "actor": "dave",
+      "type": "add_task",
+      "title": "review PRs"
+    },
+    {
+      "actor": "alice",
+      "type": "toggle_last_task"
+    },
+    {
+      "actor": "bob",
+      "type": "update_last_task_title",
+      "title": "write docs (priority)"
+    },
+    {
+      "actor": "alice",
+      "type": "add_calendar_event",
+      "start_time": 1735689600,
+      "end_time": 1735693200,
+      "title": "kickoff",
+      "description": "planning sync"
+    },
+    {
+      "actor": "bob",
+      "type": "add_calendar_event",
+      "start_time": 1735776000,
+      "end_time": 1735779600,
+      "title": "design review",
+      "description": "ui review"
+    },
+    {
+      "actor": "charlie",
+      "type": "add_calendar_event",
+      "start_time": 1735862400,
+      "end_time": 1735866000,
+      "title": "standup",
+      "description": "daily standup"
+    },
+    {
+      "actor": "alice",
+      "type": "notes_insert",
+      "pos": 0,
+      "text": "# Project Plan\n\n"
+    },
+    {
+      "actor": "bob",
+      "type": "sync"
+    },
+    {
+      "actor": "bob",
+      "type": "notes_insert",
+      "pos": 18,
+      "text": "- Phase 1: foundations\n"
+    },
+    {
+      "actor": "charlie",
+      "type": "sync"
+    },
+    {
+      "actor": "charlie",
+      "type": "notes_insert",
+      "pos": 42,
+      "text": "- Phase 2: features\n"
+    },
+    {
+      "actor": "alice",
+      "type": "sync_all"
+    },
+    {
+      "actor": "alice",
+      "type": "invite",
+      "invitee": "eve"
+    },
+    {
+      "actor": "eve",
+      "type": "join",
+      "from": "alice",
+      "channel": "general"
+    },
+    {
+      "actor": "alice",
+      "type": "invite",
+      "invitee": "frank"
+    },
+    {
+      "actor": "frank",
+      "type": "join",
+      "from": "alice",
+      "channel": "general"
+    },
+    {
+      "actor": "alice",
+      "type": "invite",
+      "invitee": "grace"
+    },
+    {
+      "actor": "grace",
+      "type": "join",
+      "from": "alice",
+      "channel": "general"
+    },
+    {
+      "actor": "eve",
+      "type": "send_message",
+      "text": "hi all, eve just joined!"
+    },
+    {
+      "actor": "eve",
+      "type": "switch_channel",
+      "name": "planning"
+    },
+    {
+      "actor": "eve",
+      "type": "send_message",
+      "text": "eve: caught up on planning"
+    },
+    {
+      "actor": "eve",
+      "type": "add_task",
+      "title": "onboard eve"
+    },
+    {
+      "actor": "eve",
+      "type": "toggle_reaction_on_last",
+      "emoji": "\ud83d\udc4b"
+    },
+    {
+      "actor": "eve",
+      "type": "switch_channel",
+      "name": "design"
+    },
+    {
+      "actor": "eve",
+      "type": "reply_to_last",
+      "text": "eve chiming in on design"
+    },
+    {
+      "actor": "eve",
+      "type": "switch_channel",
+      "name": "general"
+    },
+    {
+      "actor": "frank",
+      "type": "send_message",
+      "text": "hi all, frank just joined!"
+    },
+    {
+      "actor": "frank",
+      "type": "switch_channel",
+      "name": "planning"
+    },
+    {
+      "actor": "frank",
+      "type": "send_message",
+      "text": "frank: caught up on planning"
+    },
+    {
+      "actor": "frank",
+      "type": "add_task",
+      "title": "onboard frank"
+    },
+    {
+      "actor": "frank",
+      "type": "toggle_reaction_on_last",
+      "emoji": "\ud83d\udc4b"
+    },
+    {
+      "actor": "frank",
+      "type": "switch_channel",
+      "name": "design"
+    },
+    {
+      "actor": "frank",
+      "type": "reply_to_last",
+      "text": "frank chiming in on design"
+    },
+    {
+      "actor": "frank",
+      "type": "switch_channel",
+      "name": "general"
+    },
+    {
+      "actor": "grace",
+      "type": "send_message",
+      "text": "hi all, grace just joined!"
+    },
+    {
+      "actor": "grace",
+      "type": "switch_channel",
+      "name": "planning"
+    },
+    {
+      "actor": "grace",
+      "type": "send_message",
+      "text": "grace: caught up on planning"
+    },
+    {
+      "actor": "grace",
+      "type": "add_task",
+      "title": "onboard grace"
+    },
+    {
+      "actor": "grace",
+      "type": "toggle_reaction_on_last",
+      "emoji": "\ud83d\udc4b"
+    },
+    {
+      "actor": "grace",
+      "type": "switch_channel",
+      "name": "design"
+    },
+    {
+      "actor": "grace",
+      "type": "reply_to_last",
+      "text": "grace chiming in on design"
+    },
+    {
+      "actor": "grace",
+      "type": "switch_channel",
+      "name": "general"
+    },
+    {
+      "actor": "alice",
+      "type": "send_message",
+      "text": "alice ack"
+    },
+    {
+      "actor": "eve",
+      "type": "send_message",
+      "text": "eve ack"
+    },
+    {
+      "actor": "bob",
+      "type": "send_message",
+      "text": "bob ack"
+    },
+    {
+      "actor": "frank",
+      "type": "send_message",
+      "text": "frank ack"
+    },
+    {
+      "actor": "charlie",
+      "type": "send_message",
+      "text": "charlie ack"
+    },
+    {
+      "actor": "grace",
+      "type": "send_message",
+      "text": "grace ack"
+    },
+    {
+      "actor": "dave",
+      "type": "send_message",
+      "text": "dave ack"
+    },
+    {
+      "actor": "eve",
+      "type": "edit_last_message",
+      "text": "eve ack (edited)"
+    },
+    {
+      "actor": "frank",
+      "type": "delete_last_message"
+    },
+    {
+      "actor": "alice",
+      "type": "toggle_reaction_on_last",
+      "emoji": "\ud83d\ude80"
+    },
+    {
+      "actor": "eve",
+      "type": "notes_insert",
+      "pos": 0,
+      "text": "(eve was here) "
+    },
+    {
+      "actor": "frank",
+      "type": "notes_delete",
+      "pos": 0,
+      "count": 1
+    },
+    {
+      "actor": "grace",
+      "type": "notes_insert",
+      "pos": 10,
+      "text": "[grace]"
+    },
+    {
+      "actor": "alice",
+      "type": "sync_all"
+    },
+    {
+      "actor": "alice",
+      "type": "invite",
+      "invitee": "heidi"
+    },
+    {
+      "actor": "heidi",
+      "type": "join",
+      "from": "alice",
+      "channel": "general"
+    },
+    {
+      "actor": "alice",
+      "type": "invite",
+      "invitee": "ivan"
+    },
+    {
+      "actor": "ivan",
+      "type": "join",
+      "from": "alice",
+      "channel": "general"
+    },
+    {
+      "actor": "alice",
+      "type": "invite",
+      "invitee": "judy"
+    },
+    {
+      "actor": "judy",
+      "type": "join",
+      "from": "alice",
+      "channel": "general"
+    },
+    {
+      "actor": "heidi",
+      "type": "send_message",
+      "text": "heidi online"
+    },
+    {
+      "actor": "heidi",
+      "type": "reply_to_last",
+      "text": "heidi self-reply"
+    },
+    {
+      "actor": "heidi",
+      "type": "toggle_reaction_on_last",
+      "emoji": "\ud83c\udf1f"
+    },
+    {
+      "actor": "heidi",
+      "type": "switch_channel",
+      "name": "design"
+    },
+    {
+      "actor": "heidi",
+      "type": "send_message",
+      "text": "heidi in #design"
+    },
+    {
+      "actor": "heidi",
+      "type": "switch_channel",
+      "name": "planning"
+    },
+    {
+      "actor": "heidi",
+      "type": "send_message",
+      "text": "heidi in #planning"
+    },
+    {
+      "actor": "heidi",
+      "type": "switch_channel",
+      "name": "general"
+    },
+    {
+      "actor": "heidi",
+      "type": "send_message",
+      "text": "heidi in #general"
+    },
+    {
+      "actor": "heidi",
+      "type": "add_task",
+      "title": "task by heidi"
+    },
+    {
+      "actor": "heidi",
+      "type": "toggle_last_task"
+    },
+    {
+      "actor": "heidi",
+      "type": "add_calendar_event",
+      "start_time": 1736208000,
+      "end_time": 1736211600,
+      "title": "event heidi",
+      "description": "heidi event desc"
+    },
+    {
+      "actor": "heidi",
+      "type": "notes_insert",
+      "pos": 0,
+      "text": "heidi: "
+    },
+    {
+      "actor": "ivan",
+      "type": "send_message",
+      "text": "ivan online"
+    },
+    {
+      "actor": "ivan",
+      "type": "reply_to_last",
+      "text": "ivan self-reply"
+    },
+    {
+      "actor": "ivan",
+      "type": "toggle_reaction_on_last",
+      "emoji": "\ud83c\udf1f"
+    },
+    {
+      "actor": "ivan",
+      "type": "switch_channel",
+      "name": "design"
+    },
+    {
+      "actor": "ivan",
+      "type": "send_message",
+      "text": "ivan in #design"
+    },
+    {
+      "actor": "ivan",
+      "type": "switch_channel",
+      "name": "planning"
+    },
+    {
+      "actor": "ivan",
+      "type": "send_message",
+      "text": "ivan in #planning"
+    },
+    {
+      "actor": "ivan",
+      "type": "switch_channel",
+      "name": "general"
+    },
+    {
+      "actor": "ivan",
+      "type": "send_message",
+      "text": "ivan in #general"
+    },
+    {
+      "actor": "ivan",
+      "type": "add_task",
+      "title": "task by ivan"
+    },
+    {
+      "actor": "ivan",
+      "type": "toggle_last_task"
+    },
+    {
+      "actor": "ivan",
+      "type": "add_calendar_event",
+      "start_time": 1736208000,
+      "end_time": 1736211600,
+      "title": "event ivan",
+      "description": "ivan event desc"
+    },
+    {
+      "actor": "ivan",
+      "type": "notes_insert",
+      "pos": 0,
+      "text": "ivan: "
+    },
+    {
+      "actor": "judy",
+      "type": "send_message",
+      "text": "judy online"
+    },
+    {
+      "actor": "judy",
+      "type": "reply_to_last",
+      "text": "judy self-reply"
+    },
+    {
+      "actor": "judy",
+      "type": "toggle_reaction_on_last",
+      "emoji": "\ud83c\udf1f"
+    },
+    {
+      "actor": "judy",
+      "type": "switch_channel",
+      "name": "design"
+    },
+    {
+      "actor": "judy",
+      "type": "send_message",
+      "text": "judy in #design"
+    },
+    {
+      "actor": "judy",
+      "type": "switch_channel",
+      "name": "planning"
+    },
+    {
+      "actor": "judy",
+      "type": "send_message",
+      "text": "judy in #planning"
+    },
+    {
+      "actor": "judy",
+      "type": "switch_channel",
+      "name": "general"
+    },
+    {
+      "actor": "judy",
+      "type": "send_message",
+      "text": "judy in #general"
+    },
+    {
+      "actor": "judy",
+      "type": "add_task",
+      "title": "task by judy"
+    },
+    {
+      "actor": "judy",
+      "type": "toggle_last_task"
+    },
+    {
+      "actor": "judy",
+      "type": "add_calendar_event",
+      "start_time": 1736208000,
+      "end_time": 1736211600,
+      "title": "event judy",
+      "description": "judy event desc"
+    },
+    {
+      "actor": "judy",
+      "type": "notes_insert",
+      "pos": 0,
+      "text": "judy: "
+    },
+    {
+      "actor": "alice",
+      "type": "sync_all"
+    },
+    {
+      "actor": "alice",
+      "type": "switch_channel",
+      "name": "general"
+    },
+    {
+      "actor": "alice",
+      "type": "send_message",
+      "text": "final: alice"
+    },
+    {
+      "actor": "bob",
+      "type": "switch_channel",
+      "name": "general"
+    },
+    {
+      "actor": "bob",
+      "type": "send_message",
+      "text": "final: bob"
+    },
+    {
+      "actor": "charlie",
+      "type": "switch_channel",
+      "name": "general"
+    },
+    {
+      "actor": "charlie",
+      "type": "send_message",
+      "text": "final: charlie"
+    },
+    {
+      "actor": "dave",
+      "type": "switch_channel",
+      "name": "general"
+    },
+    {
+      "actor": "dave",
+      "type": "send_message",
+      "text": "final: dave"
+    },
+    {
+      "actor": "eve",
+      "type": "switch_channel",
+      "name": "general"
+    },
+    {
+      "actor": "eve",
+      "type": "send_message",
+      "text": "final: eve"
+    },
+    {
+      "actor": "frank",
+      "type": "switch_channel",
+      "name": "general"
+    },
+    {
+      "actor": "frank",
+      "type": "send_message",
+      "text": "final: frank"
+    },
+    {
+      "actor": "grace",
+      "type": "switch_channel",
+      "name": "general"
+    },
+    {
+      "actor": "grace",
+      "type": "send_message",
+      "text": "final: grace"
+    },
+    {
+      "actor": "heidi",
+      "type": "switch_channel",
+      "name": "general"
+    },
+    {
+      "actor": "heidi",
+      "type": "send_message",
+      "text": "final: heidi"
+    },
+    {
+      "actor": "ivan",
+      "type": "switch_channel",
+      "name": "general"
+    },
+    {
+      "actor": "ivan",
+      "type": "send_message",
+      "text": "final: ivan"
+    },
+    {
+      "actor": "judy",
+      "type": "switch_channel",
+      "name": "general"
+    },
+    {
+      "actor": "judy",
+      "type": "send_message",
+      "text": "final: judy"
+    },
+    {
+      "actor": "judy",
+      "type": "send_message",
+      "text": "judy says good night"
+    },
+    {
+      "actor": "alice",
+      "type": "reply_to_last",
+      "text": "night judy!"
+    },
+    {
+      "actor": "ivan",
+      "type": "toggle_reaction_on_last",
+      "emoji": "\ud83c\udf19"
+    },
+    {
+      "actor": "heidi",
+      "type": "toggle_reaction_on_last",
+      "emoji": "\ud83d\ude34"
+    },
+    {
+      "actor": "eve",
+      "type": "update_channel_description",
+      "description": "general (updated by eve)"
+    },
+    {
+      "actor": "ivan",
+      "type": "update_channel_description",
+      "description": "general (updated by ivan)"
+    },
+    {
+      "actor": "alice",
+      "type": "sync_all"
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+[package]
+name = "encrypted-spaces-ffproof"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+
+[dependencies]
+base64 = {workspace = true}
+bincode = {workspace = true}
+encrypted-spaces-acl-types = {workspace = true}
+encrypted-spaces-changelog-core = {workspace = true}
+hex = {workspace = true}
+log = {workspace = true}
+risc0-zkvm = {workspace = true}
+serde = {workspace = true}
+wasm-bindgen = {workspace = true}
+postcard = {workspace = true}
+merk = {workspace = true}
+ffproof-tracer = { path = "tracer" }
+ffproof-tracer-shared = { path = "tracer/shared" }
+ctor = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+risc0-zkvm = { workspace = true, features = ["client"] }
+
+[target.'cfg(windows)'.dependencies]
+# On Windows, avoid the `client` feature which uses Unix-only APIs.
+risc0-zkvm = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Gated behind the `prove` feature so verify-only consumers (the SDK)
+# don't trigger the RISC-V guest binary build.
+encrypted-spaces-ffproof-methods = { path = "methods", optional = true }
+encrypted-spaces-client-methods = { path = "client_methods", optional = true }
+
+# Enable wasm build for getrandom
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom_03 = { workspace = true, features = ["wasm_js"] }
+getrandom_02 = { workspace = true, features = ["js"] }
+
+[dev-dependencies]
+serial_test = {workspace = true}
+temp-env = {workspace = true, features=["async_closure"]}
+wasm-bindgen-test = {workspace = true}
+tokio = { workspace = true }
+encrypted-spaces-changelog-test-utils = { path = "changelog_test_utils" }
+
+[features]
+# Default is the lightweight verifier surface: callers who don't ask
+# for anything get `FFProof`, `verify_ff`, and `ensure_risc0_proof_mode`
+# without the heavy RISC-V guest binary compile.  Consumers that need
+# to produce proofs (server, codegen, integration tests, fuzzers,
+# benches) opt in to `prove`.
+default = ["verify"]
+# Minimal verifier surface: `common::FFProof`, `verifier::verify_ff`,
+# `ensure_risc0_proof_mode`.  Does not pull in the guest-binary methods
+# crates.
+verify = []
+# Full crate including proof generation.  Pulls in the `methods` /
+# `client_methods` crates which trigger the RISC-V guest binary build.
+prove = ["verify", "dep:encrypted-spaces-ffproof-methods", "dep:encrypted-spaces-client-methods"]
+cuda = ["risc0-zkvm/cuda"]
+real-proofs = []

@@ -1,0 +1,36 @@
+// Predicate / assertion grammar.
+//
+// One grammar serves two callers:
+//   - `parse_access_rule` (ACL clauses): rejects `exists` at AST-build time.
+//   - `parse_assertion`   (recipe asserts): accepts `exists`.
+//
+// Grammar extension points: new operators slot into the precedence ladder
+// (`or` < `and` < `unary` < `primary`); new value forms extend `value`; new
+// call shapes (e.g. future `lookup`, `count`) extend `primary` with a new
+// alternative and a rule for their argument grammar. Adding a new column
+// namespace (`new.`, `param.`, ...) is one new alternative under `value`
+// plus a `ColumnNamespace` variant.
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+
+predicate  =  { SOI ~ or ~ EOI }
+
+or         =  { and ~ ("||" ~ and)* }
+and        =  { unary ~ ("&&" ~ unary)* }
+unary      =  { not_op ~ unary | primary }
+primary    =  { "(" ~ or ~ ")" | exists_call | comparison }
+
+not_op        =  { "!" }
+exists_call   =  { "exists" ~ "(" ~ ident ~ "," ~ or ~ ")" }
+comparison    =  { value ~ cmp_op ~ value }
+
+value      =  { auth_uid | self_col | row_col | integer }
+auth_uid   =  { "auth.user_id" }
+self_col   = ${ "self." ~ ident }
+row_col    = ${ "row." ~ ident }
+
+cmp_op     =  { "==" | "!=" | "<=" | ">=" | "<" | ">" }
+
+// Atomic rules (no implicit whitespace between tokens inside the rule body).
+integer    = @{ "-"? ~ ASCII_DIGIT+ }
+ident      = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }

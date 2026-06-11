@@ -1,0 +1,53 @@
+[package]
+name = "encrypted-spaces-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aes = { workspace = true }
+ctr = { workspace = true }
+base64 = { workspace = true }
+curve25519-dalek.workspace = true
+libcrux-ecdh.workspace = true
+libcrux-ml-kem.workspace = true
+libcrux-kem.workspace = true
+ml-kem.workspace = true
+p3-koala-bear.workspace = true
+p3-field.workspace = true
+p3-keccak.workspace = true
+rand = { workspace = true, features = ["std", "std_rng", "os_rng", "thread_rng"] }
+rand_core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sha3.workspace = true
+subtle.workspace = true
+spongefish = { workspace = true, features = ["derive", "p3-koala-bear"] }
+spongefish-stark.workspace = true
+thiserror.workspace = true
+x-wing.workspace = true
+zeroize.workspace = true
+num-bigint.workspace = true
+num-traits.workspace = true
+postcard.workspace = true
+ed25519-dalek.workspace = true
+ml-dsa.workspace = true
+
+[dev-dependencies]
+postcard.workspace = true
+criterion.workspace = true
+hex.workspace = true
+libcrux-ecdh.workspace = true
+tokio = { workspace = true }
+
+
+[[bench]]
+name = "pke"
+harness = false
+
+[features]
+default = []
+std = []
+avx2 = ["libcrux-ml-kem/simd256"]
