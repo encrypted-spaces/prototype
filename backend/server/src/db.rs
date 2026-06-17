@@ -1,4 +1,5 @@
 use crate::app_config::{AppConfig, BootstrapDataSource, SpaceInitConfig};
+use crate::inspector::{self, Inspector, InspectorEvent, MembershipEvent, ProofKind};
 use crate::key_delivery::GroupKeyDeliverySlots;
 use base64::Engine as _;
 use encrypted_spaces_acl_types::{Action, ActionBody, ActionLeg};
@@ -157,12 +158,319 @@ pub struct SpaceState {
     verbose_logfile: Option<String>,
     /// Per-space store mapping SHA-256 hashes to full values for hash-backed columns.
     pub hash_store: HashMap<[u8; 32], Vec<u8>>,
+    /// Inspector telemetry sink, if enabled via
+    /// `CYPHERSPACES_INSPECTOR_LOG`.
+    inspector: Option<Arc<Inspector>>,
+    /// Table names known to the inspector. Seeded with internal table names at
+    /// init and updated whenever a change writes a schema key, so dynamically
+    /// created user tables (CreateSpace, etc.) appear in `SchemaSnapshot`
+    /// events. Sorted for stable snapshot ordering.
+    inspector_tables: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SelectProofResponse {
     pub proof: Vec<u8>,
     pub hashed_values: HashedValues,
+}
+
+/// Serialize a `merk::Node` recursively into the wire format the inspector
+/// UI consumes. Returns `(root_node, total_node_count)`. The full subtree
+/// is included; demo recordings stay well under a few hundred nodes per
+/// snapshot so this is fine.
+fn serialize_merk_tree(node: Option<&merk::Node>) -> (Option<inspector::MerkTreeNode>, u32) {
+    fn walk(n: &merk::Node, count: &mut u32) -> inspector::MerkTreeNode {
+        *count += 1;
+        let key = n.key();
+        let (label, kind) = label_for_key(key);
+        let mut hash_hex = hex::encode(n.hash());
+        hash_hex.truncate(16);
+        let left = n.child(true).map(|c| Box::new(walk(c, count)));
+        let right = n.child(false).map(|c| Box::new(walk(c, count)));
+        inspector::MerkTreeNode {
+            key_hex: hex::encode(key),
+            label,
+            kind: kind.to_string(),
+            hash: hash_hex,
+            value_size: n.value().len(),
+            left,
+            right,
+        }
+    }
+    let mut count = 0;
+    let root = node.map(|n| walk(n, &mut count));
+    (root, count)
+}
+
+/// Best-effort human-readable label for a Merk key. Falls back to a hex
+/// dump for keys that don't parse — never panics.
+fn label_for_key(key: &[u8]) -> (String, &'static str) {
+    match parse_key(key) {
+        Ok(ParsedKey::Column {
+            table,
+            row_id,
+            column,
+        }) => (format!("{table}/{row_id}/{column}"), "column"),
+        Ok(ParsedKey::Row { table, row_id }) => (format!("{table}/{row_id}"), "row"),
+        Ok(ParsedKey::RowPrefix { table }) => (format!("{table}/*"), "row"),
+        Ok(ParsedKey::Index {
+            table,
+            column,
+            row_id,
+            ..
+        }) => (format!("idx:{table}.{column}→{row_id}"), "index"),
+        Ok(ParsedKey::Schema { table }) => (format!("schema:{table}"), "schema"),
+        Ok(ParsedKey::SchemaColumns { table }) => (format!("schema:{table}/columns"), "schema"),
+        Ok(ParsedKey::SchemaNextId { table }) => (format!("schema:{table}/next_id"), "schema"),
+        Ok(ParsedKey::SchemaIdMode { table }) => (format!("schema:{table}/id_mode"), "schema"),
+        Ok(ParsedKey::AclRule { table, op }) => (format!("acl:{table}/{op}"), "schema"),
+        Ok(ParsedKey::OnlyViaActions { table, op }) => {
+            (format!("only_via_actions:{table}/{op}"), "schema")
+        }
+        Ok(ParsedKey::Action {
+            primary_table,
+            name,
+        }) => (format!("action:{primary_table}/{name}"), "schema"),
+        Ok(ParsedKey::ActionMarker { primary_table }) => {
+            (format!("action_marker:{primary_table}"), "other")
+        }
+        Err(_) => {
+            let preview = hex::encode(&key[..key.len().min(8)]);
+            (format!("?{preview}"), "other")
+        }
+    }
+}
+
+fn column_type_label(t: &encrypted_spaces_backend::schema::ColumnType) -> &'static str {
+    use encrypted_spaces_backend::schema::ColumnType::*;
+    match t {
+        Integer => "int",
+        String => "string",
+        Text => "text",
+        Real => "real",
+        Blob => "blob",
+        FileRef => "fileref",
+        List => "list",
+    }
+}
+
+/// Best-effort inline preview for a column value. `bytes` is the
+/// postcard-encoded `StoredValue` as it sits in the tree. We never panic on
+/// malformed bytes — preview is observability, not validation.
+fn render_value_preview(bytes: &[u8], encrypted: bool) -> String {
+    const MAX_PLAINTEXT_LEN: usize = 80;
+    const HEX_PREFIX_BYTES: usize = 8;
+    let hex_prefix = || -> String {
+        let take = bytes.len().min(HEX_PREFIX_BYTES);
+        let mut out = hex::encode(&bytes[..take]);
+        if bytes.len() > take {
+            out.push('…');
+        }
+        out
+    };
+    if encrypted {
+        return format!("🔒 {} B · {}", bytes.len(), hex_prefix());
+    }
+    match stored_value::bytes_to_value(bytes) {
+        Ok(v) => {
+            let s = match &v {
+                serde_json::Value::String(s) => format!("\"{s}\""),
+                other => other.to_string(),
+            };
+            if s.chars().count() > MAX_PLAINTEXT_LEN {
+                let truncated: String = s.chars().take(MAX_PLAINTEXT_LEN).collect();
+                format!("{truncated}…")
+            } else {
+                s
+            }
+        }
+        Err(_) => format!("({} B) {}", bytes.len(), hex_prefix()),
+    }
+}
+
+/// Build inspector EntrySummary list from a Change's signed entries.
+/// Each entry is parsed; column entries get a plaintext/encrypted
+/// classification from the table schema. Missing schemas (e.g. internal
+/// tables touched before init completes) default to "encrypted" — never
+/// claim cleartext we can't verify.
+/// Build inspector `TableInfo` for every table in `names` that has a
+/// schema in the tree. Unknown / unparseable tables are skipped silently —
+/// the inspector is best-effort, never the source of truth.
+fn build_schema_tables(names: &BTreeSet<String>, db: &MerkStorage) -> Vec<inspector::TableInfo> {
+    names
+        .iter()
+        .filter_map(|name| {
+            let s = db.get_schema(name).ok()?;
+            Some(inspector::TableInfo {
+                name: s.name.clone(),
+                internal: is_internal_table(&s.name),
+                auto_increment: s.auto_increment,
+                columns: s
+                    .columns
+                    .iter()
+                    .map(|c| inspector::ColumnInfo {
+                        name: c.name.clone(),
+                        type_label: column_type_label(&c.column_type).to_string(),
+                        plaintext: c.plaintext,
+                        indexed: c.indexed,
+                    })
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+/// Collect distinct table names from any schema-related parsed keys in
+/// `change.entry.message.entries`. Used to keep the inspector's known-table
+/// set fresh as `CreateSpace` / dynamic table additions land.
+fn schema_tables_in_change(change: &Change) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for kv in &change.entry.message.entries {
+        if let Ok(p) = parse_key(&kv.key) {
+            match p {
+                ParsedKey::Schema { table }
+                | ParsedKey::SchemaColumns { table }
+                | ParsedKey::SchemaNextId { table }
+                | ParsedKey::SchemaIdMode { table } => {
+                    out.insert(table);
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+fn build_entry_summaries(change: &Change, db: &MerkStorage) -> Vec<inspector::EntrySummary> {
+    let mut out = Vec::with_capacity(change.entry.message.entries.len());
+    for kv in &change.entry.message.entries {
+        let value_bytes: &[u8] = kv.value.as_slice();
+        let value_size = value_bytes.len();
+
+        let parsed = match parse_key(&kv.key) {
+            Ok(p) => p,
+            Err(_) => {
+                out.push(inspector::EntrySummary::Other {
+                    label: format!("unparseable key ({} B)", kv.key.len()),
+                    value_size,
+                });
+                continue;
+            }
+        };
+
+        match parsed {
+            ParsedKey::Column {
+                table,
+                row_id,
+                column,
+            } => {
+                let plaintext = db
+                    .get_schema(&table)
+                    .ok()
+                    .and_then(|s| {
+                        s.columns
+                            .iter()
+                            .find(|c| c.name == column)
+                            .map(|c| c.plaintext)
+                    })
+                    .unwrap_or(false);
+                let preview = render_value_preview(value_bytes, !plaintext);
+                out.push(inspector::EntrySummary::Column {
+                    table,
+                    row_id,
+                    column,
+                    encrypted: !plaintext,
+                    value_size,
+                    value_preview: preview,
+                });
+            }
+            ParsedKey::Row { table, row_id } => {
+                out.push(inspector::EntrySummary::Row {
+                    table,
+                    row_id,
+                    value_size,
+                });
+            }
+            ParsedKey::Index {
+                table,
+                column,
+                row_id,
+                ..
+            } => {
+                out.push(inspector::EntrySummary::Index {
+                    table,
+                    column,
+                    row_id,
+                    value_size,
+                });
+            }
+            ParsedKey::RowPrefix { table } => {
+                out.push(inspector::EntrySummary::Other {
+                    label: format!("row prefix on {table}"),
+                    value_size,
+                });
+            }
+            ParsedKey::Schema { table }
+            | ParsedKey::SchemaColumns { table }
+            | ParsedKey::SchemaNextId { table }
+            | ParsedKey::SchemaIdMode { table } => {
+                out.push(inspector::EntrySummary::Other {
+                    label: format!("schema metadata for {table}"),
+                    value_size,
+                });
+            }
+            ParsedKey::AclRule { table, op } => {
+                out.push(inspector::EntrySummary::Other {
+                    label: format!("acl rule {table}/{op}"),
+                    value_size,
+                });
+            }
+            ParsedKey::OnlyViaActions { table, op } => {
+                out.push(inspector::EntrySummary::Other {
+                    label: format!("action gating {table}/{op}"),
+                    value_size,
+                });
+            }
+            ParsedKey::Action {
+                primary_table,
+                name,
+            } => {
+                out.push(inspector::EntrySummary::Other {
+                    label: format!("action {primary_table}/{name}"),
+                    value_size,
+                });
+            }
+            ParsedKey::ActionMarker { primary_table } => {
+                out.push(inspector::EntrySummary::Other {
+                    label: format!("action marker {primary_table}"),
+                    value_size,
+                });
+            }
+        }
+    }
+    out
+}
+
+fn op_type_label(op: encrypted_spaces_changelog_core::changelog::OpType) -> &'static str {
+    use encrypted_spaces_changelog_core::changelog::OpType::*;
+    match op {
+        Insert => "Insert",
+        Update => "Update",
+        Delete => "Delete",
+        ListInsert => "ListInsert",
+        ListUpdate => "ListUpdate",
+        ListDelete => "ListDelete",
+        CreateSpace => "CreateSpace",
+        RefreshKeys => "RefreshKeys",
+        InviteUser => "InviteUser",
+        RemoveUser => "RemoveUser",
+        Extend => "Extend",
+        Reduce => "Reduce",
+        Rekey => "Rekey",
+        ListAppend => "ListAppend",
+        Action => "Action",
+        Noop => "Noop",
+    }
 }
 
 #[derive(Debug)]
@@ -547,6 +855,11 @@ impl SpaceState {
             sigref_map: BTreeMap::new(),
             verbose_logfile,
             hash_store: HashMap::new(),
+            inspector: Inspector::global(),
+            inspector_tables: internal_schemas::all_internal_schemas()
+                .iter()
+                .map(|s| s.name.clone())
+                .collect(),
         };
         let sid = new_server_state.space_id;
         if let Some(config) = &init_cfg {
@@ -601,6 +914,32 @@ impl SpaceState {
         // the first tracked change will see as its old_root
         new_server_state.tree_snapshot = new_server_state.db.snapshot();
 
+        // Seed the inspector's known-table set with any user schemas that
+        // were applied at init, then emit the initial SchemaSnapshot. The
+        // set may grow later as dynamic table creations (CreateSpace) write
+        // schema keys; see `handle_change` for the on-demand re-emit.
+        for s in schema.iter().flat_map(|v| v.iter()) {
+            new_server_state.inspector_tables.insert(s.name.clone());
+        }
+        let snapshot_tables =
+            build_schema_tables(&new_server_state.inspector_tables, &new_server_state.db);
+        new_server_state.emit_inspector(InspectorEvent::SchemaSnapshot {
+            ts_ms: inspector::now_ms(),
+            space_id: sid.to_string(),
+            tables: snapshot_tables,
+        });
+        if new_server_state.inspector.is_some() {
+            let snap = new_server_state.db.snapshot();
+            let (root, node_count) = serialize_merk_tree(snap.as_ref());
+            new_server_state.emit_inspector(InspectorEvent::MerkSnapshot {
+                ts_ms: inspector::now_ms(),
+                space_id: sid.to_string(),
+                change_id: 0,
+                node_count,
+                root,
+            });
+        }
+
         log::info!(
             "space={sid} init complete, root={}",
             hex::encode(new_server_state.db.root_hash())
@@ -611,6 +950,13 @@ impl SpaceState {
 
     pub async fn get_root_hash(&self) -> [u8; 32] {
         self.db.root_hash()
+    }
+
+    /// Emit an inspector event if telemetry is enabled. No-op otherwise.
+    fn emit_inspector(&self, event: InspectorEvent) {
+        if let Some(insp) = &self.inspector {
+            insp.emit(event);
+        }
     }
 
     fn clear_logfile(logfile: Option<&str>) {
@@ -2083,6 +2429,13 @@ impl SpaceState {
             ));
         }
         self.validate_hashed_values(&change.hashed_values)?;
+        self.emit_inspector(InspectorEvent::Request {
+            ts_ms: inspector::now_ms(),
+            space_id: self.space_id.to_string(),
+            request_id: String::new(),
+            op: op_type_label(entry.message.op_type).to_string(),
+            uid: Some(entry.uid as i64),
+        });
         self.verify_change_signature(change, &change.hashed_values)?;
         self.ensure_change_applies(entry)?;
         self.enforce_provisional_restrictions(entry)?;
@@ -2207,6 +2560,75 @@ impl SpaceState {
             accepted_at_server_time,
             hashed_values: response_hashed_values,
         };
+
+        let op_label = op_type_label(entry.message.op_type);
+        let space_str = self.space_id.to_string();
+        let entries = build_entry_summaries(change, &self.db);
+
+        // If this change touched any schema keys (e.g. CreateSpace adding
+        // user tables), update the known-table set and re-emit a fresh
+        // SchemaSnapshot so the UI's Tables tab picks up the new schemas.
+        let new_schema_tables = schema_tables_in_change(change);
+        let schema_added = new_schema_tables
+            .iter()
+            .any(|t| !self.inspector_tables.contains(t));
+        if schema_added {
+            self.inspector_tables.extend(new_schema_tables);
+            let tables = build_schema_tables(&self.inspector_tables, &self.db);
+            self.emit_inspector(InspectorEvent::SchemaSnapshot {
+                ts_ms: inspector::now_ms(),
+                space_id: space_str.clone(),
+                tables,
+            });
+        }
+
+        self.emit_inspector(InspectorEvent::MerkUpdate {
+            ts_ms: inspector::now_ms(),
+            space_id: space_str.clone(),
+            change_id: response.change_id,
+            op_type: op_label.to_string(),
+            old_root: hex::encode(response.old_root),
+            new_root: hex::encode(response.new_root),
+            rows_affected: response.rows_affected,
+            entries,
+        });
+        if self.inspector.is_some() {
+            let snapshot = self.db.snapshot();
+            let (root, node_count) = serialize_merk_tree(snapshot.as_ref());
+            self.emit_inspector(InspectorEvent::MerkSnapshot {
+                ts_ms: inspector::now_ms(),
+                space_id: space_str.clone(),
+                change_id: response.change_id,
+                node_count,
+                root,
+            });
+        }
+        self.emit_inspector(InspectorEvent::ChangelogAppend {
+            ts_ms: inspector::now_ms(),
+            space_id: space_str.clone(),
+            change_id: response.change_id,
+            op_type: op_label.to_string(),
+            clc_root: hex::encode(server_new_clc),
+            entry_size_bytes: entry.as_bytes().len(),
+        });
+        if entry.message.op_type == OpType::CreateSpace {
+            self.emit_inspector(InspectorEvent::Membership {
+                ts_ms: inspector::now_ms(),
+                space_id: space_str.clone(),
+                event: MembershipEvent::Add,
+                change_id: response.change_id,
+                uid: Some(entry.uid as i64),
+            });
+        }
+        self.emit_inspector(InspectorEvent::ProofEmitted {
+            ts_ms: inspector::now_ms(),
+            space_id: space_str,
+            proof_kind: ProofKind::Update,
+            proof_size_bytes: response.pruned_merkle_tree.len(),
+            covers_entries: Some(1),
+            gen_ms: None,
+        });
+
         self.change_responses.push(response.clone());
 
         self.maybe_generate_ff_proof()?;
@@ -2360,6 +2782,14 @@ impl SpaceState {
         query: &Query,
         commitment: &[u8],
     ) -> Result<SelectProofResponse, SdkError> {
+        self.emit_inspector(InspectorEvent::Request {
+            ts_ms: inspector::now_ms(),
+            space_id: self.space_id.to_string(),
+            request_id: String::new(),
+            op: "Select".to_string(),
+            uid: None,
+        });
+
         if commitment.is_empty() {
             return Err(SdkError::ValidationError(
                 "select request must include a data commitment".into(),
@@ -2387,6 +2817,14 @@ impl SpaceState {
             .map_err(|e| SdkError::DatabaseError(format!("failed to generate proof: {e:?}")))?;
         let hashed_values = self.collect_hashed_values_for_select(query, &proof, &root)?;
 
+        self.emit_inspector(InspectorEvent::ProofEmitted {
+            ts_ms: inspector::now_ms(),
+            space_id: self.space_id.to_string(),
+            proof_kind: ProofKind::Select,
+            proof_size_bytes: proof.len(),
+            covers_entries: None,
+            gen_ms: None,
+        });
         Ok(SelectProofResponse {
             proof,
             hashed_values,
@@ -2406,6 +2844,14 @@ impl SpaceState {
     ) -> Result<FastForwardData, ServerError> {
         // TODO: we can use auth context to decide if this user can see certain changes.
         // E.g., if they are new and should only see a ZKP of past changes, we might have to trigger proof generation
+
+        self.emit_inspector(InspectorEvent::Request {
+            ts_ms: inspector::now_ms(),
+            space_id: self.space_id.to_string(),
+            request_id: String::new(),
+            op: "FastForward".to_string(),
+            uid: None,
+        });
 
         // Self-check -- we're assuming for now that we store all the changes and responses on the server
         assert!(self.changelog.changes.len() == self.change_responses.len());
@@ -2554,6 +3000,18 @@ impl SpaceState {
             );
         }
 
+        if let Some(ref ff_proof) = proof {
+            let covers = proven_up_to.saturating_sub(from_change_id as usize) as u32;
+            self.emit_inspector(InspectorEvent::ProofEmitted {
+                ts_ms: inspector::now_ms(),
+                space_id: self.space_id.to_string(),
+                proof_kind: ProofKind::FastForward,
+                proof_size_bytes: ff_proof.proof.len(),
+                covers_entries: Some(covers),
+                gen_ms: None,
+            });
+        }
+
         Ok(FastForwardData {
             proof,
             changes,
@@ -2651,6 +3109,14 @@ impl SpaceState {
             change_response.change_id as usize,
         )
         .map_err(|e| ServerError::Generic(format!("extract row id failed: {e:?}")))?;
+
+        self.emit_inspector(InspectorEvent::Membership {
+            ts_ms: inspector::now_ms(),
+            space_id: self.space_id.to_string(),
+            event: MembershipEvent::Add,
+            change_id: change_response.change_id,
+            uid: Some(new_user_id),
+        });
 
         // 7. Write the invite envelope into the new user's GK delivery slot.
         //    Slot updates are best-effort key-delivery state; the canonical
@@ -2750,6 +3216,16 @@ impl SpaceState {
 
         // 5. Execute the change.
         let change_response = self.handle_change(delete_change, auth).await?;
+
+        for removed_uid in removed_user_ids_in_change(&delete_change.entry) {
+            self.emit_inspector(InspectorEvent::Membership {
+                ts_ms: inspector::now_ms(),
+                space_id: self.space_id.to_string(),
+                event: MembershipEvent::Remove,
+                change_id: change_response.change_id,
+                uid: Some(removed_uid),
+            });
+        }
 
         // 7. Clear the removed user's delivery slot.
         for row_id in removed_user_ids_in_change(&delete_change.entry) {

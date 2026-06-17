@@ -638,19 +638,23 @@ class DemoLauncher(App):
 
         steps = []
 
-        # npm install — check if node_modules exists and package.json hasn't changed
-        node_modules = SCRIPT_DIR / "node_modules"
-        pkg_json = SCRIPT_DIR / "package.json"
-        pkg_lock = SCRIPT_DIR / "package-lock.json"
-        npm_stamp = node_modules / ".install-stamp" if node_modules.exists() else None
-        npm_stale = not node_modules.exists() or (
-            npm_stamp is not None and (
-                not npm_stamp.exists()
-                or (pkg_json.exists() and pkg_json.stat().st_mtime > npm_stamp.stat().st_mtime)
-                or (pkg_lock.exists() and pkg_lock.stat().st_mtime > npm_stamp.stat().st_mtime)
+        def _npm_install_stale(dirpath: Path) -> bool:
+            """True when `dirpath/node_modules` is missing or older than
+            its package.json / package-lock.json."""
+            nm = dirpath / "node_modules"
+            pkg = dirpath / "package.json"
+            lock = dirpath / "package-lock.json"
+            stamp = nm / ".install-stamp" if nm.exists() else None
+            return not nm.exists() or (
+                stamp is not None and (
+                    not stamp.exists()
+                    or (pkg.exists() and pkg.stat().st_mtime > stamp.stat().st_mtime)
+                    or (lock.exists() and lock.stat().st_mtime > stamp.stat().st_mtime)
+                )
             )
-        )
-        if npm_stale:
+
+        # npm install — check if node_modules exists and package.json hasn't changed
+        if _npm_install_stale(SCRIPT_DIR):
             steps.append(
                 ("Installing frontend dependencies...",
                  ["npm", "--prefix", "demos/tauri", "install"],
@@ -659,6 +663,26 @@ class DemoLauncher(App):
         else:
             self.call_from_thread(self._log, "build",
                                   "[dim]✓ Frontend dependencies already installed[/]")
+
+        # Inspector SPA — backend embeds dist/ via include_dir!, so it must
+        # be built before `cargo build`. npm install is conditional on the
+        # same stamp pattern; the build itself is fast (~1s) and idempotent,
+        # so we always run it.
+        inspector_ui_dir = WORKSPACE_ROOT / "backend" / "inspector-ui"
+        if _npm_install_stale(inspector_ui_dir):
+            steps.append(
+                ("Installing inspector SPA dependencies...",
+                 ["npm", "--prefix", "backend/inspector-ui", "install"],
+                 WORKSPACE_ROOT),
+            )
+        else:
+            self.call_from_thread(self._log, "build",
+                                  "[dim]✓ Inspector SPA dependencies already installed[/]")
+        steps.append(
+            ("Building inspector SPA bundle...",
+             ["npm", "--prefix", "backend/inspector-ui", "run", "build"],
+             WORKSPACE_ROOT),
+        )
 
         # Always run cargo build — Cargo's own fingerprinting handles
         # staleness detection and is a fast no-op when nothing changed.
@@ -687,7 +711,14 @@ class DemoLauncher(App):
                  WORKSPACE_ROOT),
             )
 
-        npm_cmd = ["npm", "--prefix", "demos/tauri", "install"]
+        # Map each `npm … install` invocation to the node_modules dir whose
+        # `.install-stamp` we touch on success.
+        install_stamp_dirs = {
+            tuple(["npm", "--prefix", "demos/tauri", "install"]):
+                SCRIPT_DIR / "node_modules",
+            tuple(["npm", "--prefix", "backend/inspector-ui", "install"]):
+                WORKSPACE_ROOT / "backend" / "inspector-ui" / "node_modules",
+        }
 
         for description, cmd, cwd in steps:
             self.call_from_thread(self._log, "build", f"\n[bold cyan]▶ {description}[/]")
@@ -707,9 +738,10 @@ class DemoLauncher(App):
                     return
                 # After successful npm install, write a stamp so we can detect
                 # when package.json changes relative to the last install.
-                if cmd == npm_cmd:
+                stamp_dir = install_stamp_dirs.get(tuple(cmd))
+                if stamp_dir is not None:
                     try:
-                        (SCRIPT_DIR / "node_modules" / ".install-stamp").touch()
+                        (stamp_dir / ".install-stamp").touch()
                     except OSError:
                         pass
                 self.call_from_thread(self._log, "build",
@@ -752,10 +784,27 @@ class DemoLauncher(App):
 
     # -- Server & instance management ----------------------------------------
 
+    def _resolve_inspector_log_path(self) -> str:
+        """Return the inspector log path the backend should write to.
+
+        Honors `CYPHERSPACES_INSPECTOR_LOG` from the environment when set,
+        otherwise falls back to `logs/inspector.ndjson` next to the other
+        launcher logs. This default ensures the inspector's live WebSocket
+        endpoint at `/_inspect/ws` is always available — the backend keys
+        its broadcast channel off the same env var, so leaving it unset
+        would disable live mode in the demo.
+        """
+        path = os.environ.get("CYPHERSPACES_INSPECTOR_LOG")
+        if path:
+            return path
+        LOGS_DIR.mkdir(exist_ok=True)
+        return str(LOGS_DIR / "inspector.ndjson")
+
     @work()
     async def _launch_server(self):
         env = {} if self.use_risc0 else {"RISC0_SKIP_BUILD": "1"}
         env["RUST_LOG"] = self.log_level
+        env["CYPHERSPACES_INSPECTOR_LOG"] = self._resolve_inspector_log_path()
         if self.cache_disabled:
             env["CACHE_DISABLED"] = "1"
 
@@ -877,6 +926,7 @@ class DemoLauncher(App):
 
         env = {} if self.use_risc0 else {"RISC0_SKIP_BUILD": "1"}
         env["RUST_LOG"] = self.log_level
+        env["CYPHERSPACES_INSPECTOR_LOG"] = self._resolve_inspector_log_path()
         if self.cache_disabled:
             env["CACHE_DISABLED"] = "1"
 
