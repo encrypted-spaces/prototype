@@ -14,7 +14,7 @@ use encrypted_spaces_changelog_core::changelog::{
     check_sigref_continuity as core_check_sigref_continuity, Change, ChangeLog, ChangeResponse,
     ChangelogEntry, FastForwardData, HashedValues, OpType, MAX_PARENT_DISTANCE, ROOT_TREE_PATH,
 };
-use encrypted_spaces_changelog_core::mmr_tree::{h_leaf, verify_with_leaf_hash};
+use encrypted_spaces_changelog_core::mmr_tree::{h_leaf, verify_with_leaf_hash, InclusionProof};
 use encrypted_spaces_changelog_core::time::{
     validate_accepted_at_server_time_against_local_clock, validate_change_timestamp_at_acceptance,
     validate_timestamp_hwm, TIMESTAMP_HWM_TOLERANCE_SECONDS,
@@ -93,6 +93,10 @@ struct SavedChangelogState {
     /// a rolled-back ragged apply / inclusion proof can never leave a stale
     /// discharge for a chain we did not commit (issue #212).
     undischarged_pending: Vec<u32>,
+    /// Carry the join anchor through rollback so a partial FF that cleared
+    /// it before failing later cannot leave the joiner believing they verified
+    /// against a chain they then aborted.
+    inviter_anchor: Option<crate::state::InviterAnchor>,
 }
 
 #[derive(Clone)]
@@ -134,6 +138,31 @@ const FAST_FORWARD_RECOVERY_BUDGET: std::time::Duration = std::time::Duration::f
 /// that we don't add meaningful latency, large enough to avoid hot-spinning.
 const FAST_FORWARD_RECOVERY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// Verify a server-supplied inclusion proof binds `entry` to `head` at
+/// position `expected_change_id`. The leaf hash is recomputed from the
+/// entry bytes locally, so a server returning a proof for a different
+/// entry at the same change_id cannot satisfy this check.
+pub(crate) fn verify_entry_inclusion(
+    head: &ClcState,
+    proof: &InclusionProof,
+    expected_change_id: u32,
+    entry: &ChangelogEntry,
+    context: &str,
+) -> Result<()> {
+    if proof.i != expected_change_id {
+        return Err(SdkError::ValidationError(format!(
+            "{context}: inclusion proof i={} does not match expected change_id={expected_change_id}",
+            proof.i,
+        )));
+    }
+    if !verify_with_leaf_hash(head, proof, h_leaf(&entry.as_bytes())) {
+        return Err(SdkError::ValidationError(format!(
+            "{context}: inclusion proof does not verify at change_id={expected_change_id}"
+        )));
+    }
+    Ok(())
+}
+
 impl Space {
     fn save_changelog_state(&self) -> SavedChangelogState {
         self.with_state(|state| SavedChangelogState {
@@ -150,6 +179,7 @@ impl Space {
                 .filter(|(_, p)| !p.discharged)
                 .map(|(&cid, _)| cid)
                 .collect(),
+            inviter_anchor: state.inviter_anchor.clone(),
         })
     }
 
@@ -158,6 +188,7 @@ impl Space {
             state.current_data_commitment = saved.data_commitment;
             state.current_change_id = saved.change_id;
             state.my_last_change_id = saved.my_last_change_id;
+            state.inviter_anchor = saved.inviter_anchor.clone();
             state.sigref_map = saved.sigref_map.clone();
             state.timestamp_hwm = saved.timestamp_hwm;
             state.current_clc_state = saved.clc.clone();
@@ -176,6 +207,70 @@ impl Space {
             change_id: state.current_change_id,
             change_entry: state.current_change_entry.clone(),
         })
+    }
+
+    /// Verify the join's inviter anchor against the FF proof's
+    /// `end_clc_state` when the anchor falls inside the proven range.
+    /// Returns `true` when verification succeeded (caller clears the
+    /// anchor atomically with the state advance); returns `false` when
+    /// the anchor is unset or in the ragged tail (handled separately
+    /// by `check_inviter_anchor_against_ragged`); errors when the
+    /// anchor is in the proven range but the server's proof is missing
+    /// or does not verify.
+    fn verify_inviter_anchor_against_proof(
+        &self,
+        end_clc_state: &ClcState,
+        end_change_id: u32,
+        proof: &encrypted_spaces_changelog_core::changelog::FastForwardProof,
+    ) -> Result<bool> {
+        let anchor = match self.with_state(|s| s.inviter_anchor.clone()) {
+            Some(a) if a.change_id > 0 && a.change_id <= end_change_id => a,
+            _ => return Ok(false),
+        };
+        let incl = proof
+            .expected_inclusion_proofs
+            .get(&anchor.change_id)
+            .ok_or_else(|| {
+                SdkError::ValidationError(format!(
+                    "join: server omitted inclusion proof for inviter anchor change_id={}",
+                    anchor.change_id
+                ))
+            })?;
+        verify_entry_inclusion(
+            end_clc_state,
+            incl,
+            anchor.change_id,
+            &anchor.entry,
+            "join: inviter anchor",
+        )?;
+        Ok(true)
+    }
+
+    /// Verify the join's inviter anchor against a ragged change being
+    /// applied. The change's bytes must equal the inviter's signed
+    /// entry. Caller clears the anchor on success.
+    fn check_inviter_anchor_against_ragged(
+        &self,
+        change: &ChangelogEntry,
+        applied_change_id: u32,
+    ) -> Result<()> {
+        let anchor_bytes = self.with_state(|s| {
+            s.inviter_anchor
+                .as_ref()
+                .filter(|a| a.change_id == applied_change_id)
+                .map(|a| a.entry.as_bytes())
+        });
+        let Some(anchor_bytes) = anchor_bytes else {
+            return Ok(());
+        };
+        if change.as_bytes() != anchor_bytes {
+            return Err(SdkError::ValidationError(format!(
+                "join: ragged change at inviter anchor change_id={applied_change_id} \
+                 does not match the inviter's signed entry"
+            )));
+        }
+        self.with_state_mut(|s| s.inviter_anchor = None);
+        Ok(())
     }
 
     fn rollback_if_applied<T>(
@@ -1817,13 +1912,22 @@ impl Space {
             // entry must be proven incorporated by this fast-forward. The
             // server returns inclusion proofs for any that fall in the proven
             // range; ones in the ragged tail discharge through apply_state_update.
+            // The inviter anchor (set by `Space::join`) rides along the same
+            // path: in the proven range it's verified via the inclusion proof,
+            // in the ragged tail by byte-equality against the applied change.
             let expected_change_ids: Vec<u32> = self.with_state(|state| {
-                state
+                let mut ids: Vec<u32> = state
                     .pending_local_changes
                     .iter()
                     .filter(|(_, p)| !p.discharged)
                     .map(|(&cid, _)| cid)
-                    .collect()
+                    .collect();
+                if let Some(inviter_anchor) = &state.inviter_anchor {
+                    if inviter_anchor.change_id > 0 && !ids.contains(&inviter_anchor.change_id) {
+                        ids.push(inviter_anchor.change_id);
+                    }
+                }
+                ids
             });
             log::info!(
                 "[SDK] recover_via_fast_forward: requesting FF from change_id={} (attempt {attempt})",
@@ -2079,21 +2183,13 @@ impl Space {
                          from_change_id={prior_change_id}"
                     ))
                 })?;
-                if prior_proof.i != prior_change_id {
-                    return Err(SdkError::ValidationError(format!(
-                        "FF: from_inclusion_proof.i={} does not match client's \
-                         current_change_id={prior_change_id}",
-                        prior_proof.i
-                    )));
-                }
-                let prior_leaf_hash = h_leaf(&prior_entry.as_bytes());
-                if !verify_with_leaf_hash(&range.end_clc_state, prior_proof, prior_leaf_hash) {
-                    return Err(SdkError::ValidationError(format!(
-                        "FF: branch substitution detected — from_inclusion_proof \
-                         does not verify against end_clc_state at \
-                         change_id={prior_change_id}"
-                    )));
-                }
+                verify_entry_inclusion(
+                    &range.end_clc_state,
+                    prior_proof,
+                    prior_change_id,
+                    &prior_entry,
+                    "FF: branch continuity",
+                )?;
                 println!("FF branch continuity verified at change_id={prior_change_id}");
             } else if proof.from_inclusion_proof.is_some() {
                 // Defensive: a from_change_id==0 request should not
@@ -2123,25 +2219,13 @@ impl Space {
                                 .to_string(),
                         )
                     })?;
-                if end_entry_inclusion_proof.i != range.end_change_id {
-                    return Err(SdkError::ValidationError(format!(
-                        "FF: end_entry_inclusion_proof.i={} does not match \
-                         end_change_id={}",
-                        end_entry_inclusion_proof.i, range.end_change_id
-                    )));
-                }
-                let end_leaf_hash = h_leaf(&end_entry.as_bytes());
-                if !verify_with_leaf_hash(
+                verify_entry_inclusion(
                     &range.end_clc_state,
                     end_entry_inclusion_proof,
-                    end_leaf_hash,
-                ) {
-                    return Err(SdkError::ValidationError(
-                        "FF: end_entry_inclusion_proof does not verify against \
-                         end_clc_state"
-                            .to_string(),
-                    ));
-                }
+                    range.end_change_id,
+                    end_entry,
+                    "FF: end_entry",
+                )?;
                 Some(end_entry.clone())
             } else {
                 None
@@ -2198,6 +2282,12 @@ impl Space {
                 }
             }
 
+            let inviter_anchor_verified_by_proof = self.verify_inviter_anchor_against_proof(
+                &end_clc_state,
+                range.end_change_id,
+                proof,
+            )?;
+
             let state_update = self.with_state_mut(|state| {
                 if state.current_change_id != anchor.change_id {
                     return Err(SdkError::FastForwardStateAdvanced);
@@ -2237,6 +2327,9 @@ impl Space {
                     if let Some(p) = state.pending_local_changes.get_mut(cid) {
                         p.discharged = true;
                     }
+                }
+                if inviter_anchor_verified_by_proof {
+                    state.inviter_anchor = None;
                 }
                 Ok(())
             });
@@ -2378,6 +2471,10 @@ impl Space {
                 return self.rollback_if_applied(&saved_state, applied_state, e);
             }
 
+            if let Err(e) = self.check_inviter_anchor_against_ragged(change, response.change_id) {
+                return self.rollback_if_applied(&saved_state, applied_state, e);
+            }
+
             ragged_cache_updates.push((
                 Change {
                     entry: change.clone(),
@@ -2466,6 +2563,14 @@ impl Space {
         }
         for (change, writes) in &ragged_cache_updates {
             self.apply_broadcast_cache_updates(change, writes).await;
+        }
+
+        if let Some(anchor) = self.with_state(|s| s.inviter_anchor.clone()) {
+            self.rollback_changelog_state(&saved_state);
+            return Err(SdkError::ValidationError(format!(
+                "join: fast-forward completed without verifying inviter anchor at change_id={}",
+                anchor.change_id
+            )));
         }
 
         Ok(inserted_ids)

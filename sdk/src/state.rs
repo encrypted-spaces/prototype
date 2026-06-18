@@ -99,6 +99,20 @@ pub(crate) struct State {
     /// Ephemeral index-based cache of decrypted rows. Never serialized.
     #[serde(skip)]
     pub(crate) cache: Cache,
+
+    /// Out-of-band anchor handed to a fresh joiner via `SpaceInvite`. Verified
+    /// (and cleared) during the join's first fast-forward, either against the
+    /// FF proof's `expected_inclusion_proofs` or by byte-equality with the
+    /// matching ragged change. Never persisted; `None` for snapshot-restored
+    /// or already-joined spaces.
+    #[serde(skip)]
+    pub(crate) inviter_anchor: Option<InviterAnchor>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct InviterAnchor {
+    pub(crate) change_id: u32,
+    pub(crate) entry: ChangelogEntry,
 }
 
 /// A local submission awaiting proof of incorporation. See
@@ -290,6 +304,7 @@ mod tests {
             ff_image_id: EXTEND_FF_ID,
             pending_local_changes: Default::default(),
             cache: Default::default(),
+            inviter_anchor: None,
         }
     }
 

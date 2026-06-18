@@ -230,6 +230,7 @@ impl Space {
                 ff_image_id,
                 pending_local_changes: Default::default(),
                 cache: Default::default(),
+                inviter_anchor: None,
             })),
             key_manager: Arc::new(tokio::sync::Mutex::new(key_manager)),
             updates_tx: tokio::sync::broadcast::channel(64).0,
@@ -290,8 +291,15 @@ impl Space {
         invite: SpaceInvite,
         schema: ApplicationSchema,
     ) -> Result<Self> {
+        let SpaceInvite {
+            user,
+            space_id,
+            inviter_change_id,
+            inviter_change_entry,
+        } = invite;
+
         let transport: Arc<dyn Transport> = Arc::new(transport);
-        let auth_context = invite.user.as_auth_context(invite.space_id);
+        let auth_context = user.as_auth_context(space_id);
         transport.authenticate(&auth_context).await?;
 
         // Fetch the bootstrap envelope from the GK delivery slot deposited
@@ -305,18 +313,20 @@ impl Space {
         // Bootstrap the key chain directly from the delivered envelope.
         // Canonical retention state is fetched from `_retention` during
         // `restore()` below; no retention rows are written locally here.
-        let key_manager: SpaceKeyManager = KeyManager::from_delivery_envelope(
-            invite.user.update_key_pair,
-            invite.user.auth_key_pair,
-            &envelope,
-        )
-        .map_err(|e| SdkError::JoinError(format!("failed to process invite: {e:?}")))?;
+        let key_manager: SpaceKeyManager =
+            KeyManager::from_delivery_envelope(user.update_key_pair, user.auth_key_pair, &envelope)
+                .map_err(|e| SdkError::JoinError(format!("failed to process invite: {e:?}")))?;
 
         let (dc, table_schemas, actions, ff_image_id) = schema.into_parts().await?;
 
+        let inviter_anchor = state::InviterAnchor {
+            change_id: inviter_change_id,
+            entry: inviter_change_entry,
+        };
+
         let space = Self::restore_internal(
             transport,
-            invite.space_id,
+            space_id,
             state::State {
                 auth_context,
                 current_data_commitment: dc,
@@ -333,6 +343,7 @@ impl Space {
                 ff_image_id,
                 pending_local_changes: Default::default(),
                 cache: Default::default(),
+                inviter_anchor: Some(inviter_anchor),
             },
             key_manager,
         )
@@ -762,7 +773,7 @@ mod tests {
         let err = alice.apply_fast_forward(ff_data).await.unwrap_err();
 
         assert!(
-            err.to_string().contains("end_entry_inclusion_proof.i"),
+            err.to_string().contains("FF: end_entry"),
             "unexpected error: {err}"
         );
         assert_eq!(changelog_snapshot(&alice), before);
@@ -1124,6 +1135,29 @@ mod tests {
 
         let bob = users.iter().find(|u| u.id == bob_id).unwrap();
         assert_eq!(bob.status, UserStatus::Full);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn space_join_rejects_changelog_diverging_from_inviter_anchor() -> Result<()> {
+        use encrypted_spaces_changelog_core::changelog::ChangelogEntry;
+
+        let (transport, space) = create_space().await?;
+        let mut invite = space.invite_user().await?;
+
+        invite.inviter_change_entry = ChangelogEntry::default();
+
+        let err = match Space::join(transport.clone(), invite, schema()).await {
+            Ok(_) => panic!("join must reject anchor-divergent changelog"),
+            Err(e) => e,
+        };
+
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("inviter") || msg.contains("inclusion proof"),
+            "expected inviter-anchor rejection, got: {msg}"
+        );
 
         Ok(())
     }

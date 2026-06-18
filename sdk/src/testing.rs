@@ -125,6 +125,7 @@ impl Space {
                 ff_image_id: EXTEND_FF_ID,
                 pending_local_changes: Default::default(),
                 cache: Default::default(),
+                inviter_anchor: None,
             })),
             key_manager: Arc::new(tokio::sync::Mutex::new(key_manager)),
             updates_tx: tokio::sync::broadcast::channel(64).0,
