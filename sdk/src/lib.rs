@@ -349,6 +349,12 @@ impl Space {
         )
         .await?;
 
+        // Authenticate the group key installed from the (untrusted) delivery
+        // envelope against the now-authenticated post-FF `_retention`
+        // commitment, before any local write. `restore_internal` verified the
+        // inviter anchor, so a substituted key fails closed here.
+        space.verify_installed_group_key_against_retention().await?;
+
         // Rotate provisional invite keypairs → fresh permanent keypairs.
         space.rotate_user_keys().await?;
 
@@ -1155,6 +1161,93 @@ mod tests {
         assert!(
             msg.contains("inviter") || msg.contains("inclusion proof"),
             "expected inviter-anchor rejection, got: {msg}"
+        );
+
+        Ok(())
+    }
+
+    /// Honest invite + join succeeds and the key installed from the delivery
+    /// envelope authenticates directly against the post-FF `_retention`
+    /// commitment, so the check is transparent to honest flows.
+    #[tokio::test]
+    async fn space_join_installs_group_key_authenticated_against_retention() -> Result<()> {
+        let (transport, space) = create_space().await?;
+
+        let invite = space.invite_user().await?;
+        let bob_id = invite.user.id;
+        let bob_space = Space::join(transport.clone(), invite, schema()).await?;
+
+        // Join succeeded: the installed group key authenticated against the
+        // authenticated `_retention` snapshot. Bob is now a full member.
+        let users = bob_space.users().select().all().await?;
+        assert_eq!(users.len(), 2);
+        let bob = users.iter().find(|u| u.id == bob_id).unwrap();
+        assert_eq!(bob.status, UserStatus::Full);
+
+        Ok(())
+    }
+
+    /// Honest changelog (so the inviter anchor passes) but a server-substituted
+    /// GK delivery slot. The substitute envelope is internally self-consistent
+    /// — `(K_srv, commit(K_srv))` for an unrelated key — so it passes
+    /// `from_delivery_envelope`'s weak check. `join` must still fail, at the
+    /// authenticated reconciliation against `_retention`, not at the anchor.
+    #[tokio::test]
+    async fn space_join_rejects_server_substituted_group_key() -> Result<()> {
+        use encrypted_spaces_key_manager::{verify_invite, GkDeliveryEnvelope};
+
+        let (transport, alice) = create_space().await?;
+
+        // Alice issues an honest invite for Bob. The server deposits the real
+        // group-key envelope in Bob's slot, and the invite carries Alice's
+        // genuine inviter anchor.
+        let invite = alice.invite_user().await?;
+        let bob_uid = invite
+            .user
+            .id
+            .expect("invited user has a server-assigned id");
+        let bob_update_pk = invite.user.update_key_pair.public().clone();
+
+        // Mint a self-consistent substitute envelope wrapped to Bob's update
+        // key. A second, independent space stands in for the server's freshly
+        // generated key: its founder group key is unrelated to Alice's
+        // `_retention`, yet the binding commitment matches it exactly, so the
+        // internal check inside `from_delivery_envelope` passes.
+        let (_carol_transport, carol) = create_space().await?;
+        let mut carol_builder = carol.retention_builder();
+        let evil_request = carol
+            .key_manager()
+            .create_invite(&bob_update_pk, &mut carol_builder)
+            .await?;
+        let evil_ciphertexts =
+            verify_invite(&bob_update_pk, &evil_request).expect("carol's invite proof verifies");
+        let evil_ct = evil_ciphertexts
+            .get(0)
+            .expect("one per-recipient ciphertext");
+        let evil_envelope = GkDeliveryEnvelope {
+            binding_commitment: evil_request.root_commitment,
+            ciphertext: evil_ct,
+        };
+        let evil_bytes = serde_json::to_vec(&evil_envelope).expect("serialize envelope");
+
+        // The malicious server overwrites Bob's delivery slot.
+        transport.set_key_delivery_slot(bob_uid, evil_bytes).await;
+
+        let err = match Space::join(transport.clone(), invite, schema()).await {
+            Ok(_) => panic!("join must reject a server-substituted group key"),
+            Err(e) => e,
+        };
+
+        // The failure must be the authenticated key check against `_retention`,
+        // *not* the inviter-anchor check (the changelog is honest here).
+        let msg = format!("{err:?}");
+        assert!(
+            !msg.contains("inviter") && !msg.contains("inclusion proof"),
+            "join must fail at the authenticated key check, not the anchor: {msg}"
+        );
+        assert!(
+            msg.contains("delivery-slot recovery failed") || msg.contains("group key sync failed"),
+            "expected an authenticated group-key reconciliation failure, got: {msg}"
         );
 
         Ok(())

@@ -262,6 +262,25 @@ impl Space {
             Ok(())
         }
     }
+
+    /// Authenticate the group key installed from the (untrusted) GK delivery
+    /// envelope against the canonical commitment in `_retention`.
+    ///
+    /// [`KeyManager::from_delivery_envelope`] only checks the delivered key
+    /// against the server-supplied `binding_commitment`, which is not
+    /// authentication. This runs **after** [`Space::restore_internal`] has
+    /// fast-forwarded and verified the inviter anchor (so `_retention` is
+    /// authenticated) and **before** any local write, reusing
+    /// [`Self::sync_via_delivery_slot`]:
+    ///
+    /// - `AlreadyCurrent`/`DerivedForward`: the installed key reconciles to the
+    ///   canonical commitment (directly or via the DGK chain) — done.
+    /// - `NeedsDelivery`: re-fetch the slot and reconcile the recovered key
+    ///   against `_retention`, failing closed (so `join` errors) if it still
+    ///   does not authenticate.
+    pub(crate) async fn verify_installed_group_key_against_retention(&self) -> Result<()> {
+        self.sync_via_delivery_slot().await
+    }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32"), feature = "local-transport"))]

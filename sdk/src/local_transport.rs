@@ -83,6 +83,14 @@ impl LocalTransport {
         self.fetch_my_key_delivery_calls
             .load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// Test-only: overwrite a recipient's GK delivery slot with raw bytes.
+    ///
+    /// Models a malicious server substituting the delivered group-key envelope.
+    pub async fn set_key_delivery_slot(&self, recipient_uid: i64, payload: Vec<u8>) {
+        let mut state = self.state.lock().await;
+        state.key_delivery_slots.put(recipient_uid, payload);
+    }
 }
 
 impl LocalTransport {

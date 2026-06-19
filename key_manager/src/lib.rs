@@ -73,6 +73,12 @@ impl<G: SpaceKey> KeyManager<G> {
     /// installs `G::from_group_key(group_key)` as the local space key.
     /// Public retention state must be fetched separately from canonical
     /// server state; no serialized `SpaceKey` is decrypted here.
+    ///
+    /// `binding_commitment` is server-supplied, so the commitment check is an
+    /// internal-consistency fast-fail, **not** authentication: the installed
+    /// key is authenticated after fast-forward against the canonical
+    /// commitment in `_retention` (see
+    /// `Space::verify_installed_group_key_against_retention`).
     pub fn from_delivery_envelope(
         update_key_pair: KemKeyPair<DefaultMkem>,
         auth_key_pair: SignatureKeyPair<DefaultSignature>,
