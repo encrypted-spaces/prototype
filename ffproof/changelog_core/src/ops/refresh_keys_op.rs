@@ -1,9 +1,9 @@
 use super::{
     append_insert_index_puts, bump_next_id_after_chain, column_names_from_keys,
     derive_column_keys_with_row_id, extract_i64_from_kh_entries, extract_value_from_kh_entries,
-    partition_composite_entry, read_kh_ranges_indexed, read_next_id, table_from_column_keys,
-    validate_key_history_entries, validate_sorted_entries, validate_user_access, OpContext,
-    OpReader, OpVerifier, OpVerifyResult,
+    partition_composite_entry, read_kh_ranges_indexed, read_next_id,
+    validate_consistent_column_key_row_id, validate_key_history_entries, validate_sorted_entries,
+    validate_user_access, OpContext, OpReader, OpVerifier, OpVerifyResult,
 };
 use crate::changelog::{ChangelogEntry, ChangelogError, OpType};
 use crate::{ReadOp, TraceStep};
@@ -63,15 +63,30 @@ impl OpVerifier for RefreshKeysOp {
             validate_key_history_entries(&kh_column_keys, &kh_entries, entry.uid, "refresh_keys")?;
         debug_assert_eq!(kh_row_id, kh_row_id_check);
 
-        // _users column keys come straight from the (signed) entry.
+        // _users column keys come straight from the (signed) entry. Require
+        // every key to bind to a single (table, row_id) so the write can be
+        // neither split across rows nor aimed at a user other than the signer.
         let users_column_keys: Vec<Vec<u8>> =
             users_entries.iter().map(|kv| kv.key.clone()).collect();
+        let (table, users_row_id) =
+            validate_consistent_column_key_row_id(&users_column_keys, "refresh_keys", "_users")?;
 
         // Must target the _users table
-        let table = table_from_column_keys(&users_column_keys, "refresh_keys")?;
         if table != "_users" {
             return Err(ChangelogError::Generic(format!(
                 "refresh_keys: must target _users table, got '{table}'"
+            )));
+        }
+
+        // Must target the signer's own _users row. Every semantic check below
+        // (old_auth_key match, _key_history continuity) is keyed on entry.uid,
+        // so a row_id != entry.uid would let a member rotate another user's
+        // signing key and take over their identity.
+        if users_row_id != entry.uid as i64 {
+            return Err(ChangelogError::Generic(format!(
+                "refresh_keys: _users row_id={users_row_id} \
+                 must match signer uid={}",
+                entry.uid
             )));
         }
 
@@ -1022,6 +1037,82 @@ mod tests {
         let msg = format!("{err}");
         assert!(
             msg.contains("expected the placeholder row_id=0"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// Cross-user signing-key takeover: a member (uid=1) signs a RefreshKeys
+    /// whose _users write targets a *different* user's row (row_id=2). Every
+    /// semantic check is keyed on entry.uid=1, so without the row_id==uid
+    /// guard the victim's auth_key would be silently overwritten, letting the
+    /// attacker sign as the victim. The verifier must reject this.
+    #[test]
+    fn test_refresh_keys_rejects_users_row_for_other_user() {
+        let uid = 1u32;
+        let victim_uid = 2u32;
+        // _users write targets the victim's row, not the signer's.
+        let user_col = column_key("_users", victim_uid as i64, "auth_key");
+        let kh_kvs = make_kh_kvs(uid);
+        let entry = make_combined_entry(uid, kh_kvs, std::slice::from_ref(&user_col));
+
+        let sk = user_status_key(uid);
+        let reads = vec![
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk, stored_i64(1))],
+            },
+            ProvenRead {
+                op: ReadOp::Key(schema_next_id_key(KEY_HISTORY_TABLE)),
+                results: vec![(
+                    schema_next_id_key(KEY_HISTORY_TABLE),
+                    1i64.to_be_bytes().to_vec(),
+                )],
+            },
+        ];
+        let mut reader = VerifierReader::new(&reads);
+        let err = RefreshKeysOp::extract_and_validate(&entry, &mut reader, &OpContext::default());
+        assert!(err.is_err(), "cross-user _users row must be rejected");
+        let msg = format!("{}", err.unwrap_err());
+        assert!(
+            msg.contains("must match signer uid"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// A RefreshKeys whose _users entries span two different rows must be
+    /// rejected: one rotation must bind every column to a single (table,
+    /// row_id). Here uid=1 writes both _users[1] and _users[2].
+    #[test]
+    fn test_refresh_keys_rejects_users_keys_for_multiple_rows() {
+        let uid = 1u32;
+        let mut user_keys = [
+            column_key("_users", uid as i64, "auth_key"),
+            column_key("_users", 2, "update_key"),
+        ];
+        user_keys.sort();
+        let kh_kvs = make_kh_kvs(uid);
+        let entry = make_combined_entry(uid, kh_kvs, &user_keys);
+
+        let sk = user_status_key(uid);
+        let reads = vec![
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk, stored_i64(1))],
+            },
+            ProvenRead {
+                op: ReadOp::Key(schema_next_id_key(KEY_HISTORY_TABLE)),
+                results: vec![(
+                    schema_next_id_key(KEY_HISTORY_TABLE),
+                    1i64.to_be_bytes().to_vec(),
+                )],
+            },
+        ];
+        let mut reader = VerifierReader::new(&reads);
+        let err = RefreshKeysOp::extract_and_validate(&entry, &mut reader, &OpContext::default());
+        assert!(err.is_err(), "multi-row _users write must be rejected");
+        let msg = format!("{}", err.unwrap_err());
+        assert!(
+            msg.contains("single (table, row_id)") || msg.contains("must match signer uid"),
             "unexpected error: {msg}"
         );
     }
