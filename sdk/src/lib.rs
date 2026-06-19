@@ -295,7 +295,7 @@ impl Space {
             user,
             space_id,
             inviter_change_id,
-            inviter_change_entry,
+            inviter_change_hash,
         } = invite;
 
         let transport: Arc<dyn Transport> = Arc::new(transport);
@@ -321,7 +321,7 @@ impl Space {
 
         let inviter_anchor = state::InviterAnchor {
             change_id: inviter_change_id,
-            entry: inviter_change_entry,
+            change_hash: inviter_change_hash,
         };
 
         let space = Self::restore_internal(
@@ -1141,12 +1141,10 @@ mod tests {
 
     #[tokio::test]
     async fn space_join_rejects_changelog_diverging_from_inviter_anchor() -> Result<()> {
-        use encrypted_spaces_changelog_core::changelog::ChangelogEntry;
-
         let (transport, space) = create_space().await?;
         let mut invite = space.invite_user().await?;
 
-        invite.inviter_change_entry = ChangelogEntry::default();
+        invite.inviter_change_hash = [0xAB; 32];
 
         let err = match Space::join(transport.clone(), invite, schema()).await {
             Ok(_) => panic!("join must reject anchor-divergent changelog"),

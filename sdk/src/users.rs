@@ -5,7 +5,8 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use encrypted_spaces_backend::error::SdkError;
 use encrypted_spaces_backend::internal_schemas::{key_history_schema, users_schema};
 use encrypted_spaces_backend::SpaceId;
-use encrypted_spaces_changelog_core::changelog::{ChangelogEntry, OpType};
+use encrypted_spaces_changelog_core::changelog::OpType;
+use encrypted_spaces_changelog_core::mmr_tree::h_leaf;
 use encrypted_spaces_crypto::pke::{KemKeyPair, XWingRistretto};
 use encrypted_spaces_crypto::signature::SignatureKeyPair;
 use encrypted_spaces_crypto::{default_rng, Mkem, Signature};
@@ -199,7 +200,7 @@ pub struct SpaceInvite {
     pub(crate) user: UserWithSecrets,
     pub(crate) space_id: SpaceId,
     pub(crate) inviter_change_id: u32,
-    pub(crate) inviter_change_entry: ChangelogEntry,
+    pub(crate) inviter_change_hash: [u8; 32],
 }
 
 impl SpaceInvite {
@@ -319,6 +320,7 @@ impl Space {
                 "invite_user: changelog anchor missing after InviteUser was proven".into(),
             )
         })?;
+        let inviter_change_hash = h_leaf(&inviter_change_entry.as_bytes()).into();
 
         let mut result_user = new_user;
         result_user.id = Some(new_user_id);
@@ -326,7 +328,7 @@ impl Space {
             user: result_user,
             space_id: self.id,
             inviter_change_id,
-            inviter_change_entry,
+            inviter_change_hash,
         })
     }
 
@@ -965,7 +967,7 @@ mod tests {
             user,
             space_id,
             inviter_change_id: 0,
-            inviter_change_entry: ChangelogEntry::default(),
+            inviter_change_hash: [0u8; 32],
         };
 
         assert_eq!(invite.id(), Some(123));
@@ -980,7 +982,7 @@ mod tests {
             user,
             space_id: SpaceId::random(),
             inviter_change_id: 0,
-            inviter_change_entry: ChangelogEntry::default(),
+            inviter_change_hash: [0u8; 32],
         };
         assert!(invite.id().is_none());
     }

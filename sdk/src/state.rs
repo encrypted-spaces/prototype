@@ -112,7 +112,7 @@ pub(crate) struct State {
 #[derive(Clone, Debug)]
 pub(crate) struct InviterAnchor {
     pub(crate) change_id: u32,
-    pub(crate) entry: ChangelogEntry,
+    pub(crate) change_hash: [u8; 32],
 }
 
 /// A local submission awaiting proof of incorporation. See

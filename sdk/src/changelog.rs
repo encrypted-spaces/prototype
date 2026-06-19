@@ -12,7 +12,8 @@ use encrypted_spaces_backend::{
 };
 use encrypted_spaces_changelog_core::changelog::{
     check_sigref_continuity as core_check_sigref_continuity, Change, ChangeLog, ChangeResponse,
-    ChangelogEntry, FastForwardData, HashedValues, OpType, MAX_PARENT_DISTANCE, ROOT_TREE_PATH,
+    ChangelogEntry, Digest, FastForwardData, HashedValues, OpType, MAX_PARENT_DISTANCE,
+    ROOT_TREE_PATH,
 };
 use encrypted_spaces_changelog_core::mmr_tree::{h_leaf, verify_with_leaf_hash, InclusionProof};
 use encrypted_spaces_changelog_core::time::{
@@ -138,15 +139,16 @@ const FAST_FORWARD_RECOVERY_BUDGET: std::time::Duration = std::time::Duration::f
 /// that we don't add meaningful latency, large enough to avoid hot-spinning.
 const FAST_FORWARD_RECOVERY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// Verify a server-supplied inclusion proof binds `entry` to `head` at
-/// position `expected_change_id`. The leaf hash is recomputed from the
-/// entry bytes locally, so a server returning a proof for a different
-/// entry at the same change_id cannot satisfy this check.
-pub(crate) fn verify_entry_inclusion(
+/// Verify a server-supplied inclusion proof binds `leaf_hash` to `head` at
+/// position `expected_change_id`. The leaf hash is supplied by the caller —
+/// either the locally-computed `h_leaf(entry.as_bytes())` (FF branch /
+/// end-anchor checks) or a known hash from a trusted out-of-band source
+/// (join's inviter anchor).
+pub(crate) fn verify_inclusion_proof(
     head: &ClcState,
     proof: &InclusionProof,
     expected_change_id: u32,
-    entry: &ChangelogEntry,
+    leaf_hash: Digest,
     context: &str,
 ) -> Result<()> {
     if proof.i != expected_change_id {
@@ -155,7 +157,7 @@ pub(crate) fn verify_entry_inclusion(
             proof.i,
         )));
     }
-    if !verify_with_leaf_hash(head, proof, h_leaf(&entry.as_bytes())) {
+    if !verify_with_leaf_hash(head, proof, leaf_hash) {
         return Err(SdkError::ValidationError(format!(
             "{context}: inclusion proof does not verify at change_id={expected_change_id}"
         )));
@@ -236,34 +238,35 @@ impl Space {
                     anchor.change_id
                 ))
             })?;
-        verify_entry_inclusion(
+        verify_inclusion_proof(
             end_clc_state,
             incl,
             anchor.change_id,
-            &anchor.entry,
+            anchor.change_hash.into(),
             "join: inviter anchor",
         )?;
         Ok(true)
     }
 
     /// Verify the join's inviter anchor against a ragged change being
-    /// applied. The change's bytes must equal the inviter's signed
-    /// entry. Caller clears the anchor on success.
+    /// applied. The change's leaf hash must equal the inviter's. Caller
+    /// clears the anchor on success.
     fn check_inviter_anchor_against_ragged(
         &self,
         change: &ChangelogEntry,
         applied_change_id: u32,
     ) -> Result<()> {
-        let anchor_bytes = self.with_state(|s| {
+        let anchor_hash = self.with_state(|s| {
             s.inviter_anchor
                 .as_ref()
                 .filter(|a| a.change_id == applied_change_id)
-                .map(|a| a.entry.as_bytes())
+                .map(|a| a.change_hash)
         });
-        let Some(anchor_bytes) = anchor_bytes else {
+        let Some(anchor_hash) = anchor_hash else {
             return Ok(());
         };
-        if change.as_bytes() != anchor_bytes {
+        let applied_hash: [u8; 32] = h_leaf(&change.as_bytes()).into();
+        if applied_hash != anchor_hash {
             return Err(SdkError::ValidationError(format!(
                 "join: ragged change at inviter anchor change_id={applied_change_id} \
                  does not match the inviter's signed entry"
@@ -2183,11 +2186,11 @@ impl Space {
                          from_change_id={prior_change_id}"
                     ))
                 })?;
-                verify_entry_inclusion(
+                verify_inclusion_proof(
                     &range.end_clc_state,
                     prior_proof,
                     prior_change_id,
-                    &prior_entry,
+                    h_leaf(&prior_entry.as_bytes()),
                     "FF: branch continuity",
                 )?;
                 println!("FF branch continuity verified at change_id={prior_change_id}");
@@ -2219,11 +2222,11 @@ impl Space {
                                 .to_string(),
                         )
                     })?;
-                verify_entry_inclusion(
+                verify_inclusion_proof(
                     &range.end_clc_state,
                     end_entry_inclusion_proof,
                     range.end_change_id,
-                    end_entry,
+                    h_leaf(&end_entry.as_bytes()),
                     "FF: end_entry",
                 )?;
                 Some(end_entry.clone())
