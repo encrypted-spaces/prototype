@@ -254,6 +254,32 @@ pub fn prove_ff_chunk(
     // Compact witness bytes from `encode_pruned_compact`.
     pruned_tree_bytes: Vec<u8>,
 ) -> (FFProof, SessionStats) {
+    // Production always uses the real guest image id. The `self_image_id`
+    // seam below exists only so tests can simulate a malicious prover that
+    // commits a foreign recursion image id (the "inner image ID is
+    // prover-controlled" attack), which `verify_ff_internal` must reject.
+    prove_ff_chunk_with_image_id(
+        previous_proof,
+        changelog,
+        change_responses,
+        start_idx,
+        pruned_tree_bytes,
+        EXTEND_FF_ID,
+    )
+}
+
+fn prove_ff_chunk_with_image_id(
+    previous_proof: Option<&FFProof>,
+    changelog: &ChangeLog,
+    change_responses: &[ChangeResponse],
+    start_idx: usize,
+    // Compact witness bytes from `encode_pruned_compact`.
+    pruned_tree_bytes: Vec<u8>,
+    // Image id the guest commits to its journal and (for extension chunks)
+    // verifies the previous proof against. Always `EXTEND_FF_ID` in
+    // production; tests pass a foreign id to exercise the verifier's pin.
+    self_image_id: [u32; 8],
+) -> (FFProof, SessionStats) {
     crate::ensure_risc0_proof_mode();
     let is_first = previous_proof.is_none();
 
@@ -359,6 +385,11 @@ pub fn prove_ff_chunk(
 
         let mut builder = ExecutorEnv::builder();
         builder.write(&is_first).expect("write is_first failed");
+        // The guest reads the recursion image id unconditionally (right after
+        // `is_first`) and commits it to the journal; supply it here so first
+        // chunks carry the same uniform journal layout
+        // `(FastForwardRange, Digest)` as extension chunks.
+        builder.write_slice(&self_image_id);
         write_flat_entries!(builder);
         builder
             .write(&range_bytes.len())
@@ -380,10 +411,14 @@ pub fn prove_ff_chunk(
         builder
             .write(&is_first)
             .expect("write is_first failed")
+            // Image id first (the guest reads it unconditionally right after
+            // `is_first`), then the previous io bytes. The guest verifies the
+            // previous receipt against this id and requires the previous proof
+            // to have committed the same id (self-consistency).
+            .write_slice(&self_image_id)
             .write(&previous_io_bytes.len())
             .expect("write_previous_io_bytes.len() failed")
             .write_slice(&previous_io_bytes)
-            .write_slice(&EXTEND_FF_ID)
             .add_assumption(previous_receipt.clone());
         write_flat_entries!(builder);
         builder
@@ -439,8 +474,11 @@ pub fn prove_ff_chunk(
         "receipt verification failed"
     );
 
-    // Decode journal directly as FastForwardRange - no conversions needed
-    let io: FastForwardRange = receipt.journal.decode().unwrap();
+    // Journal layout is `(FastForwardRange, Digest)` (see `extend_ff` guest).
+    // The trailing digest is the committed recursion image id, which the
+    // verifier pins; the prover only needs the `FastForwardRange`.
+    let (io, _committed_image_id): (FastForwardRange, risc0_zkvm::sha::Digest) =
+        receipt.journal.decode().unwrap();
 
     log::info!(
         "Batch proven: {} changes (change ids 0 to {})",
@@ -584,6 +622,56 @@ mod tests {
             let res = verify_ff_internal(&proof, EXTEND_FF_ID);
 
             assert!(res, "Result of verify_ff_internal is false");
+        });
+    }
+
+    /// Regression test for the "inner image ID is prover-controlled" attack.
+    ///
+    /// A malicious prover commits a foreign recursion image id into the
+    /// journal. The receipt is still a genuine `EXTEND_FF` receipt (so it
+    /// verifies against `EXTEND_FF_ID`), but `verify_ff_internal` must reject
+    /// it because the committed image id is not the trusted one. Without the
+    /// committed-id pin this proof would be accepted, enabling total state
+    /// forgery via a trivial inner guest.
+    #[tokio::test]
+    #[serial]
+    async fn test_forged_recursion_image_id_rejected() {
+        if std::env::var("RISC0_SKIP_BUILD").is_ok() {
+            eprintln!("Skipping test_forged_recursion_image_id_rejected: RISC0_SKIP_BUILD is set");
+            return;
+        }
+        let server = TestServer::new_for_tests(3, None).await;
+
+        temp_env::with_vars(TEST_ENV_VARS, || {
+            let tr = extract_and_trace(&server, 0);
+
+            // Any image id != EXTEND_FF_ID stands in for a prover-chosen
+            // (e.g. trivial) inner guest.
+            let mut forged_id = EXTEND_FF_ID;
+            forged_id[0] ^= 0x1;
+
+            let (proof, _stats) = prove_ff_chunk_with_image_id(
+                None,
+                server.changelog(),
+                server.responses(),
+                0,
+                tr.pruned_tree_bytes,
+                forged_id,
+            );
+
+            // The receipt is a real EXTEND_FF receipt, so it verifies under
+            // the trusted image id...
+            assert!(
+                proof.receipt.verify(EXTEND_FF_ID).is_ok(),
+                "forged-id receipt should still verify as an EXTEND_FF receipt"
+            );
+
+            // ...but the FF verifier must reject it because the *committed*
+            // recursion image id does not match EXTEND_FF_ID.
+            assert!(
+                !verify_ff_internal(&proof, EXTEND_FF_ID),
+                "verifier must reject a proof whose committed image id != EXTEND_FF_ID"
+            );
         });
     }
 

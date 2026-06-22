@@ -66,13 +66,29 @@ pub(crate) fn verify_ff_internal(proof: &FFProof, expected_image_id: [u32; 8]) -
         return false;
     }
 
-    let io: FastForwardRange = match proof.receipt.journal.decode() {
-        Ok(decoded) => decoded,
-        Err(_) => {
-            log::error!("Failed to decode journal");
-            return false;
-        }
-    };
+    // The journal commits `(FastForwardRange, Digest)`, where the trailing
+    // digest is the image id the guest used for the recursive `env::verify`
+    // of the previous chunk (and, for first chunks, the id the host claimed).
+    // It must equal the trusted image id; otherwise a prover could recurse
+    // into a foreign guest that fabricates the recursion's `previous_io`,
+    // forging arbitrary `end_dc` / `end_clc_state` / `sigref_map` while the
+    // outer receipt still verifies under `EXTEND_FF_ID`.
+    let (io, committed_image_id): (FastForwardRange, Risc0Digest) =
+        match proof.receipt.journal.decode() {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                log::error!("Failed to decode journal");
+                return false;
+            }
+        };
+
+    if committed_image_id != extend_ff_id {
+        log::error!(
+            "Committed recursion image id {committed_image_id} does not match \
+             the trusted EXTEND_FF image id {extend_ff_id}"
+        );
+        return false;
+    }
 
     log::debug!(
         "Verification took {:?}",

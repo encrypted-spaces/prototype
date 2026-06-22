@@ -5,12 +5,27 @@ use encrypted_spaces_changelog_core::changelog::{
 };
 use risc0_zkvm::guest::env;
 use risc0_zkvm::serde;
+use risc0_zkvm::sha::Digest;
 use std::collections::BTreeMap;
 
 risc0_zkvm::guest::entry!(main);
 
 fn main() {
     let is_first: bool = env::read();
+
+    // Self image id, supplied by the (untrusted) host. The guest commits it
+    // to the journal (see `env::commit` at the end) so the verifier can pin
+    // it to the trusted `EXTEND_FF_ID`. The guest cannot know its own image
+    // id at build time, so soundness is established jointly by:
+    //   1. the verifier requiring the committed id to equal `EXTEND_FF_ID`,
+    //      and
+    //   2. each extension chunk requiring the previous proof to have
+    //      committed this *same* id (the self-consistency check below).
+    // Together these bind every layer of the recursion to a single image id.
+    #[allow(non_snake_case)]
+    let mut PROGRAM_ID = [0u32; 8];
+    env::read_slice(&mut PROGRAM_ID);
+    let program_id_digest = Digest::from(PROGRAM_ID);
 
     let mut previous_io = FastForwardRange::default();
     if !is_first {
@@ -19,12 +34,14 @@ fn main() {
         env::read_slice(&mut io_bytes);
         previous_io.set_from_bytes(&io_bytes).unwrap();
 
-        #[allow(non_snake_case)]
-        let mut PROGRAM_ID = [0u32; 8];
-        env::read_slice(&mut PROGRAM_ID);
-
-        let inputs = &serde::to_vec(&previous_io).unwrap();
-        env::verify(PROGRAM_ID, inputs).unwrap();
+        // The previous proof's journal is `(previous_io, program_id_digest)`.
+        // Appending `program_id_digest` to the expected journal forces the
+        // previous proof to have committed this very image id, so a prover
+        // cannot recurse into a foreign guest (e.g. a trivial one that emits
+        // an arbitrary `FastForwardRange`) to fabricate `previous_io`.
+        let mut inputs = serde::to_vec(&previous_io).unwrap();
+        inputs.extend_from_slice(&serde::to_vec(&program_id_digest).unwrap());
+        env::verify(PROGRAM_ID, &inputs).unwrap();
     }
 
     // Read flat entry bytes: entry_count, entries_byte_len, entry_ends, entries_bytes
@@ -127,5 +144,10 @@ fn main() {
         timestamp_hwm,
     };
 
+    // Journal layout is `(FastForwardRange, Digest)`. The trailing digest is
+    // the image id used for recursion; the verifier pins it to the trusted
+    // `EXTEND_FF_ID`, and extension chunks require the previous proof to have
+    // committed the same value (see the self-consistency check above).
     env::commit(&output);
+    env::commit(&program_id_digest);
 }
