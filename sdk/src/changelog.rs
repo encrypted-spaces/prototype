@@ -4565,6 +4565,122 @@ mod hash_backed_broadcast_tests {
 
         Ok(())
     }
+
+    /// Build a legitimate insert against `space` and submit it to the
+    /// transport (advancing the server's changelog) *without* applying it
+    /// locally, returning the `(change, change_response)` a remote client
+    /// would receive over a broadcast. `space`'s `current_change_id` is left
+    /// one behind so the resulting frame is a fresh, non-stale broadcast.
+    async fn pending_broadcast(
+        space: &Space,
+        content: &str,
+        title: &str,
+    ) -> Result<(
+        Change,
+        encrypted_spaces_changelog_core::changelog::ChangeResponse,
+    )> {
+        let mut insert_query = Query::new(
+            "broadcast_notes".to_string(),
+            QueryOperation::Insert(vec![
+                ("content".to_string(), QueryParam::Text(content.to_string())),
+                ("title".to_string(), QueryParam::Text(title.to_string())),
+            ]),
+        );
+        crate::crypto::encrypt_query_fields(&mut insert_query, space).await?;
+        let change = super::ChangeBuilder::new(&mut insert_query, Arc::new(space.clone()))
+            .build()
+            .await?
+            .unwrap();
+        let change_response = space.transport.submit_change(&change, vec![]).await?;
+        Ok((change, change_response))
+    }
+
+    /// Regression for C-5: a broadcast whose signature does not verify must
+    /// be rejected by `handle_broadcast` (returns `false`) so the listener
+    /// never forwards a fabricated frame to `subscribe_updates()` consumers,
+    /// and local changelog state must remain untouched.
+    #[tokio::test]
+    async fn handle_broadcast_rejects_forged_signature() -> Result<()> {
+        use crate::websocket_transport::BroadcastEvent;
+
+        let (_transport, space, _schema) = hash_backed_broadcast_space().await.unwrap();
+        let notes = space.table::<BroadcastNote>("broadcast_notes");
+        // Seed so the cache table exists and the client is in sync with the
+        // transport, leaving the next submitted change one ahead of the client.
+        notes
+            .insert(&BroadcastNote {
+                id: None,
+                content: "seed".to_string(),
+                title: "seed".to_string(),
+            })
+            .execute()
+            .await?;
+
+        let (mut change, change_response) =
+            pending_broadcast(&space, "forged body", "forged title").await?;
+
+        let change_id_before = space.with_state(|state| state.current_change_id);
+
+        // Tamper: strip the signature, simulating a malicious server pushing
+        // a fabricated frame.
+        change.entry.signature.clear();
+
+        let applied = space
+            .handle_broadcast(BroadcastEvent {
+                change,
+                change_response,
+            })
+            .await;
+
+        assert!(!applied, "forged broadcast must not be reported as applied");
+        assert_eq!(
+            space.with_state(|state| state.current_change_id),
+            change_id_before,
+            "forged broadcast must not advance local changelog state",
+        );
+
+        Ok(())
+    }
+
+    /// Companion to the forged-frame test: a legitimately signed broadcast is
+    /// applied and `handle_broadcast` reports `true`, so the listener forwards
+    /// it to subscribers.
+    #[tokio::test]
+    async fn handle_broadcast_applies_valid_frame() -> Result<()> {
+        use crate::websocket_transport::BroadcastEvent;
+
+        let (_transport, space, _schema) = hash_backed_broadcast_space().await.unwrap();
+        let notes = space.table::<BroadcastNote>("broadcast_notes");
+        notes
+            .insert(&BroadcastNote {
+                id: None,
+                content: "seed".to_string(),
+                title: "seed".to_string(),
+            })
+            .execute()
+            .await?;
+
+        let (change, change_response) =
+            pending_broadcast(&space, "valid body", "valid title").await?;
+
+        let change_id_before = space.with_state(|state| state.current_change_id);
+
+        let applied = space
+            .handle_broadcast(BroadcastEvent {
+                change,
+                change_response,
+            })
+            .await;
+
+        assert!(applied, "valid broadcast must be reported as applied");
+        assert_eq!(
+            space.with_state(|state| state.current_change_id),
+            change_id_before + 1,
+            "valid broadcast must advance local changelog state",
+        );
+
+        Ok(())
+    }
 }
 
 #[cfg(all(test, feature = "local-transport"))]
