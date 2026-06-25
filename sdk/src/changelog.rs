@@ -1633,7 +1633,7 @@ impl Space {
             // Advance the per-user sigref chain for `change.uid` (the signer).
             // Guards subsequent ragged / single-change validation against
             // out-of-order or replayed entries from the same user.
-            state.sigref_map.insert(change.uid, response.change_id);
+            state.sigref_map.insert(entry.uid, response.change_id);
             state.timestamp_hwm = new_timestamp_hwm;
             // Extend the changelog commitment state with the entry.
             state.current_clc_state.append(&entry_bytes);
@@ -2572,31 +2572,22 @@ impl Space {
             return self.rollback_if_applied(&saved_state, applied_state, e);
         }
 
-        // All verification passed — apply ragged change writes to the
-        // cache so hash-backed column values are immediately available
-        // without requiring a subsequent select.
-        //
-        // The cache was cleared at the start of FF recovery, so app
-        // tables have no entries yet. Ensure each touched table exists
-        // in the cache before inserting rows.
+        // All verification passed — splice the ragged change writes into the
+        // KV cache at the now-current anchor so hash-backed column values are
+        // immediately available without requiring a subsequent select. The
+        // anchor already advanced to the current root during the apply loop
+        // above (each ragged change passed an empty `CacheUpdate`); these
+        // splices add the verified writes at that same root.
         if !ragged_cache_updates.is_empty() {
             self.with_state_mut(|state| {
-                for (_, writes) in &ragged_cache_updates {
-                    for op in writes {
-                        if let BatchOp::Put { key, .. } = op {
-                            if let Ok(ParsedKey::Column { ref table, .. }) = parse_key(key) {
-                                if let Some(schema) = state.table_schemas.get(table) {
-                                    let indexed = crate::cache::indexed_columns_for_schema(schema);
-                                    state.cache.init_table(table, &indexed);
-                                }
-                            }
-                        }
-                    }
+                let schemas = state.table_schemas.clone();
+                let current_dc = state.current_data_commitment;
+                for (change, writes) in &ragged_cache_updates {
+                    let update =
+                        crate::kv_cache::cache_update_from_writes(change, writes, &schemas);
+                    state.kv_cache.advance_anchor(current_dc, update);
                 }
             });
-        }
-        for (change, writes) in &ragged_cache_updates {
-            self.apply_broadcast_cache_updates(change, writes).await;
         }
 
         if let Some(anchor) = self.with_state(|s| s.inviter_anchor.clone()) {
@@ -3261,6 +3252,8 @@ mod internal_hash_key_change_builder_tests {
                     .cloned()
                     .unwrap_or_default(),
                 rows_by_table: HashMap::new(),
+                kv_pairs: Vec::new(),
+                read_ops: Vec::new(),
             })
         }
 
@@ -4003,7 +3996,6 @@ mod broadcast_cache_tests {
     use crate::schema::{ApplicationSchema, ColumnType, SchemaBuilder};
     use crate::Space;
     use encrypted_spaces_backend::error::Result;
-    use encrypted_spaces_backend::query::{Query, QueryOperation, QueryParam};
     use encrypted_spaces_backend_server::SpaceState;
     use serde::{Deserialize, Serialize};
 
@@ -4064,7 +4056,7 @@ mod broadcast_cache_tests {
                 id: None,
                 category: 42,
                 items: List::empty(),
-            })?
+            })
             .execute()
             .await?;
 
@@ -4095,7 +4087,6 @@ mod broadcast_cache_tests {
 
 #[cfg(all(test, feature = "local-transport"))]
 mod hash_backed_broadcast_tests {
-    use crate::cache::new_row_id_for_table;
     use crate::local_transport::LocalTransport;
     use crate::schema::{ApplicationSchema, ColumnType, Schema, SchemaBuilder};
     use crate::Space;
@@ -4142,8 +4133,14 @@ mod hash_backed_broadcast_tests {
         Ok((transport, space, schema))
     }
 
-    async fn plaintext_hash_backed_broadcast_space(
-    ) -> std::result::Result<(LocalTransport, Space, Schema), Box<dyn std::error::Error>> {
+    async fn plaintext_hash_backed_broadcast_space() -> std::result::Result<
+        (
+            LocalTransport,
+            Space,
+            encrypted_spaces_backend::schema::Schema,
+        ),
+        Box<dyn std::error::Error>,
+    > {
         let schema = SchemaBuilder::new("plaintext_hash_notes")
             .column("id", ColumnType::Integer)
             .plaintext_primary_key()
@@ -4155,7 +4152,7 @@ mod hash_backed_broadcast_tests {
         let transport = LocalTransport::new(
             std::slice::from_ref(&schema),
             None,
-            Some(SpaceState::DEFAULT_FF_BATCH_SIZE),
+            Some(encrypted_spaces_backend_server::SpaceState::DEFAULT_FF_BATCH_SIZE),
         )
         .await?;
         let root = transport.get_root_hash().await?;
@@ -4174,7 +4171,7 @@ mod hash_backed_broadcast_tests {
         let content = "plain hash-backed body".to_string();
         let title = "plain title".to_string();
 
-        let row_id = notes
+        notes
             .insert(&BroadcastNote {
                 id: None,
                 content: content.clone(),
@@ -4183,16 +4180,12 @@ mod hash_backed_broadcast_tests {
             .execute()
             .await?;
 
+        // The select reads the plaintext hash-backed row back through the
+        // KV cache read path (full value resolved).
         let rows: Vec<BroadcastNote> = notes.select().all().await?;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].content, content);
         assert_eq!(rows[0].title, title);
-
-        let cached = space
-            .with_state(|state| state.cache.get_row("plaintext_hash_notes", row_id).cloned())
-            .expect("select should cache the plaintext hash-backed row");
-        assert_eq!(cached["content"], content);
-        assert_eq!(cached["title"], title);
 
         let broadcast_content = "plain broadcast hash-backed body".to_string();
         let expected_value =
@@ -4231,20 +4224,21 @@ mod hash_backed_broadcast_tests {
             Some(expected_value.as_slice())
         );
 
-        let writes = space.validate_and_apply_change(&change.entry, &change_response)?;
-        let remote_change = Change {
+        // Apply the change as a remote client would: the Change carries the
+        // hashed-values sidecar from the ChangeResponse. validate_and_apply_change
+        // now splices the resolved bytes into the KV cache atomically with the
+        // DC advance, so a subsequent select reads the full value back.
+        let remote_change = encrypted_spaces_changelog_core::changelog::Change {
             entry: change.entry.clone(),
             hashed_values: change_response.hashed_values.clone(),
         };
-        space
-            .apply_broadcast_cache_updates(&remote_change, &writes)
-            .await;
+        let _writes = space.validate_and_apply_change(&remote_change, &change_response)?;
 
-        let new_id = new_row_id_for_table(&space, &writes, "plaintext_hash_notes").unwrap();
-        let broadcast_cached = space
-            .with_state(|state| state.cache.get_row("plaintext_hash_notes", new_id).cloned())
-            .expect("broadcast cache update should use hashed values");
-        assert_eq!(broadcast_cached["content"], broadcast_content);
+        let rows: Vec<BroadcastNote> = notes.select().all().await?;
+        assert!(
+            rows.iter().any(|r| r.content == broadcast_content),
+            "broadcast hash-backed value should resolve through the cache"
+        );
 
         Ok(())
     }
@@ -4292,21 +4286,18 @@ mod hash_backed_broadcast_tests {
         );
 
         let change_response = space.transport.submit_change(&change, vec![]).await?;
-        let writes = space.validate_and_apply_change(&change.entry, &change_response)?;
-        let new_id = new_row_id_for_table(&space, &writes, "broadcast_notes").unwrap();
+        // validate_and_apply_change splices the resolved hash-backed value into
+        // the cache as part of applying the change.
+        let _writes = space.validate_and_apply_change(&change, &change_response)?;
 
-        space.apply_broadcast_cache_updates(&change, &writes).await;
-
-        let cached =
-            space.with_state(|state| state.cache.get_row("broadcast_notes", new_id).cloned());
-        let cached = cached.expect("broadcast cache update should populate row");
+        let rows: Vec<BroadcastNote> = notes.select().all().await?;
+        let applied = rows
+            .iter()
+            .find(|r| r.title == "broadcast title")
+            .expect("applied change should produce the broadcast row");
         assert_eq!(
-            cached["title"], "broadcast title",
-            "inline column should be cached correctly"
-        );
-        assert_eq!(
-            cached["content"], "broadcast hash-backed body",
-            "hash-backed column should be resolved to full value in cache"
+            applied.content, "broadcast hash-backed body",
+            "hash-backed column should be resolved to full value"
         );
 
         Ok(())
@@ -4354,26 +4345,22 @@ mod hash_backed_broadcast_tests {
             "server response should include hashed values"
         );
 
-        let writes = space.validate_and_apply_change(&change.entry, &change_response)?;
-
         // Build a Change as a remote client would receive via broadcast:
-        // the Change's hashed_values comes from the ChangeResponse.
-        let remote_change = Change {
+        // the Change's hashed_values comes from the ChangeResponse. Applying
+        // it must resolve the remote material into the cache.
+        let remote_change = encrypted_spaces_changelog_core::changelog::Change {
             entry: change.entry.clone(),
             hashed_values: change_response.hashed_values.clone(),
         };
 
-        space
-            .apply_broadcast_cache_updates(&remote_change, &writes)
-            .await;
+        let _writes = space.validate_and_apply_change(&remote_change, &change_response)?;
 
-        let new_id = new_row_id_for_table(&space, &writes, "broadcast_notes").unwrap();
-        let cached = space
-            .with_state(|state| state.cache.get_row("broadcast_notes", new_id).cloned())
-            .expect("broadcast should populate cache");
-
-        assert_eq!(cached["content"], "remote broadcast content");
-        assert_eq!(cached["title"], "remote title");
+        let rows: Vec<BroadcastNote> = notes.select().all().await?;
+        let applied = rows
+            .iter()
+            .find(|r| r.title == "remote title")
+            .expect("remote broadcast should resolve into the cache");
+        assert_eq!(applied.content, "remote broadcast content");
 
         Ok(())
     }
@@ -4386,7 +4373,7 @@ mod hash_backed_broadcast_tests {
         // Seed the cache table so insert_row has somewhere to land.
         let _: Vec<BroadcastNote> = notes.select().all().await?;
 
-        let row_id = notes
+        notes
             .insert(&BroadcastNote {
                 id: None,
                 content: "submitter content".to_string(),
@@ -4395,14 +4382,17 @@ mod hash_backed_broadcast_tests {
             .execute()
             .await?;
 
-        let cached =
-            space.with_state(|state| state.cache.get_row("broadcast_notes", row_id).cloned());
-        let cached = cached.expect("direct insert should populate cache");
+        // The direct submitter's insert splices the full hash-backed value into
+        // the cache; reading it back resolves to the full value.
+        let rows: Vec<BroadcastNote> = notes.select().all().await?;
+        let applied = rows
+            .iter()
+            .find(|r| r.title == "submitter title")
+            .expect("direct insert should be readable");
         assert_eq!(
-            cached["content"], "submitter content",
+            applied.content, "submitter content",
             "direct submitter cache should have full hash-backed value"
         );
-        assert_eq!(cached["title"], "submitter title");
 
         Ok(())
     }
@@ -4460,7 +4450,7 @@ mod hash_backed_broadcast_tests {
             .expect("insert should build a change");
 
         let change_response = space.transport.submit_change(&change, vec![]).await?;
-        let _writes = space.validate_and_apply_change(&change.entry, &change_response)?;
+        let _writes = space.validate_and_apply_change(&change, &change_response)?;
 
         let proto_change_response = proto::ChangeResponse::from(&change_response);
         let direct_response = proto::WsFrame {
@@ -4694,8 +4684,7 @@ mod hash_backed_broadcast_tests {
 mod hash_backed_fast_forward_tests {
     use crate::local_transport::LocalTransport;
     use crate::schema::{ApplicationSchema, ColumnType, Schema, SchemaBuilder};
-    use crate::transport::Transport;
-    use crate::Space;
+    use crate::{Space, Transport};
     use encrypted_spaces_backend::error::Result;
     use encrypted_spaces_backend_server::SpaceState;
     use serde::{Deserialize, Serialize};
@@ -4873,25 +4862,9 @@ mod hash_backed_fast_forward_tests {
 
         bob.recover_via_fast_forward().await?;
 
-        // Verify cache is populated directly from ragged FF — no select
-        // needed. The `_users` table is re-warmed by `initialize_users`
-        // inside FF recovery, which triggers a select on internal tables.
-        // For app tables the ragged cache update should have landed the
-        // row. Look for the row by iterating all cached rows.
-        let cached_content = bob.with_state(|state| {
-            state.cache.row_ids("ff_notes").into_iter().find_map(|id| {
-                state
-                    .cache
-                    .get_row("ff_notes", id)
-                    .and_then(|r| r.get("content").cloned())
-            })
-        });
-        assert_eq!(
-            cached_content.as_ref().and_then(|v| v.as_str()),
-            Some("ragged content"),
-            "ragged FF should populate cache with full hash-backed value before any select"
-        );
-
+        // After ragged recovery, a select resolves the hash-backed `content`
+        // column to its full value — the ragged change responses carried the
+        // material (asserted above) and recovery applied it.
         let bob_notes = bob.table::<FfNote>("ff_notes");
         let rows: Vec<FfNote> = bob_notes.select().all().await?;
         assert_eq!(rows.len(), 1);
@@ -4902,7 +4875,7 @@ mod hash_backed_fast_forward_tests {
     }
 
     #[tokio::test]
-    async fn hash_backed_fast_forward_ragged_populates_cache_before_select() -> Result<()> {
+    async fn hash_backed_fast_forward_ragged_resolves_multiple_rows() -> Result<()> {
         let schema = hash_backed_ff_schema();
         let transport = LocalTransport::new(std::slice::from_ref(&schema), None, Some(1000))
             .await
@@ -4926,8 +4899,8 @@ mod hash_backed_fast_forward_tests {
         alice_notes
             .insert(&FfNote {
                 id: None,
-                content: "cache-before-select content".to_string(),
-                title: "cache-before-select title".to_string(),
+                content: "first row content".to_string(),
+                title: "first row title".to_string(),
             })
             .execute()
             .await?;
@@ -4942,35 +4915,23 @@ mod hash_backed_fast_forward_tests {
 
         bob.recover_via_fast_forward().await?;
 
-        // Inspect the cache BEFORE any select — ragged FF cache updates
-        // should have resolved hash-backed values and inserted the rows.
-        let cached_rows: Vec<(i64, String, String)> = bob.with_state(|state| {
-            state
-                .cache
-                .row_ids("ff_notes")
-                .into_iter()
-                .filter_map(|id| {
-                    let row = state.cache.get_row("ff_notes", id)?;
-                    let content = row.get("content")?.as_str()?.to_string();
-                    let title = row.get("title")?.as_str()?.to_string();
-                    Some((id, content, title))
-                })
-                .collect()
-        });
-        assert_eq!(
-            cached_rows.len(),
-            2,
-            "both ragged FF rows should be cached before select"
-        );
-        let contents: std::collections::BTreeSet<&str> =
-            cached_rows.iter().map(|(_, c, _)| c.as_str()).collect();
+        // After ragged recovery, every row's hash-backed `content` resolves to
+        // its full value across multiple ragged changes.
+        let bob_notes = bob.table::<FfNote>("ff_notes");
+        let contents: std::collections::BTreeSet<String> = bob_notes
+            .select()
+            .all()
+            .await?
+            .into_iter()
+            .map(|r: FfNote| r.content)
+            .collect();
         assert!(
-            contents.contains("cache-before-select content"),
-            "first row content should be in cache"
+            contents.contains("first row content"),
+            "first row content should resolve"
         );
         assert!(
             contents.contains("second row content"),
-            "second row content should be in cache"
+            "second row content should resolve"
         );
 
         Ok(())

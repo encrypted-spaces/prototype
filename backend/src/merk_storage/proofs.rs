@@ -746,9 +746,38 @@ fn verify_query_proof_inner(
     Ok(VerifiedRows {
         main_rows,
         rows_by_table,
-        kv_pairs: results,
+        kv_pairs: resolve_hashed_kv_pairs(&results, hash_context)?,
         read_ops,
     })
+}
+
+/// Resolve hash-backed column values in raw proof entries to their full
+/// bytes via response material, so the `kv_pairs` a client splices into its
+/// cache hold the same representation the decoded rows do (the cache has no
+/// sidecar to resolve digests at read time). Without `hash_context` (no
+/// material) the entries pass through unchanged.
+fn resolve_hashed_kv_pairs(
+    entries: &[(Vec<u8>, Vec<u8>)],
+    hash_context: Option<(
+        &std::collections::HashMap<String, crate::schema::Schema>,
+        &HashedValues,
+    )>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let Some((schemas, material)) = hash_context else {
+        return Ok(entries.to_vec());
+    };
+    entries
+        .iter()
+        .map(|(key, value)| {
+            if let Ok(ParsedKey::Column { table, column, .. }) = parse_key(key) {
+                if is_hash_backed_column(schemas, &table, &column) {
+                    let resolved = resolve_hash_backed_bytes(&table, &column, value, material)?;
+                    return Ok((key.clone(), resolved));
+                }
+            }
+            Ok((key.clone(), value.clone()))
+        })
+        .collect()
 }
 
 fn group_entries_for_verifier(
@@ -1363,6 +1392,7 @@ fn verify_tracer_select_proof(
 
     let mut kv_pairs = main_all_entries;
     kv_pairs.extend(join_all_entries);
+    let kv_pairs = resolve_hashed_kv_pairs(&kv_pairs, hash_context)?;
     let mut read_ops: Vec<ReadOp> = all_read_results[0].iter().map(|pr| pr.op.clone()).collect();
     read_ops.extend(all_read_results[1].iter().map(|pr| pr.op.clone()));
 

@@ -284,13 +284,12 @@ impl Space {
             .get_table_schema(USERS_TABLE_NAME)
             .ok_or_else(|| SdkError::InsertError("users schema not registered".into()))?;
         let new_user_id = if let Some(writes) = &completed.sequential_writes {
-            crate::kv_cache::new_row_id_for_table(writes, USERS_TABLE_NAME, &users_schema).ok_or_else(
-                || {
+            crate::kv_cache::new_row_id_for_table(writes, USERS_TABLE_NAME, &users_schema)
+                .ok_or_else(|| {
                     SdkError::InsertError(
                         "InviteUser proof did not write any new row to _users".into(),
                     )
-                },
-            )?
+                })?
         } else if let Some(id) = completed
             .ff_inserted_ids
             .get(&completed.change.entry.signature)
@@ -303,8 +302,7 @@ impl Space {
             // CLC chain. Same unanchored-id limitation as
             // `InsertBuilder::execute_as` (not a false success; entry is proven).
             // Tracked in https://github.com/encrypted-spaces/prototype/issues/232.
-            let writes =
-                self.validate_and_apply_change(&completed.change, &completed.response)?;
+            let writes = self.validate_and_apply_change(&completed.change, &completed.response)?;
             crate::kv_cache::new_row_id_for_table(&writes, USERS_TABLE_NAME, &users_schema)
                 .ok_or_else(|| {
                     SdkError::InsertError(
@@ -442,8 +440,7 @@ impl Space {
         // 8. Apply the change locally.  The entry keeps the client's original
         //    valid_to guess; the proof carries the server-assigned value (which will usually be equal).
         //    Issue #212: fail closed unless the exact RemoveUser entry is proven.
-        let completed = self
-            .complete_submitted(delete_change, change_response)
+        self.complete_submitted(delete_change, change_response)
             .await?;
 
         // 10. Post-apply delivery-slot recovery if the builder flagged it.

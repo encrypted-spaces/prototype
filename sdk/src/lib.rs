@@ -2,10 +2,10 @@ pub mod action;
 pub mod authentication;
 mod broadcast;
 pub(crate) mod changelog;
-pub(crate) mod kv_cache;
 mod crypto;
 pub mod file;
 mod key_manager;
+pub(crate) mod kv_cache;
 pub mod list;
 #[cfg(feature = "local-transport")]
 pub mod local_transport;
@@ -34,7 +34,7 @@ pub use crate::textarea::TextArea;
 #[cfg(not(target_arch = "wasm32"))]
 pub use crate::tls_trust::load_trust_cert;
 pub use crate::transport::EphemeralEvent;
-use crate::transport::Transport;
+pub use crate::transport::Transport;
 pub(crate) use crate::users::UserWithSecrets;
 pub use crate::users::{SpaceInvite, UserRecord, UserStatus};
 pub use crate::websocket_transport::{BroadcastEvent, WebSocketTransport};
@@ -272,14 +272,11 @@ impl Space {
         let users_schema = space
             .get_table_schema(users::USERS_TABLE_NAME)
             .ok_or_else(|| SdkError::InsertError("users schema not registered".to_string()))?;
-        let new_user_id = crate::kv_cache::new_row_id_for_table(
-            &writes,
-            users::USERS_TABLE_NAME,
-            &users_schema,
-        )
-        .ok_or_else(|| {
-            SdkError::InsertError("missing new user id in change response".to_string())
-        })?;
+        let new_user_id =
+            crate::kv_cache::new_row_id_for_table(&writes, users::USERS_TABLE_NAME, &users_schema)
+                .ok_or_else(|| {
+                    SdkError::InsertError("missing new user id in change response".to_string())
+                })?;
         assert!(Some(new_user_id) == user.id);
 
         crate::broadcast::start_listener(&space);
@@ -2470,26 +2467,18 @@ mod tests {
             "RefreshKeys response should carry hashed values for key columns"
         );
 
-        // Simulate broadcast reception: apply the change using the
-        // response's hashed_values, then update the cache — the same
-        // steps handle_broadcast performs.
-        let writes = alice.validate_and_apply_change(bob_change, bob_response)?;
-        let broadcast_change = Change {
+        // Simulate broadcast reception: apply the change as a remote client,
+        // with the Change carrying the response's hashed_values. Applying it
+        // splices the resolved key material into the KV cache.
+        let broadcast_change = encrypted_spaces_changelog_core::changelog::Change {
             entry: bob_change.clone(),
             hashed_values: bob_response.hashed_values.clone(),
         };
-        alice
-            .apply_broadcast_cache_updates(&broadcast_change, &writes)
-            .await;
+        alice.validate_and_apply_change(&broadcast_change, bob_response)?;
 
         // Verify the broadcast receiver's cache now contains the full
         // decoded auth_key (a base64 string), not a 32-byte hash.
-        let cached_auth_key = alice.with_state(|state| {
-            state
-                .cache
-                .get_row("_users", bob_uid as i64)
-                .and_then(|r| r.get("auth_key").cloned())
-        });
+        let cached_auth_key = cached_users_column(&alice, bob_uid as i64, "auth_key");
         assert!(
             cached_auth_key.is_some(),
             "broadcast receiver should have Bob's auth_key cached"
@@ -2510,12 +2499,7 @@ mod tests {
         let invite = alice.invite_user().await?;
         let new_uid = invite.user.id.unwrap();
 
-        let cached_auth_key = alice.with_state(|state| {
-            state
-                .cache
-                .get_row("_users", new_uid)
-                .and_then(|r| r.get("auth_key").cloned())
-        });
+        let cached_auth_key = cached_users_column(&alice, new_uid, "auth_key");
         assert!(
             cached_auth_key.is_some(),
             "submitter should cache invited user's auth_key"
@@ -2535,12 +2519,7 @@ mod tests {
 
         space.rotate_user_keys().await?;
 
-        let cached_auth_key = space.with_state(|state| {
-            state
-                .cache
-                .get_row("_users", uid as i64)
-                .and_then(|r| r.get("auth_key").cloned())
-        });
+        let cached_auth_key = cached_users_column(&space, uid as i64, "auth_key");
         assert!(
             cached_auth_key.is_some(),
             "submitter should cache own auth_key after key rotation"

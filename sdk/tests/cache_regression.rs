@@ -88,7 +88,7 @@ async fn id_reread_after_insert_hits() -> Result<(), Box<dyn std::error::Error>>
             price: 2.5,
             name: "fresh".into(),
             secret: Some("s".into()),
-        })?
+        })
         .execute()
         .await?;
     let before = snapshot(&transport);
@@ -450,7 +450,7 @@ async fn insert_then_full_table_reread() -> Result<(), Box<dyn std::error::Error
             "price": 99.0,
             "name": "new",
             "secret": "s",
-        }))?
+        }))
         .execute()
         .await?;
 
@@ -619,7 +619,7 @@ async fn remote_insert_ff_recovery() -> Result<(), Box<dyn std::error::Error>> {
             "price": 999.0,
             "name": "alice_new",
             "secret": "alice_secret",
-        }))?
+        }))
         .execute()
         .await?;
 
@@ -647,7 +647,7 @@ async fn cache_cleared_on_ff() -> Result<(), Box<dyn std::error::Error>> {
             "price": 888.0,
             "name": "alice_first",
             "secret": "s1",
-        }))?
+        }))
         .execute()
         .await?;
     assert_eq!(bob_items.select().all().await?.len(), 51);
@@ -659,7 +659,7 @@ async fn cache_cleared_on_ff() -> Result<(), Box<dyn std::error::Error>> {
             "price": 777.0,
             "name": "alice_second",
             "secret": "s2",
-        }))?
+        }))
         .execute()
         .await?;
 
@@ -733,7 +733,7 @@ async fn real_index_integer_normalization() -> Result<(), Box<dyn std::error::Er
             "price": 10.0,
             "name": "ten_price",
             "secret": "secret_ten",
-        }))?
+        }))
         .execute()
         .await?;
 
@@ -782,7 +782,7 @@ async fn null_value_handling() -> Result<(), Box<dyn std::error::Error>> {
             "price": 1.0,
             "name": Value::Null,
             "secret": Value::Null,
-        }))?
+        }))
         .execute()
         .await?;
 
@@ -847,7 +847,7 @@ async fn full_table_prime_insert_then_predicate_hits() -> Result<(), Box<dyn std
             "price": 42.0,
             "name": "inserted_match",
             "secret": "s_inserted",
-        }))?
+        }))
         .execute()
         .await?;
 

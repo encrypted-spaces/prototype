@@ -118,11 +118,13 @@ impl Space {
             SdkError::InvalidQuery(format!("table '{table}' is not registered locally"))
         })?;
         if let Some(writes) = &completed.sequential_writes {
-            return crate::kv_cache::new_row_id_for_table(writes, &table, &schema).ok_or_else(|| {
-                SdkError::InsertError(format!(
-                    "action '{action_name}' produced no new row id on table '{table}'"
-                ))
-            });
+            return crate::kv_cache::new_row_id_for_table(writes, &table, &schema).ok_or_else(
+                || {
+                    SdkError::InsertError(format!(
+                        "action '{action_name}' produced no new row id on table '{table}'"
+                    ))
+                },
+            );
         }
         if let Some(row_id) = completed
             .ff_inserted_ids
@@ -136,8 +138,7 @@ impl Space {
         // verified CLC chain). Same unanchored-row-id limitation as
         // `InsertBuilder::execute_as` — not a false success; the entry is proven.
         // Tracked in https://github.com/encrypted-spaces/prototype/issues/232.
-        let writes =
-            self.validate_and_apply_change(&completed.change, &completed.response)?;
+        let writes = self.validate_and_apply_change(&completed.change, &completed.response)?;
         crate::kv_cache::new_row_id_for_table(&writes, &table, &schema).ok_or_else(|| {
             SdkError::InsertError(format!(
                 "action '{action_name}' produced no new row id on table '{table}'"

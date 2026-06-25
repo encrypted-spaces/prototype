@@ -4,7 +4,9 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use encrypted_spaces_backend::error::{Result as SdkResult, SdkError};
 use encrypted_spaces_backend::merk_storage::stored_value;
-use encrypted_spaces_crypto::encryption::{ciphertext_key_id, decrypt_field, EncryptionKey, FieldType};
+use encrypted_spaces_crypto::encryption::{
+    ciphertext_key_id, decrypt_field, EncryptionKey, FieldType,
+};
 use encrypted_spaces_key_manager::SimpleKeyId;
 
 use crate::kv_cache::SyncDecryptResolver;

@@ -505,9 +505,7 @@ pub(crate) fn row_matches_predicate(row: &serde_json::Value, pred: &Predicate) -
 fn json_eq_param(val: &serde_json::Value, param: &QueryParam) -> bool {
     match param {
         QueryParam::Null => val.is_null(),
-        QueryParam::Integer(i) => {
-            val.as_i64() == Some(*i) || val.as_f64() == Some(*i as f64)
-        }
+        QueryParam::Integer(i) => val.as_i64() == Some(*i) || val.as_f64() == Some(*i as f64),
         QueryParam::Real(f) => val.as_f64() == Some(*f),
         QueryParam::Text(s) => val.as_str() == Some(s.as_str()),
         QueryParam::Boolean(b) => {
@@ -804,7 +802,6 @@ impl<T, W> SelectBuilder<T, W> {
         // anchor.
         self.space
             .with_state_mut(|state| state.kv_cache.apply_select(commitment, &verified));
-
 
         let mut main_rows = verified.main_rows;
         decrypt_table_rows(&mut main_rows, &self.query.table, &schemas, &self.space).await?;
@@ -1244,12 +1241,15 @@ impl<T> InsertBuilder<T> {
                 .ok_or_else(|| SdkError::DatabaseError("No rows matched for insert".to_string()))?
         };
         let completed = self.space.submit_and_complete(change).await?;
-        let schema = self.space.get_table_schema(&self.query.table).ok_or_else(|| {
-            SdkError::InvalidQuery(format!(
-                "table '{}' is not registered locally",
-                self.query.table
-            ))
-        })?;
+        let schema = self
+            .space
+            .get_table_schema(&self.query.table)
+            .ok_or_else(|| {
+                SdkError::InvalidQuery(format!(
+                    "table '{}' is not registered locally",
+                    self.query.table
+                ))
+            })?;
 
         // Sequential append: derive the new row id from the verified
         // sequential writes (and warm the cache).
@@ -1400,7 +1400,7 @@ mod tests {
         let (_transport, space, _schema) = hash_backed_select_space().await?;
         let notes = space.table::<HashBackedSelectNote>("hash_select_notes");
 
-        let row_id = notes
+        let _row_id = notes
             .insert(&HashBackedSelectNote {
                 id: None,
                 content: "large hash-backed body".to_string(),
@@ -1499,15 +1499,6 @@ mod tests {
         Ok(())
     }
 
-    /// True iff `space.kv_cache` can answer a full-table SELECT on `table`
-    /// without going to the server — coverage spans the whole table row
-    /// range. Behavioral replacement for the old `is_table_complete`.
-    fn cache_covers_full_table(space: &Space, table: &str) -> bool {
-        let q = Query::new(table.to_string(), QueryOperation::Select(Vec::new()));
-        let schemas = space.with_state(|s| s.table_schemas.clone());
-        space.with_state(|s| matches!(s.kv_cache.try_select(&q, &schemas), Ok(CacheResult::Hit(_))))
-    }
-
     #[tokio::test]
     async fn test_select_validates_original_predicate_before_server_fetch(
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -1557,7 +1548,7 @@ mod tests {
             .insert(&SecretNote {
                 id: None,
                 secret: "server plaintext".to_string(),
-            })?
+            })
             .execute()
             .await?;
 
@@ -2173,7 +2164,7 @@ mod tests {
             state.current_clc_state = clc;
             state.current_change_entry = entry;
             state.sigref_map = sigref_map;
-            state.cache.clear_all();
+            state.kv_cache.reanchor(dc);
         });
 
         // Without auto-recovery, this insert would fail with
@@ -2590,7 +2581,7 @@ mod tests {
             })
             .execute()
             .await?;
-        let bob_id = authors
+        let _bob_id = authors
             .insert(&Author {
                 id: None,
                 name: "Bob".into(),

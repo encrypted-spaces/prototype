@@ -2506,6 +2506,7 @@ dependencies = [
  "libcrux-ml-kem",
  "log",
  "native-tls",
+ "proptest",
  "prost 0.14.4",
  "rand 0.9.4",
  "serde",

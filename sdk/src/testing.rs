@@ -30,8 +30,6 @@ use encrypted_spaces_key_manager::{CollectingOperationBuilder, KeyManager};
 #[cfg(not(target_arch = "wasm32"))]
 use encrypted_spaces_retention::simple_line2::SimpleLine2SpaceKey;
 
-#[cfg(test)]
-use crate::cache::Cache;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{state, AuthContext, Space, SpaceId, Transport, UserWithSecrets};
 use crate::{ApplicationSchema, DataCommitment, Schema};
@@ -138,46 +136,6 @@ impl Space {
     }
 }
 
-/// Cross-module test accessors on [`Cache`].
-///
-/// Sibling modules' `mod tests` blocks (e.g. `list`, `changelog`) need
-/// to peek at the cache from outside `cache::tests`, and helpers
-/// defined inside `cache::tests` aren't visible to them.  Keeping these
-/// methods here — rather than on the production `impl Cache` under
-/// `#[cfg(test)]` — concentrates all test-only surface in this module.
-///
-/// Each method is gated to match the union of its callers' cfgs (not
-/// the looser module-level `cfg(feature = "testing")`), because
-/// leaving them visible under bare `feature = "testing"` makes them
-/// dead code (`Cache` is `pub(crate)`, so downstream
-/// `feature = "testing"` consumers can't reach them).
-#[cfg(test)]
-impl Cache {
-    /// Check if a single row exists in cache by id.
-    ///
-    /// Callers: `cache::tests` (`cfg(test)`),
-    /// `list::tests` and `changelog::broadcast_cache_tests`
-    /// (`cfg(all(test, feature = "local-transport"))`).
-    pub fn get_row(&self, table: &str, id: i64) -> Option<&serde_json::Value> {
-        self.tables.get(table)?.rows.get(&id)
-    }
-}
-
-/// Return all cached row IDs for a table.
-///
-/// Only called from `list::tests` and
-/// `changelog::broadcast_cache_tests`, both gated on
-/// `cfg(all(test, feature = "local-transport"))`.
-#[cfg(all(test, feature = "local-transport"))]
-impl Cache {
-    pub fn row_ids(&self, table: &str) -> std::collections::HashSet<i64> {
-        self.tables
-            .get(table)
-            .map(|t| t.rows.keys().copied().collect())
-            .unwrap_or_default()
-    }
-}
-
 /// Test-only changelog/state accessors on [`Space`].
 ///
 /// Used by the ffproof integration tests / benches and by in-crate
@@ -221,17 +179,43 @@ impl Space {
     /// `new_without_schema_init` with a transport that doesn't share the
     /// real server state.
     pub fn seed_user_cache(&self, users: &[(i64, String)]) {
+        use encrypted_spaces_backend::internal_schemas::USERS_TABLE_NAME;
+        use encrypted_spaces_changelog_core::prefix_successor;
+        use encrypted_spaces_storage_encoding::{keys, stored_value};
+
         self.register_table_schema(users_schema());
         self.register_table_schema(key_history_schema());
         self.with_state_mut(|state| {
-            state.cache.init_table("_users", &["id".to_string()]);
+            // `_key_history` is empty but authoritatively known: extend
+            // coverage over the whole table so id reads of missing entries
+            // resolve as authenticated absences.
+            let kh_start = keys::row_prefix(KEY_HISTORY_TABLE_NAME);
+            let kh_end = prefix_successor(&kh_start).expect("row prefix has a successor");
             state
-                .cache
-                .populate_full(KEY_HISTORY_TABLE_NAME, vec![], &[]);
+                .kv_cache
+                .splice(std::iter::empty(), [(kh_start, kh_end)]);
+
+            // Per seeded user: extend coverage over its row range and put
+            // point entries for `auth_key` and `status` (status defaults to
+            // 1 — "active" — matching the prior stub-row behavior).
+            let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(users.len() * 2);
+            let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(users.len());
             for (uid, auth_key_b64) in users {
-                let row = serde_json::json!({ "id": uid, "auth_key": auth_key_b64, "status": 1 });
-                state.cache.insert_row("_users", row);
+                let row_key = keys::row_key(USERS_TABLE_NAME, *uid);
+                let row_end = prefix_successor(&row_key).expect("row key always has a successor");
+                ranges.push((row_key, row_end));
+                pairs.push((
+                    keys::column_key(USERS_TABLE_NAME, *uid, "auth_key"),
+                    stored_value::value_to_bytes(&serde_json::json!(auth_key_b64))
+                        .expect("serializing String cannot fail"),
+                ));
+                pairs.push((
+                    keys::column_key(USERS_TABLE_NAME, *uid, "status"),
+                    stored_value::value_to_bytes(&serde_json::json!(1))
+                        .expect("serializing 1 cannot fail"),
+                ));
             }
+            state.kv_cache.splice(pairs, ranges);
         });
     }
 }

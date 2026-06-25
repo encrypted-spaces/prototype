@@ -92,9 +92,14 @@ impl Transport for CountingTransport {
         self.inner.fast_forward(change_id).await
     }
 
-    async fn select(&self, query: Query, commitment: &[u8; 32]) -> Result<VerifiedRows> {
+    async fn select(
+        &self,
+        query: Query,
+        commitment: &[u8; 32],
+        schemas: &std::collections::HashMap<String, Schema>,
+    ) -> Result<VerifiedRows> {
         self.select_calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.select(query, commitment).await
+        self.inner.select(query, commitment, schemas).await
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -190,7 +195,7 @@ pub async fn setup_space(
             "name": format!("item_{i}"),
             "secret": format!("secret_{i}"),
         });
-        items.insert(&row)?.execute().await?;
+        items.insert(&row).execute().await?;
     }
 
     let tags = space.table::<serde_json::Value>("tags");
@@ -202,7 +207,7 @@ pub async fn setup_space(
                 "item_id": i as i64,
                 "label": format!("tag_{i}_{t}"),
             });
-            tags.insert(&row)?.execute().await?;
+            tags.insert(&row).execute().await?;
         }
     }
 

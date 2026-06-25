@@ -12,58 +12,36 @@ use super::CacheUpdate;
 /// Convert a verified write batch into a [`CacheUpdate`] ready for
 /// [`super::KvCache::advance_anchor`].
 ///
-/// `PutHash` references the sidecar in `change.hashed_values`; entries the
-/// sidecar can't resolve are skipped with a warning (the cache will refetch
-/// on the next read since coverage wasn't extended for those keys).
+/// A hash-backed column (`Text`/`Blob`) stores a 32-byte digest in its
+/// `BatchOp::Put`; the actual bytes live in `change.hashed_values`. We
+/// resolve those to the full value before splicing so the cache holds the
+/// same representation a SELECT proof yields and the decrypt path reads it
+/// back identically. A hash-backed write whose digest is absent from the
+/// sidecar is skipped, and its row is marked tainted so it does not get a
+/// coverage extension (an id-read must not return a row with a hole).
 ///
 /// When `writes` cover *every* non-id column of a row's schema (i.e. a
-/// full insert or a complete replacement update), the row's byte range
-/// [`row_key, prefix_successor)` is added to `coverage_extensions`. After
-/// the splice, a subsequent id-read of that row hits the cache without
-/// needing a server round-trip — matches Trevor's `full_row_coverage`.
-/// Same shape for deletes: a delete that names every non-id column of a
-/// row extends coverage so the absence is authenticated.
+/// full insert or a complete replacement update) and no column was
+/// tainted, the row's byte range `[row_key, prefix_successor)` is added to
+/// `coverage_extensions` so a later id-read hits the cache. Same shape for
+/// deletes: a delete naming every non-id column authenticates the absence.
 pub fn cache_update_from_writes(
     change: &Change,
     writes: &[BatchOp],
     schemas: &HashMap<String, Schema>,
 ) -> CacheUpdate {
     let mut update = CacheUpdate::new();
-    // Track which (table, row_id) pairs had at least one PutHash whose
-    // sidecar value couldn't be resolved. We splice everything we *could*
-    // resolve, but those rows must NOT get a coverage extension — the
-    // row's cache state is incomplete, so claiming full coverage would
-    // make a subsequent id-read return the row with missing columns.
     let mut tainted_rows: BTreeSet<(String, i64)> = BTreeSet::new();
     for op in writes {
         match op {
-            BatchOp::Put { key, value } => update.put(key.clone(), value.clone()),
-            BatchOp::PutHash { key, value_hash } => {
-                use encrypted_spaces_changelog_core::changelog::ValueOrHash;
-                if let Some(bytes) = change.hashed_values.get(value_hash) {
-                    if ValueOrHash::from_value(bytes).value_hash() != *value_hash {
-                        log::warn!(
-                            "cache_update_from_writes: PutHash for {} has mismatched hash; \
-                             key not spliced and the row will not be coverage-extended",
-                            hex::encode(key)
-                        );
-                        if let Ok(ParsedKey::Column { table, row_id, .. }) = parse_key(key) {
-                            tainted_rows.insert((table, row_id));
-                        }
-                    } else {
-                        update.put(key.clone(), bytes.clone());
-                    }
-                } else {
-                    log::warn!(
-                        "cache_update_from_writes: PutHash for {} missing from sidecar; \
-                         key not spliced and the row will not be coverage-extended",
-                        hex::encode(key)
-                    );
+            BatchOp::Put { key, value } => match resolve_put_value(key, value, schemas, change) {
+                Some(bytes) => update.put(key.clone(), bytes),
+                None => {
                     if let Ok(ParsedKey::Column { table, row_id, .. }) = parse_key(key) {
                         tainted_rows.insert((table, row_id));
                     }
                 }
-            }
+            },
             BatchOp::Delete { key } => update.delete(key.clone()),
         }
     }
@@ -76,13 +54,46 @@ pub fn cache_update_from_writes(
     update
 }
 
+/// Resolve a `Put`'s stored bytes to the value the cache should hold.
+///
+/// For a hash-backed column the stored bytes are a 32-byte digest that
+/// indexes `change.hashed_values`; returns `Some(full_value)` when the
+/// sidecar can resolve it, or `None` (skip + taint) when it can't. For
+/// every other column the stored bytes are the value itself.
+fn resolve_put_value(
+    key: &[u8],
+    value: &[u8],
+    schemas: &HashMap<String, Schema>,
+    change: &Change,
+) -> Option<Vec<u8>> {
+    if let Ok(ParsedKey::Column { table, column, .. }) = parse_key(key) {
+        if let Some(col) = schemas
+            .get(&table)
+            .and_then(|s| s.columns.iter().find(|c| c.name == column))
+        {
+            if col.column_type.is_hash_backed() {
+                let hash: [u8; 32] = value.try_into().ok()?;
+                return match change.hashed_values.get(&hash) {
+                    Some(bytes) => Some(bytes.clone()),
+                    None => {
+                        log::warn!(
+                            "cache_update_from_writes: hash-backed {table}.{column} digest \
+                             missing from sidecar; row not spliced or coverage-extended"
+                        );
+                        None
+                    }
+                };
+            }
+        }
+    }
+    Some(value.to_vec())
+}
+
 /// Row byte ranges produced by writes that cover every non-id column of a
 /// row's schema. `deletes = true` runs the same test against Delete ops so
 /// a full-row delete extends coverage (the row is now an authenticated
-/// absence). Rows in `tainted` (one of their PutHash values was not
-/// resolvable from the sidecar) are skipped so we never claim coverage
-/// over a row whose cache state is incomplete. Ports Trevor's
-/// `full_row_coverage` helper with the taint guard.
+/// absence). Rows in `tainted` (a hash-backed value couldn't be resolved)
+/// are skipped so we never claim coverage over an incomplete row.
 fn full_row_coverage(
     writes: &[BatchOp],
     schemas: &HashMap<String, Schema>,
@@ -93,7 +104,7 @@ fn full_row_coverage(
     let mut per_row: BTreeMap<(String, i64), BTreeSet<String>> = BTreeMap::new();
     for op in writes {
         let key = match (op, deletes) {
-            (BatchOp::Put { key, .. }, false) | (BatchOp::PutHash { key, .. }, false) => key,
+            (BatchOp::Put { key, .. }, false) => key,
             (BatchOp::Delete { key }, true) => key,
             _ => continue,
         };
@@ -147,7 +158,7 @@ pub fn new_row_id_for_table(writes: &[BatchOp], table: &str, schema: &Schema) ->
     let mut per_row: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
     for op in writes {
         let key = match op {
-            BatchOp::Put { key, .. } | BatchOp::PutHash { key, .. } => key,
+            BatchOp::Put { key, .. } => key,
             _ => continue,
         };
         if let Ok(ParsedKey::Column {
@@ -177,18 +188,30 @@ mod tests {
         ChangelogEntry, HashedValues, LogMessage, OpType,
     };
 
-    fn schema(name: &str, cols: &[&str]) -> Schema {
+    // `small` is plaintext-inline (Integer); `large` is hash-backed (Text).
+    fn schema_with_hashed() -> Schema {
         Schema {
-            name: name.to_string(),
-            columns: cols
-                .iter()
-                .map(|c| ColumnDefinition {
-                    name: (*c).to_string(),
+            name: "t".to_string(),
+            columns: vec![
+                ColumnDefinition {
+                    name: "id".to_string(),
                     column_type: ColumnType::Integer,
                     plaintext: true,
                     indexed: false,
-                })
-                .collect(),
+                },
+                ColumnDefinition {
+                    name: "small".to_string(),
+                    column_type: ColumnType::Integer,
+                    plaintext: true,
+                    indexed: false,
+                },
+                ColumnDefinition {
+                    name: "large".to_string(),
+                    column_type: ColumnType::Text,
+                    plaintext: true,
+                    indexed: false,
+                },
+            ],
             auto_increment: true,
         }
     }
@@ -213,61 +236,61 @@ mod tests {
     }
 
     #[test]
-    fn tainted_row_is_excluded_from_coverage_extension() {
-        // A row with both a Put AND a PutHash. The PutHash's sidecar entry
-        // is missing, so the row's `large` column is never spliced. The
-        // coverage extension MUST be suppressed for that row — otherwise an
-        // id-read would hit and return the row missing `large`.
+    fn resolved_hash_backed_full_row_yields_coverage_extension() {
+        // Both columns are written and the hash-backed `large` digest
+        // resolves from the sidecar, so the row is full-covered and the
+        // spliced value is the resolved bytes (not the 32-byte digest).
         let mut schemas = HashMap::new();
-        schemas.insert("t".to_string(), schema("t", &["id", "small", "large"]));
-
-        let writes = vec![
-            BatchOp::Put {
-                key: keys::column_key("t", 7, "small"),
-                value: vec![1, 2, 3],
-            },
-            BatchOp::PutHash {
-                key: keys::column_key("t", 7, "large"),
-                value_hash: [0xAB; 32],
-            },
-        ];
-        // Empty sidecar → PutHash unresolved.
-        let change = change_with_sidecar(HashedValues::new());
-
-        let update = cache_update_from_writes(&change, &writes, &schemas);
-
-        assert_eq!(update.writes.len(), 1, "only the Put should be spliced");
-        assert!(
-            update.coverage_extensions.is_empty(),
-            "tainted row must not receive a coverage extension"
-        );
-    }
-
-    #[test]
-    fn resolved_puthash_still_yields_coverage_extension() {
-        // Same row shape but the sidecar has the value. Both writes splice,
-        // both columns are present, so the row IS full-covered.
-        let mut schemas = HashMap::new();
-        schemas.insert("t".to_string(), schema("t", &["id", "small", "large"]));
+        schemas.insert("t".to_string(), schema_with_hashed());
 
         let mut sidecar = HashedValues::new();
         sidecar.insert([0xAB; 32], vec![9, 9, 9]);
+        let change = change_with_sidecar(sidecar);
 
         let writes = vec![
             BatchOp::Put {
                 key: keys::column_key("t", 7, "small"),
                 value: vec![1, 2, 3],
             },
-            BatchOp::PutHash {
+            BatchOp::Put {
                 key: keys::column_key("t", 7, "large"),
-                value_hash: [0xAB; 32],
+                value: [0xAB; 32].to_vec(),
             },
         ];
-        let change = change_with_sidecar(sidecar);
 
         let update = cache_update_from_writes(&change, &writes, &schemas);
 
         assert_eq!(update.writes.len(), 2);
         assert_eq!(update.coverage_extensions.len(), 1);
+    }
+
+    #[test]
+    fn unresolvable_hash_backed_taints_row_and_skips_coverage() {
+        // The hash-backed `large` digest is missing from the sidecar, so it
+        // is not spliced and the row must not be coverage-extended (an
+        // id-read would otherwise return the row missing `large`).
+        let mut schemas = HashMap::new();
+        schemas.insert("t".to_string(), schema_with_hashed());
+
+        let change = change_with_sidecar(HashedValues::new());
+
+        let writes = vec![
+            BatchOp::Put {
+                key: keys::column_key("t", 7, "small"),
+                value: vec![1, 2, 3],
+            },
+            BatchOp::Put {
+                key: keys::column_key("t", 7, "large"),
+                value: [0xAB; 32].to_vec(),
+            },
+        ];
+
+        let update = cache_update_from_writes(&change, &writes, &schemas);
+
+        assert_eq!(update.writes.len(), 1, "only the resolvable Put is spliced");
+        assert!(
+            update.coverage_extensions.is_empty(),
+            "tainted row must not receive a coverage extension"
+        );
     }
 }

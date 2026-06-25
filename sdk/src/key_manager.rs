@@ -98,7 +98,7 @@ impl Space {
 
         // 5. Apply the changelog entry to local state. Issue #212: fail closed
         //    unless the exact rekey entry is proven incorporated.
-        let completed = self.complete_submitted(change, change_response).await?;
+        self.complete_submitted(change, change_response).await?;
 
         // 6. Post-apply delivery-slot recovery if the builder flagged it.
         self.post_apply_delivery_slot_recovery(rekey_output.needs_delivery)
@@ -133,7 +133,7 @@ impl Space {
 
         // 4. Apply the changelog entry to local state. Issue #212: fail closed
         //    unless the exact extend entry is proven incorporated.
-        let completed = self.complete_submitted(change, change_response).await?;
+        self.complete_submitted(change, change_response).await?;
 
         // 5. Post-apply delivery-slot recovery if the builder flagged it.
         self.post_apply_delivery_slot_recovery(extend_output.needs_delivery)
