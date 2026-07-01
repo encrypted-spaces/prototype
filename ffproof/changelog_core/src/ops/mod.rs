@@ -11,6 +11,7 @@ pub mod reduce_op;
 pub mod refresh_keys_op;
 pub mod rekey_op;
 pub mod remove_user_op;
+pub mod store_op;
 pub mod update_op;
 
 use crate::changelog::{ChangelogEntry, ChangelogError, KvData, OpType, MAX_LOGMSG_ENTRIES};
@@ -42,6 +43,7 @@ pub use reduce_op::ReduceOp;
 pub use refresh_keys_op::{RefreshKeysOp, REFRESH_KEYS_ALLOWED_COLUMNS};
 pub use rekey_op::RekeyOp;
 pub use remove_user_op::RemoveUserOp;
+pub use store_op::{StoreDeleteOp, StorePutOp};
 pub use update_op::UpdateOp;
 
 // ─── Shared column-op validation helpers ─────────────────────────────────────
@@ -2083,6 +2085,8 @@ pub fn dispatch_extract_and_validate(
         OpType::Reduce => ReduceOp::extract_and_validate(entry, reader, ctx),
         OpType::Rekey => RekeyOp::extract_and_validate(entry, reader, ctx),
         OpType::Action => ActionOp::extract_and_validate(entry, reader, ctx),
+        OpType::StorePut => StorePutOp::extract_and_validate(entry, reader, ctx),
+        OpType::StoreDelete => StoreDeleteOp::extract_and_validate(entry, reader, ctx),
         OpType::Noop => Ok(OpVerifyResult {
             write_steps: Vec::new(),
         }),

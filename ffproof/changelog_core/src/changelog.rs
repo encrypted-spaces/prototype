@@ -76,6 +76,14 @@ pub enum OpType {
     /// sigref, pruned tree, overlay) without any table reads or writes.
     /// Rejected by the production server write path.
     Noop = 15,
+    /// Write (insert or overwrite) one or more entries into a declared
+    /// key-value store.  Stores are open: any member may write any key,
+    /// so this op authenticates membership and store-declaration but
+    /// enforces no per-key access control.
+    StorePut = 16,
+    /// Delete one or more entries from a declared key-value store.  Same
+    /// open-access model as [`OpType::StorePut`].
+    StoreDelete = 17,
 }
 
 type Time = u64;
@@ -527,6 +535,8 @@ impl OpType {
             13 => Some(OpType::ListAppend),
             14 => Some(OpType::Action),
             15 => Some(OpType::Noop),
+            16 => Some(OpType::StorePut),
+            17 => Some(OpType::StoreDelete),
             _ => None,
         }
     }

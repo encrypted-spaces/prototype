@@ -1497,6 +1497,60 @@ impl SpaceState {
         Ok(())
     }
 
+    /// Validate a store write (StorePut / StoreDelete) before applying it.
+    ///
+    /// Stores are open, so there is no per-key access control.  This
+    /// mirrors the verifier's well-formedness and authentication checks so
+    /// the server never accepts a change the client-side verifier would
+    /// reject: entries must be non-empty, target a single declared store,
+    /// and the writer must be a full (non-provisional) member.
+    fn server_validation_store(
+        &self,
+        change: &Change,
+        _auth: &AuthContext,
+    ) -> Result<(), ServerError> {
+        let entry = &change.entry;
+        if entry.message.entries.is_empty() {
+            return Err(ServerError::Generic("store op has no entries".to_string()));
+        }
+
+        let mut store: Option<String> = None;
+        for kv in &entry.message.entries {
+            match parse_key(&kv.key) {
+                Ok(ParsedKey::StoreEntry { store: s, .. }) => match &store {
+                    None => store = Some(s),
+                    Some(existing) if *existing != s => {
+                        return Err(ServerError::Generic(format!(
+                            "store op entries span two stores ('{existing}' and '{s}')"
+                        )));
+                    }
+                    Some(_) => {}
+                },
+                _ => {
+                    return Err(ServerError::Generic(
+                        "store op entry key is not a store entry key".to_string(),
+                    ));
+                }
+            }
+        }
+        let store = store.expect("entries are non-empty");
+
+        if !self.db.store_exists(&store).map_err(ServerError::from)? {
+            return Err(ServerError::Generic(format!(
+                "store '{store}' is not declared"
+            )));
+        }
+
+        if self.is_provisional_user(entry.uid as i64) {
+            return Err(ServerError::Generic(format!(
+                "provisional user {} may not write to stores",
+                entry.uid
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Server-side structural validation for `OpType::Action`.
     ///
     /// Parses the position-0 action marker and, when the referenced action is
@@ -1700,6 +1754,9 @@ impl SpaceState {
             }
             OpType::ListAppend | OpType::ListInsert | OpType::ListUpdate | OpType::ListDelete => {
                 self.server_validation_list(change, auth)?;
+            }
+            OpType::StorePut | OpType::StoreDelete => {
+                self.server_validation_store(change, auth)?;
             }
         }
 
@@ -2977,6 +3034,8 @@ fn rows_affected(change: &ChangelogEntry) -> u64 {
         | OpType::Reduce
         | OpType::Rekey => 1,
         OpType::ListAppend | OpType::ListInsert | OpType::ListUpdate | OpType::ListDelete => 1,
+        // Store ops affect exactly one entry per key written/deleted.
+        OpType::StorePut | OpType::StoreDelete => change.message.entries.len().max(1) as u64,
         OpType::Noop => 0,
         OpType::Action => {
             // Same shape as Update/Delete: count unique column-key row_ids.
