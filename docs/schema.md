@@ -1,8 +1,8 @@
 # Application schema
 
-An app declares its tables, access-control rules, and actions in a single KDL file. The build-time `sdk-codegen` parses the file, computes the initial data commitment, and emits an `Actions` extension trait on `Space` whose methods are typed wrappers around the underlying `call_*_action` entry points.
+An app declares its tables, key-value stores, access-control rules, and actions in a single KDL file. The build-time `sdk-codegen` parses the file, computes the initial data commitment, and emits an `Actions` extension trait on `Space` whose methods are typed wrappers around the underlying `call_*_action` entry points.
 
-The top level holds `table` blocks. Each `table` body has columns and an optional `rules { }` block. The rules block declares ACL clauses, action-gating, and action definitions. Everything that governs the table lives inside its block.
+The top level holds `table` blocks and `store` blocks. Each `table` body has columns and an optional `rules { }` block. The rules block declares ACL clauses, action-gating, and action definitions. Everything that governs the table lives inside its block. A `store` (see [Stores](#stores)) is a namespaced key-value collection with no columns or rules.
 
 ## Tables and rules
 
@@ -83,6 +83,36 @@ Each `action` block has zero or more `assert "<expr>"` predicates followed by on
 - **Per-leg ACL.** Primary legs inherit the table's `allow` predicates; cascade legs inherit authorization from the primary delete.
 
 See `docs/actions.md` for the action data model in more depth, including the codegen output and call-site shape.
+
+## Stores
+
+A `store` is a namespaced key-value collection, declared at the top level alongside tables:
+
+```kdl
+store "prefs"
+store "cache" encrypted=#false
+```
+
+Unlike a table, a store has no columns, indexes, or access control. It is **open**: any member of the space can read, write, overwrite, or delete any key. Keys are opaque plaintext bytes (used for lookup); values are opaque bytes, encrypted client-side by default. Set `encrypted=#false` only for non-sensitive metadata.
+
+Use a store through the `Space::store` handle:
+
+```rust
+let store = space.store("prefs")?;
+store.put("theme", b"dark".to_vec()).await?;
+let value = store.get("theme").await?;          // Option<Vec<u8>>
+store.delete("theme").await?;
+let ui = store.list_prefix("ui/").await?;        // Vec<(key, value)>, key order
+```
+
+Notes and constraints:
+
+- **Open access, still authenticated.** Writes flow through the same zkVM verifier as table writes: it authenticates the writer's membership, checks the entries target a single declared store, and applies them. It performs no per-key authorization — there is no `allow` or `only_via_actions` for stores in this version, and a `store` block may not contain any children.
+- **Flat namespace.** A store name may not collide with a table (or another store), and may not start with `_`.
+- **Reads.** Served from the local KV cache when possible; a cache miss fetches and verifies a Merk proof, splices it in, and re-reads. (The networked transport's store read is a follow-up; in-process/`LocalTransport` is supported today.)
+- **Relationship to `_retention`.** Stores are the purpose-built primitive that the internal `_retention` "temporary KV-store shim" (`backend/src/internal_schemas.kdl`) anticipated; migrating retention state onto a store is future work.
+
+Per-store access control (`rules { allow ... }`, per-key ownership) and store actions are an explicit follow-up.
 
 ## What gets generated
 
