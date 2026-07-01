@@ -75,6 +75,22 @@ pub trait Transport: Send + Sync + 'static {
         schemas: &HashMap<String, Schema>,
     ) -> Result<VerifiedRows>;
 
+    /// Read from a key-value store: prove the given `read_op` (a single
+    /// `ReadOp::Key` for `get`, or `ReadOp::Prefix` for a whole-store scan)
+    /// against `commitment`, verify it, and return the authenticated rows.
+    ///
+    /// The default errors "unsupported"; in-process transports override it.
+    /// A networked (proto) implementation is a follow-up.
+    async fn store_read(
+        &self,
+        _read_op: encrypted_spaces_changelog_core::ReadOp,
+        _commitment: &[u8; 32],
+    ) -> Result<VerifiedRows> {
+        Err(SdkError::ValidationError(
+            "store_read is not supported by this transport".into(),
+        ))
+    }
+
     /// Upcast to `&dyn Any` for runtime downcasts to concrete transport types.
     fn as_any(&self) -> &dyn Any;
 

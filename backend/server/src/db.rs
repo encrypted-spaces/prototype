@@ -1235,6 +1235,33 @@ impl SpaceState {
                 }
                 Ok(())
             }
+            OpType::StorePut | OpType::StoreDelete => {
+                // Store entries live under the "T" tag with no schema.
+                // Per-store validation happens in `server_validation_store`
+                // and the verifier op; here we only check the entry shape.
+                if tree_path.as_slice() != b"/" {
+                    return Err(ServerError::Generic(format!(
+                        "Store op requires tree_path \"/\", got {:?}",
+                        String::from_utf8_lossy(tree_path)
+                    )));
+                }
+                for kv in &change.message.entries {
+                    match parse_key(&kv.key) {
+                        Ok(ParsedKey::StoreEntry { .. }) => {}
+                        Ok(other) => {
+                            return Err(ServerError::Generic(format!(
+                                "Store op entry must be a store entry key, got {other:?}"
+                            )));
+                        }
+                        Err(e) => {
+                            return Err(ServerError::Generic(format!(
+                                "Store op entry key failed to parse: {e:?}"
+                            )));
+                        }
+                    }
+                }
+                Ok(())
+            }
             OpType::Action => {
                 // Action entries carry the action-marker kv at
                 // position 0 plus one or more column kvs across one or

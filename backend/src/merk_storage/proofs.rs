@@ -234,23 +234,8 @@ impl MerkStorage {
     ///
     /// This is useful for proving all rows in a table or all index entries.
     pub async fn prove_prefix(&self, prefix: &[u8]) -> Result<Vec<u8>> {
-        // Build a range query for the prefix
-        // The range is [prefix, prefix_end) where prefix_end is the lexicographically next prefix
-        let mut end_prefix = prefix.to_vec();
-        // Increment the last byte to get the exclusive end bound
-        // This works for our length-prefixed keys since we want all keys starting with prefix
-        if let Some(last) = end_prefix.last_mut() {
-            if *last < 255 {
-                *last += 1;
-            } else {
-                // If last byte is 255, we need to handle overflow
-                // For simplicity, just append 0xFF to make it larger
-                end_prefix.push(0xFF);
-            }
-        }
-
         let mut query = MerkQuery::new();
-        query.insert_range(prefix.to_vec()..end_prefix);
+        query.insert_range(prefix_scan_range(prefix));
 
         // Generate the proof using prove() which returns encoded bytes
         let proof = self
@@ -603,6 +588,54 @@ fn verify_merk_query(
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     merk::proofs::query::verify_query(bytes, &query, expected_hash)
         .map_err(|e| SdkError::DatabaseError(format!("Proof verification failed: {e:?}")))
+}
+
+/// The half-open key range covering every key with the given prefix:
+/// `[prefix, prefix_end)`. Shared by [`MerkStorage::prove_prefix`] and
+/// [`verify_store_proof`] so prover and verifier agree on the exact range.
+fn prefix_scan_range(prefix: &[u8]) -> std::ops::Range<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    if let Some(last) = end.last_mut() {
+        if *last < 255 {
+            *last += 1;
+        } else {
+            end.push(0xFF);
+        }
+    }
+    prefix.to_vec()..end
+}
+
+/// Verify a key-value store read proof for a single `ReadOp` and return the
+/// authenticated rows.
+///
+/// Stores have no columns or schema, so `main_rows` / `rows_by_table` are
+/// empty; only `kv_pairs` (raw, still-encrypted entry values) and the
+/// authenticated `read_ops` are populated, for the cache to ingest.
+#[cfg(any(feature = "merk", feature = "merk_verify"))]
+pub fn verify_store_proof(
+    read_op: &ReadOp,
+    proof: &[u8],
+    commitment: &[u8; 32],
+) -> Result<VerifiedRows> {
+    let kv_pairs = match read_op {
+        ReadOp::Key(key) => verify_proof(proof, commitment, std::slice::from_ref(key))?,
+        ReadOp::Prefix(prefix) => {
+            let mut query = MerkQuery::new();
+            query.insert_range(prefix_scan_range(prefix));
+            verify_merk_query(proof, query, *commitment)?
+        }
+        ReadOp::Range { start, end } => {
+            let mut query = MerkQuery::new();
+            query.insert_range(start.clone()..end.clone());
+            verify_merk_query(proof, query, *commitment)?
+        }
+    };
+    Ok(VerifiedRows {
+        main_rows: Vec::new(),
+        rows_by_table: HashMap::new(),
+        kv_pairs,
+        read_ops: vec![read_op.clone()],
+    })
 }
 
 /// Verify a Merkle proof against an expected root hash.

@@ -706,6 +706,36 @@ impl<'q> ChangeBuilder<'q> {
         Ok(change)
     }
 
+    /// Build a signed store write (`StorePut` / `StoreDelete`) from raw
+    /// `(key, value)` entries.
+    ///
+    /// The keys are `store_entry_key`s and the values are already encrypted
+    /// by the caller. Stores have no schema, so no hash-backed storage or
+    /// column handling is applied. Uses the query-less builder
+    /// ([`ChangeBuilder::retention_only`]).
+    pub async fn build_store_write(
+        &self,
+        op_type: OpType,
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<Change> {
+        let (uid, current_change_id, my_last_change_id, current_clc) = self.auth_state().await?;
+        let key_refs: Vec<&[u8]> = entries.iter().map(|(k, _)| k.as_slice()).collect();
+        let value_refs: Vec<&[u8]> = entries.iter().map(|(_, v)| v.as_slice()).collect();
+        let mut change = Change::new(
+            op_type,
+            uid,
+            ROOT_TREE_PATH,
+            &key_refs,
+            &value_refs,
+            current_change_id,
+            my_last_change_id,
+            current_clc,
+        )
+        .map_err(|e| SdkError::DatabaseError(format!("Failed to create store change: {e}")))?;
+        self.sign(&mut change).await;
+        Ok(change)
+    }
+
     /// Apply `with_prepended_kv` (if set) by inserting the kv at the
     /// front of the keys / values vectors.
     fn prepend_marker_kv(&self, keys: &mut Vec<Vec<u8>>, values: &mut Vec<Vec<u8>>) {

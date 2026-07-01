@@ -4,7 +4,7 @@ use encrypted_spaces_backend::{
     access_control::{AccessOperation, AccessRule, AuthContext},
     error::{Result, SdkError},
     internal_schemas::is_reserved_table_name,
-    merk_storage::proofs::{verify_query_proof_with_hashed_values, VerifiedRows},
+    merk_storage::proofs::{verify_query_proof_with_hashed_values, verify_store_proof, VerifiedRows},
     query::Query,
     schema::Schema,
     storage::Storage as StorageTrait,
@@ -403,6 +403,25 @@ impl Transport for LocalTransport {
         )
     }
 
+    async fn store_read(
+        &self,
+        read_op: encrypted_spaces_changelog_core::ReadOp,
+        commitment: &[u8; 32],
+    ) -> Result<VerifiedRows> {
+        use encrypted_spaces_changelog_core::ReadOp;
+        let state = self.state.lock().await;
+        let proof = match &read_op {
+            ReadOp::Key(key) => state.db.prove_keys(std::slice::from_ref(key)).await?,
+            ReadOp::Prefix(prefix) => state.db.prove_prefix(prefix).await?,
+            ReadOp::Range { .. } => {
+                return Err(SdkError::ValidationError(
+                    "store_read does not support range reads".into(),
+                ));
+            }
+        };
+        verify_store_proof(&read_op, &proof, commitment)
+    }
+
     #[inline]
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -528,6 +547,37 @@ impl crate::Space {
             // Server changelog baseline was reset out-of-band; per-user
             // sigref chains must restart so the next tracked change
             // (sig_ref=0) is accepted by `check_sigref_continuity`.
+            state.sigref_map.clear();
+            state.current_clc_state = crate::state::initial_clc_state(&new_root);
+            state.kv_cache.advance_anchor(new_root, Default::default());
+        });
+        Ok(())
+    }
+
+    /// Declare a key-value store in the local backend and register it
+    /// locally. Test-only; requires a `LocalTransport`-backed `Space`.
+    /// Resets the client state to the new server root, exactly like
+    /// [`Self::create_table`].
+    pub async fn create_store(
+        &self,
+        store: &encrypted_spaces_backend::app_schema::SchemaStore,
+    ) -> Result<()> {
+        let local = self
+            .transport
+            .as_any()
+            .downcast_ref::<LocalTransport>()
+            .expect("Space::create_store requires a LocalTransport-backed Space");
+        local.create_store(store).await?;
+        self.with_state_mut(|state| {
+            state.stores.insert(store.name.clone(), store.clone());
+        });
+
+        let new_root = local.get_root_hash().await?;
+        self.with_state_mut(|state| {
+            state.current_data_commitment = new_root;
+            state.initial_dc = new_root;
+            state.current_change_id = 0;
+            state.my_last_change_id = 0;
             state.sigref_map.clear();
             state.current_clc_state = crate::state::initial_clc_state(&new_root);
             state.kv_cache.advance_anchor(new_root, Default::default());

@@ -12,6 +12,7 @@ pub mod local_transport;
 pub(crate) mod retention;
 pub mod schema;
 mod state;
+pub mod store;
 pub(crate) mod sync_decrypt;
 pub mod table;
 #[cfg(feature = "testing")]
@@ -206,7 +207,9 @@ impl Space {
             user.auth_key_pair.clone(),
             space_key,
         );
-        let (dc, table_schemas, actions, ff_image_id) = schema.into_parts().await?;
+        let parts = schema.into_parts().await?;
+        let dc = parts.commitment;
+        let ff_image_id = parts.image_id;
 
         let space_id = SpaceId::random();
         let auth_context = user.as_auth_context(space_id);
@@ -224,8 +227,9 @@ impl Space {
                 sigref_map: BTreeMap::new(),
                 timestamp_hwm: 0,
                 key_valid_from_change_id: 0,
-                table_schemas,
-                actions,
+                table_schemas: parts.schemas,
+                actions: parts.actions,
+                stores: parts.stores,
                 current_clc_state: state::initial_clc_state(&dc),
                 current_change_entry: None,
                 ff_image_id,
@@ -321,7 +325,9 @@ impl Space {
             KeyManager::from_delivery_envelope(user.update_key_pair, user.auth_key_pair, &envelope)
                 .map_err(|e| SdkError::JoinError(format!("failed to process invite: {e:?}")))?;
 
-        let (dc, table_schemas, actions, ff_image_id) = schema.into_parts().await?;
+        let parts = schema.into_parts().await?;
+        let dc = parts.commitment;
+        let ff_image_id = parts.image_id;
 
         let inviter_anchor = state::InviterAnchor {
             change_id: inviter_change_id,
@@ -340,8 +346,9 @@ impl Space {
                 sigref_map: BTreeMap::new(),
                 timestamp_hwm: 0,
                 key_valid_from_change_id: 0,
-                table_schemas,
-                actions,
+                table_schemas: parts.schemas,
+                actions: parts.actions,
+                stores: parts.stores,
                 current_clc_state: state::initial_clc_state(&dc),
                 current_change_entry: None,
                 ff_image_id,
@@ -494,6 +501,23 @@ impl Space {
         file::FileHandle {
             space: Arc::new(self.clone()),
         }
+    }
+
+    /// Return a handle to a namespaced key-value store declared in the
+    /// schema. Stores are open: any member may read/write/overwrite/delete
+    /// any key. Errors if `name` was not declared as a `store` in the
+    /// application schema.
+    pub fn store(&self, name: &str) -> Result<store::Store> {
+        let encrypted = self
+            .with_state(|state| state.stores.get(name).map(|s| s.encrypted_values))
+            .ok_or_else(|| {
+                SdkError::InvalidQuery(format!("store '{name}' is not declared in the schema"))
+            })?;
+        Ok(store::Store::new(
+            Arc::new(self.clone()),
+            name.to_string(),
+            encrypted,
+        ))
     }
 
     /// Returns a handle to the space's key manager.

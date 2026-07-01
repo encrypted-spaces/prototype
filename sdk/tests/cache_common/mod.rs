@@ -67,6 +67,7 @@ pub fn tags_schema() -> Schema {
 pub struct CountingTransport {
     inner: LocalTransport,
     select_calls: Arc<AtomicUsize>,
+    store_read_calls: Arc<AtomicUsize>,
 }
 
 impl CountingTransport {
@@ -74,7 +75,12 @@ impl CountingTransport {
         Self {
             inner,
             select_calls: Arc::new(AtomicUsize::new(0)),
+            store_read_calls: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    pub fn store_read_count(&self) -> usize {
+        self.store_read_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -100,6 +106,15 @@ impl Transport for CountingTransport {
     ) -> Result<VerifiedRows> {
         self.select_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.select(query, commitment, schemas).await
+    }
+
+    async fn store_read(
+        &self,
+        read_op: encrypted_spaces_changelog_core::ReadOp,
+        commitment: &[u8; 32],
+    ) -> Result<VerifiedRows> {
+        self.store_read_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.store_read(read_op, commitment).await
     }
 
     fn as_any(&self) -> &dyn Any {
