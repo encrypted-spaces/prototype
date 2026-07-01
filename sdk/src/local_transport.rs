@@ -268,6 +268,35 @@ impl LocalTransport {
         Ok(())
     }
 
+    /// Declare a key-value store in the local backend storage.
+    ///
+    /// Only available on `LocalTransport` (for testing).  In production,
+    /// stores are declared server-side at space init from the schema
+    /// bundle (see `SpaceState::bootstrap_from_schema_file`).  Resets the
+    /// changelog baseline like [`Self::create_table`] does, so subsequent
+    /// tracked changes replay from the new post-declaration tree.
+    pub async fn create_store(
+        &self,
+        store: &encrypted_spaces_backend::app_schema::SchemaStore,
+    ) -> Result<()> {
+        if is_reserved_table_name(&store.name) {
+            return Err(SdkError::ValidationError(format!(
+                "store '{}' is reserved: names starting with '_' are reserved for internal use",
+                store.name
+            )));
+        }
+        let mut state = self.state.lock().await;
+        state.db.import_stores(std::slice::from_ref(store)).await?;
+
+        let current_root = state.get_root_hash().await;
+        state.changelog = ChangeLog::new(&current_root);
+        state.change_responses.clear();
+        state.ff_proof = None;
+        state.tree_snapshot = state.db.snapshot();
+        state.sigref_map.clear();
+        Ok(())
+    }
+
     /// Inject an access-control rule into the local backend storage and
     /// re-finalize the ACL blob.
     ///

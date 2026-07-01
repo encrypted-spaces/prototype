@@ -948,6 +948,14 @@ impl SpaceState {
             .map_err(ServerError::from)
     }
 
+    /// Write declared key-value store declarations into authenticated state.
+    async fn import_stores(
+        &self,
+        stores: &[encrypted_spaces_backend::app_schema::SchemaStore],
+    ) -> Result<(), ServerError> {
+        self.db.import_stores(stores).await.map_err(ServerError::from)
+    }
+
     /// Reset changelog to the current Merk root and clear change history.
     pub async fn reinitialize_changelog(&mut self) -> Result<(), ServerError> {
         let current_root = self.db.root_hash();
@@ -977,6 +985,7 @@ impl SpaceState {
             tables,
             actions,
             acl_only_via_actions,
+            stores,
         } = if schema_path.ends_with(".kdl") {
             let text = std::str::from_utf8(&bytes).map_err(|e| {
                 ServerError::Generic(format!(
@@ -1006,6 +1015,7 @@ impl SpaceState {
         self.import_actions(&actions).await?;
         self.import_acl_only_via_actions(&acl_only_via_actions)
             .await?;
+        self.import_stores(&stores).await?;
         self.reinitialize_changelog().await?;
 
         log::info!(

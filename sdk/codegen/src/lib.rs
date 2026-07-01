@@ -551,6 +551,7 @@ mod tests {
                 },
             ],
             acl_only_via_actions: Default::default(),
+            stores: Vec::new(),
         }
     }
 

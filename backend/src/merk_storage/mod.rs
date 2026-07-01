@@ -33,7 +33,7 @@ use encrypted_spaces_storage_encoding::HASH_LEN;
 #[cfg(feature = "merk")]
 use encrypted_spaces_storage_encoding::{
     action_storage_key, classify_insert_id, encode_action_value, encode_column_names,
-    schema_indexes_key, InsertId,
+    schema_indexes_key, store_entry_key, store_prefix, store_schema_key, InsertId,
 };
 pub use keys::{
     acl_only_via_actions_key, acl_rule_key, bytes_to_row_id, column_key, column_key_placeholder,
@@ -48,6 +48,7 @@ use std::{cmp::Ordering, collections::HashMap};
 use {
     crate::{
         access_control::{load_access_rule, AuthContext},
+        app_schema::SchemaStore,
         storage::Storage,
     },
     merk::{InMemoryMerk, Node},
@@ -703,6 +704,49 @@ impl MerkStorage {
             ops.push((key, Op::Put(blob)));
         }
         self.apply_batch(ops)
+    }
+
+    /// Write the declaration record for each store at
+    /// `store_schema_key(name)`, value = single encryption-flag byte
+    /// (`1` = encrypted values, `0` = plaintext).  Called during space
+    /// setup; its presence makes each store part of the committed merk
+    /// root and lets the verifier authenticate that a write targets a
+    /// declared store.  An empty list is a no-op.
+    pub async fn import_stores(&self, stores: &[SchemaStore]) -> Result<()> {
+        if stores.is_empty() {
+            return Ok(());
+        }
+        let mut ops: Vec<Operation> = Vec::with_capacity(stores.len());
+        for store in stores {
+            let flag: u8 = if store.encrypted_values { 1 } else { 0 };
+            ops.push((store_schema_key(&store.name), Op::Put(vec![flag])));
+        }
+        self.apply_batch(ops)
+    }
+
+    /// Whether a store has been declared (its `store_schema_key` exists).
+    pub fn store_exists(&self, store: &str) -> Result<bool> {
+        Ok(self.get_value(&store_schema_key(store))?.is_some())
+    }
+
+    /// Read a single store entry's raw (still-encrypted) value bytes.
+    pub fn store_get(&self, store: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.get_value(&store_entry_key(store, key))
+    }
+
+    /// Scan every entry in a store, returning `(raw_key_bytes, value)`
+    /// pairs in key order.
+    pub fn store_scan(&self, store: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let entries = self.iter_prefix(&store_prefix(store))?;
+        let mut out = Vec::with_capacity(entries.len());
+        for (raw_key, value) in entries {
+            let parsed = keys::parse_key(&raw_key)
+                .map_err(|e| SdkError::DatabaseError(format!("failed to parse store key: {e}")))?;
+            if let keys::ParsedKey::StoreEntry { key, .. } = parsed {
+                out.push((key, value));
+            }
+        }
+        Ok(out)
     }
 
     /// Read the `_access_control` table, group rules by `(table, op)`
@@ -2295,6 +2339,59 @@ mod tests {
         assert!(
             msg.contains("send_message") && msg.contains("more than once"),
             "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_stores_changes_root_and_declares_store() {
+        let storage = MerkStorage::in_memory_with_internal_tables().await.unwrap();
+        let root_before = storage.root_hash();
+        assert!(!storage.store_exists("prefs").unwrap());
+
+        storage
+            .import_stores(&[SchemaStore {
+                name: "prefs".to_string(),
+                encrypted_values: true,
+            }])
+            .await
+            .unwrap();
+
+        // Declaring a store mutates the committed root, so the initial
+        // DATA_COMMITMENT provably covers it.
+        assert_ne!(root_before, storage.root_hash());
+        assert!(storage.store_exists("prefs").unwrap());
+    }
+
+    #[tokio::test]
+    async fn store_get_and_scan_roundtrip() {
+        use encrypted_spaces_storage_encoding::store_entry_key;
+        let storage = MerkStorage::in_memory_with_internal_tables().await.unwrap();
+        storage
+            .import_stores(&[SchemaStore {
+                name: "prefs".to_string(),
+                encrypted_values: false,
+            }])
+            .await
+            .unwrap();
+
+        // Write a couple of entries directly (mirrors what the verifier
+        // apply step emits for a StorePut).
+        storage
+            .apply_batch_ops(vec![
+                (store_entry_key("prefs", b"a"), Op::Put(b"1".to_vec())),
+                (store_entry_key("prefs", b"b"), Op::Put(b"2".to_vec())),
+                // An entry in a different store must not leak into the scan.
+                (store_entry_key("other", b"a"), Op::Put(b"x".to_vec())),
+            ])
+            .unwrap();
+
+        assert_eq!(storage.store_get("prefs", b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(storage.store_get("prefs", b"missing").unwrap(), None);
+
+        let scanned = storage.store_scan("prefs").unwrap();
+        assert_eq!(
+            scanned,
+            vec![(b"a".to_vec(), b"1".to_vec()), (b"b".to_vec(), b"2".to_vec())]
         );
     }
 
