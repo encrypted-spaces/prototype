@@ -217,6 +217,42 @@ impl KvCache {
         true
     }
 
+    /// Try to answer a store point read (`get`) from the cache.
+    ///
+    /// `Hit(Some(bytes))` returns the still-encrypted stored value;
+    /// `Hit(None)` is an authenticated absence (tombstone or a known gap in
+    /// a covered range); `Miss` means the cache can't answer and the caller
+    /// must fetch. Decryption happens in the runtime layer.
+    pub fn store_get(&self, store: &str, key: &[u8]) -> CacheResult<Option<Vec<u8>>> {
+        let entry_key = keys::store_entry_key(store, key);
+        match self.storage.lookup_point(&entry_key) {
+            Some(value) => CacheResult::Hit(value),
+            None => CacheResult::Miss,
+        }
+    }
+
+    /// Try to answer a whole-store scan (`list`) from the cache.
+    ///
+    /// `Hit` only when the entire store prefix is covered, so the returned
+    /// set is authoritative (no missing entries). Each pair is
+    /// `(raw_key_bytes, still-encrypted value)`.
+    pub fn store_scan(&self, store: &str) -> CacheResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        let prefix = keys::store_prefix(store);
+        let Some(end) = prefix_successor(&prefix) else {
+            return CacheResult::Miss;
+        };
+        if !self.storage.covers_range(&prefix, &end) {
+            return CacheResult::Miss;
+        }
+        let mut out = Vec::new();
+        for (k, v) in self.storage.iter_range_present(&prefix, &end) {
+            if let Ok(ParsedKey::StoreEntry { key, .. }) = parse_key(k) {
+                out.push((key, v.clone()));
+            }
+        }
+        CacheResult::Hit(out)
+    }
+
     /// Try to answer `query` from the cache. Returns `Hit(rows)` if every
     /// byte range the planned query would touch is fully covered; `Miss`
     /// otherwise.

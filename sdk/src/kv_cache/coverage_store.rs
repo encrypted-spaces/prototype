@@ -97,6 +97,29 @@ impl CoverageStore {
         self.points.len()
     }
 
+    /// Resolve a single key against points and coverage:
+    /// - `Some(Some(bytes))` — a value is present;
+    /// - `Some(None)` — an authenticated absence (a tombstone, or no point
+    ///   inside a covered range);
+    /// - `None` — unknown (no point and not covered).
+    pub fn lookup_point(&self, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        match self.points.get(key) {
+            Some(DataEntry::Value { bytes, .. }) => Some(Some(bytes.clone())),
+            Some(DataEntry::Deleted) => Some(None),
+            None => {
+                // The immediate successor of `key`; `[key, succ)` is the
+                // single-point range, covered iff `key` sits in an interval.
+                let mut succ = key.to_vec();
+                succ.push(0);
+                if self.covers_range(key, &succ) {
+                    Some(None)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
     /// True iff the half-open range `[start, end)` is fully contained in a
     /// single coverage interval.
     pub fn covers_range(&self, start: &[u8], end: &[u8]) -> bool {
@@ -291,6 +314,22 @@ mod tests {
         cs.extend_coverage(s(b"b"), s(b"y"));
         assert!(!cs.covers_range(b"a", b"c"));
         assert!(!cs.covers_range(b"x", b"z"));
+    }
+
+    #[test]
+    fn lookup_point_distinguishes_present_tombstone_absent_unknown() {
+        let mut cs = CoverageStore::new();
+        // Present value.
+        cs.put_point(s(b"k1"), Some(s(b"v1")));
+        assert_eq!(cs.lookup_point(b"k1"), Some(Some(s(b"v1"))));
+        // Explicit tombstone.
+        cs.put_point(s(b"k2"), None);
+        assert_eq!(cs.lookup_point(b"k2"), Some(None));
+        // Unknown key with no coverage.
+        assert_eq!(cs.lookup_point(b"k3"), None);
+        // Covered gap: absence is authenticated.
+        cs.extend_coverage(s(b"a"), s(b"z"));
+        assert_eq!(cs.lookup_point(b"missing"), Some(None));
     }
 
     #[test]
