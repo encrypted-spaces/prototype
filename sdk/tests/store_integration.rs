@@ -35,7 +35,10 @@ async fn put_then_get_roundtrips() -> TestResult {
     let (space, _t) = setup().await?;
     let store = space.store("prefs")?;
     store.put("theme", b"dark".to_vec()).await?;
-    assert_eq!(store.get("theme").await?, Some(b"dark".to_vec()));
+    assert_eq!(
+        store.get().key("theme").first().await?,
+        Some((b"theme".to_vec(), b"dark".to_vec())),
+    );
     Ok(())
 }
 
@@ -45,7 +48,10 @@ async fn overwrite_returns_latest_value() -> TestResult {
     let store = space.store("prefs")?;
     store.put("theme", b"dark".to_vec()).await?;
     store.put("theme", b"light".to_vec()).await?;
-    assert_eq!(store.get("theme").await?, Some(b"light".to_vec()));
+    assert_eq!(
+        store.get().key("theme").first().await?,
+        Some((b"theme".to_vec(), b"light".to_vec())),
+    );
     Ok(())
 }
 
@@ -55,7 +61,7 @@ async fn delete_removes_the_key() -> TestResult {
     let store = space.store("prefs")?;
     store.put("theme", b"dark".to_vec()).await?;
     store.delete("theme").await?;
-    assert_eq!(store.get("theme").await?, None);
+    assert_eq!(store.get().key("theme").first().await?, None);
     Ok(())
 }
 
@@ -67,7 +73,10 @@ async fn get_after_local_write_is_a_cache_hit() -> TestResult {
 
     let before = transport.store_read_count();
     // The write spliced the point into the cache, so this get needs no fetch.
-    assert_eq!(store.get("theme").await?, Some(b"dark".to_vec()));
+    assert_eq!(
+        store.get().key("theme").first().await?,
+        Some((b"theme".to_vec(), b"dark".to_vec())),
+    );
     assert_eq!(
         transport.store_read_count(),
         before,
@@ -77,16 +86,97 @@ async fn get_after_local_write_is_a_cache_hit() -> TestResult {
 }
 
 #[tokio::test]
-async fn list_prefix_returns_matching_keys_in_order() -> TestResult {
+async fn prefix_scan_returns_matching_keys_in_order() -> TestResult {
     let (space, _t) = setup().await?;
     let store = space.store("prefs")?;
     store.put("ui/theme", b"dark".to_vec()).await?;
     store.put("ui/lang", b"en".to_vec()).await?;
     store.put("net/proxy", b"none".to_vec()).await?;
 
-    let ui = store.list_prefix("ui/").await?;
+    let ui = store.get().prefix("ui/").all().await?;
     let keys: Vec<Vec<u8>> = ui.iter().map(|(k, _)| k.clone()).collect();
     assert_eq!(keys, vec![b"ui/lang".to_vec(), b"ui/theme".to_vec()]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn range_scan_is_half_open() -> TestResult {
+    let (space, _t) = setup().await?;
+    let store = space.store("prefs")?;
+    for k in ["a", "b", "c", "d"] {
+        store.put(k, k.as_bytes().to_vec()).await?;
+    }
+    let keys: Vec<Vec<u8>> = store
+        .get()
+        .range("b", "d")
+        .all()
+        .await?
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(keys, vec![b"b".to_vec(), b"c".to_vec()]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn first_and_last_pick_the_range_ends() -> TestResult {
+    let (space, _t) = setup().await?;
+    let store = space.store("prefs")?;
+    for k in ["b", "d", "a", "c"] {
+        store.put(k, k.as_bytes().to_vec()).await?;
+    }
+    assert_eq!(
+        store.get().first().await?,
+        Some((b"a".to_vec(), b"a".to_vec())),
+    );
+    assert_eq!(
+        store.get().last().await?,
+        Some((b"d".to_vec(), b"d".to_vec())),
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn descending_limit_returns_largest_keys() -> TestResult {
+    let (space, _t) = setup().await?;
+    let store = space.store("prefs")?;
+    for k in ["a", "b", "c", "d"] {
+        store.put(k, k.as_bytes().to_vec()).await?;
+    }
+    let keys: Vec<Vec<u8>> = store
+        .get()
+        .descending()
+        .limit(2)
+        .all()
+        .await?
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(keys, vec![b"d".to_vec(), b"c".to_vec()]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn repeated_limited_read_is_a_coverage_cache_hit() -> TestResult {
+    let (space, transport) = setup().await?;
+    let store = space.store("prefs")?;
+    for k in ["a", "b", "c", "d", "e"] {
+        store.put(k, k.as_bytes().to_vec()).await?;
+    }
+
+    // The first limited read proves a narrowed range; the repeat is answered
+    // from the coverage that fetch established.
+    let first = store.get().range("a", "e").limit(2).all().await?;
+    let after_first = transport.store_read_count();
+    let second = store.get().range("a", "e").limit(2).all().await?;
+    assert_eq!(
+        transport.store_read_count(),
+        after_first,
+        "repeat limited read should hit the coverage cache"
+    );
+    assert_eq!(first, second);
+    let keys: Vec<Vec<u8>> = first.into_iter().map(|(k, _)| k).collect();
+    assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
     Ok(())
 }
 
@@ -95,7 +185,7 @@ async fn get_missing_key_returns_none() -> TestResult {
     let (space, _t) = setup().await?;
     let store = space.store("prefs")?;
     store.put("theme", b"dark".to_vec()).await?;
-    assert_eq!(store.get("absent").await?, None);
+    assert_eq!(store.get().key("absent").first().await?, None);
     Ok(())
 }
 
@@ -127,7 +217,10 @@ async fn second_actor_reads_first_actors_write_via_proof() -> TestResult {
 
     let bob_store = bob.store("prefs")?;
     let before = counting.store_read_count();
-    assert_eq!(bob_store.get("theme").await?, Some(b"dark".to_vec()));
+    assert_eq!(
+        bob_store.get().key("theme").first().await?,
+        Some((b"theme".to_vec(), b"dark".to_vec())),
+    );
     assert_eq!(
         counting.store_read_count(),
         before + 1,
@@ -135,7 +228,10 @@ async fn second_actor_reads_first_actors_write_via_proof() -> TestResult {
     );
 
     let after_fetch = counting.store_read_count();
-    assert_eq!(bob_store.get("theme").await?, Some(b"dark".to_vec()));
+    assert_eq!(
+        bob_store.get().key("theme").first().await?,
+        Some((b"theme".to_vec(), b"dark".to_vec())),
+    );
     assert_eq!(
         counting.store_read_count(),
         after_fetch,

@@ -2385,13 +2385,19 @@ mod tests {
             ])
             .unwrap();
 
-        assert_eq!(storage.store_get("prefs", b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(
+            storage.store_get("prefs", b"a").unwrap(),
+            Some(b"1".to_vec())
+        );
         assert_eq!(storage.store_get("prefs", b"missing").unwrap(), None);
 
         let scanned = storage.store_scan("prefs").unwrap();
         assert_eq!(
             scanned,
-            vec![(b"a".to_vec(), b"1".to_vec()), (b"b".to_vec(), b"2".to_vec())]
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec())
+            ]
         );
     }
 

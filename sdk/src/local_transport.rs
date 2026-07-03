@@ -4,7 +4,9 @@ use encrypted_spaces_backend::{
     access_control::{AccessOperation, AccessRule, AuthContext},
     error::{Result, SdkError},
     internal_schemas::is_reserved_table_name,
-    merk_storage::proofs::{verify_query_proof_with_hashed_values, verify_store_proof, VerifiedRows},
+    merk_storage::proofs::{
+        verify_query_proof_with_hashed_values, verify_store_tracer_proof, VerifiedRows,
+    },
     query::Query,
     schema::Schema,
     storage::Storage as StorageTrait,
@@ -405,21 +407,12 @@ impl Transport for LocalTransport {
 
     async fn store_read(
         &self,
-        read_op: encrypted_spaces_changelog_core::ReadOp,
+        read: encrypted_spaces_changelog_core::StoreReadOp,
         commitment: &[u8; 32],
     ) -> Result<VerifiedRows> {
-        use encrypted_spaces_changelog_core::ReadOp;
         let state = self.state.lock().await;
-        let proof = match &read_op {
-            ReadOp::Key(key) => state.db.prove_keys(std::slice::from_ref(key)).await?,
-            ReadOp::Prefix(prefix) => state.db.prove_prefix(prefix).await?,
-            ReadOp::Range { .. } => {
-                return Err(SdkError::ValidationError(
-                    "store_read does not support range reads".into(),
-                ));
-            }
-        };
-        verify_store_proof(&read_op, &proof, commitment)
+        let proof = state.db.prove_store_read(&read).await?;
+        verify_store_tracer_proof(&read, &proof, commitment)
     }
 
     #[inline]

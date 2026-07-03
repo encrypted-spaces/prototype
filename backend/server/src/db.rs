@@ -954,7 +954,10 @@ impl SpaceState {
         &self,
         stores: &[encrypted_spaces_backend::app_schema::SchemaStore],
     ) -> Result<(), ServerError> {
-        self.db.import_stores(stores).await.map_err(ServerError::from)
+        self.db
+            .import_stores(stores)
+            .await
+            .map_err(ServerError::from)
     }
 
     /// Reset changelog to the current Merk root and clear change history.
@@ -2426,18 +2429,16 @@ impl SpaceState {
     }
 
     /// Verify the client's data commitment matches the server root, then
-    /// generate a store-read proof for `read_op`. Returns the raw Merk proof
-    /// bytes; the client verifies them with `verify_store_proof`. Mirrors
+    /// generate a tracer store-read proof for `read`. Returns the proof bytes;
+    /// the client verifies them with `verify_store_tracer_proof`. Mirrors
     /// [`SpaceState::handle_select`] — on commitment mismatch it returns
     /// `SdkError::FastForwardRequired` rather than a proof the client can't
-    /// verify. Range reads are rejected (see `ReadOp::Range`).
+    /// verify.
     pub async fn handle_store_read(
         &self,
-        read_op: &encrypted_spaces_changelog_core::ReadOp,
+        read: &encrypted_spaces_changelog_core::StoreReadOp,
         commitment: &[u8],
     ) -> Result<Vec<u8>, SdkError> {
-        use encrypted_spaces_changelog_core::ReadOp;
-
         if commitment.is_empty() {
             return Err(SdkError::ValidationError(
                 "store read request must include a data commitment".into(),
@@ -2456,13 +2457,7 @@ impl SpaceState {
             });
         }
 
-        match read_op {
-            ReadOp::Key(key) => self.db.prove_keys(std::slice::from_ref(key)).await,
-            ReadOp::Prefix(prefix) => self.db.prove_prefix(prefix).await,
-            ReadOp::Range { .. } => Err(SdkError::ValidationError(
-                "store_read does not support range reads".into(),
-            )),
-        }
+        self.db.prove_store_read(read).await
     }
 
     ///
@@ -3291,17 +3286,26 @@ async fn handle_store_read(
     app_cfg: &AppConfig,
     auth_context: &AuthContext,
 ) -> DbResponse {
-    use encrypted_spaces_changelog_core::ReadOp;
-    use proto::store_read_request::ReadOp as ProtoReadOp;
+    use encrypted_spaces_changelog_core::{ReadOp, StoreReadOp};
+    use proto::store_read_request::Selector as ProtoSelector;
 
-    let read_op = match req.read_op {
-        Some(ProtoReadOp::Key(key)) => ReadOp::Key(key),
-        Some(ProtoReadOp::Prefix(prefix)) => ReadOp::Prefix(prefix),
-        None => return error_response(request_id, "missing_read_op"),
+    let op = match req.selector {
+        Some(ProtoSelector::Key(key)) => ReadOp::Key(key),
+        Some(ProtoSelector::Prefix(prefix)) => ReadOp::Prefix(prefix),
+        Some(ProtoSelector::Range(range)) => ReadOp::Range {
+            start: range.start,
+            end: range.end,
+        },
+        None => return error_response(request_id, "missing_store_read_selector"),
+    };
+    let read = StoreReadOp {
+        op,
+        descending: req.descending,
+        limit: req.limit,
     };
 
     log::info!(
-        "space={} store_read: request_id={request_id} read_op={read_op:?}",
+        "space={} store_read: request_id={request_id} read={read:?}",
         auth_context.space_id
     );
 
@@ -3309,7 +3313,7 @@ async fn handle_store_read(
     let result = space
         .lock()
         .await
-        .handle_store_read(&read_op, &req.commitment)
+        .handle_store_read(&read, &req.commitment)
         .await;
     match result {
         Ok(proof) => ok_response(
@@ -3653,9 +3657,11 @@ mod tests {
         }
     }
 
+    /// A space seeded with store `prefs` holding keys a,b,c,d (values va..vd),
+    /// plus the store prefix for whole-store reads.
     async fn store_read_test_state() -> (SpaceState, Vec<u8>) {
         use encrypted_spaces_backend::merk_storage::Op;
-        use encrypted_spaces_storage_encoding::keys::store_entry_key;
+        use encrypted_spaces_storage_encoding::keys::{store_entry_key, store_prefix};
 
         let state = SpaceState::init_server(
             None,
@@ -3670,56 +3676,123 @@ mod tests {
         .await
         .unwrap();
 
-        // Seed one store entry directly into the tree. `handle_store_read`
-        // proves over the raw (still-encrypted) stored bytes, so any bytes work.
-        let entry_key = store_entry_key("prefs", b"theme");
-        state
-            .db
-            .apply_batch_ops(vec![(entry_key.clone(), Op::Put(b"ciphertext".to_vec()))])
-            .unwrap();
-        (state, entry_key)
+        // Seed store entries directly into the tree. The proof is over the raw
+        // (still-encrypted) stored bytes, so any bytes work.
+        let ops = [b"a", b"b", b"c", b"d"]
+            .iter()
+            .map(|k| {
+                (
+                    store_entry_key("prefs", *k),
+                    Op::Put(format!("v-{}", std::str::from_utf8(*k).unwrap()).into_bytes()),
+                )
+            })
+            .collect();
+        state.db.apply_batch_ops(ops).unwrap();
+        (state, store_prefix("prefs"))
+    }
+
+    // The user key each authenticated store entry decodes to.
+    fn store_keys(
+        verified: &encrypted_spaces_backend::merk_storage::proofs::VerifiedRows,
+    ) -> Vec<Vec<u8>> {
+        use encrypted_spaces_storage_encoding::keys::{parse_key, ParsedKey};
+        verified
+            .kv_pairs
+            .iter()
+            .filter_map(|(k, _)| match parse_key(k) {
+                Ok(ParsedKey::StoreEntry { key, .. }) => Some(key),
+                _ => None,
+            })
+            .collect()
     }
 
     #[tokio::test]
-    async fn handle_store_read_key_proof_verifies_and_carries_value() {
-        use encrypted_spaces_backend::merk_storage::proofs::verify_store_proof;
-        use encrypted_spaces_changelog_core::ReadOp;
+    async fn handle_store_read_whole_store_proof_verifies() {
+        use encrypted_spaces_backend::merk_storage::proofs::verify_store_tracer_proof;
+        use encrypted_spaces_changelog_core::{ReadOp, StoreReadOp};
 
-        let (state, entry_key) = store_read_test_state().await;
+        let (state, prefix) = store_read_test_state().await;
         let root = state.db.root_hash();
 
-        let read_op = ReadOp::Key(entry_key.clone());
-        let proof = state.handle_store_read(&read_op, &root).await.unwrap();
+        let read = StoreReadOp::new(ReadOp::Prefix(prefix));
+        let proof = state.handle_store_read(&read, &root).await.unwrap();
 
-        // The proof the server generated must verify against the client's
-        // commitment and surface the stored (key, value) pair.
-        let verified = verify_store_proof(&read_op, &proof, &root).unwrap();
-        assert_eq!(verified.kv_pairs, vec![(entry_key, b"ciphertext".to_vec())]);
+        let verified = verify_store_tracer_proof(&read, &proof, &root).unwrap();
+        assert_eq!(
+            store_keys(&verified),
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()],
+        );
     }
 
     #[tokio::test]
-    async fn handle_store_read_prefix_proof_verifies() {
-        use encrypted_spaces_backend::merk_storage::proofs::verify_store_proof;
-        use encrypted_spaces_changelog_core::ReadOp;
-        use encrypted_spaces_storage_encoding::keys::store_prefix;
+    async fn handle_store_read_ascending_limit_narrows_provably() {
+        use encrypted_spaces_backend::merk_storage::proofs::verify_store_tracer_proof;
+        use encrypted_spaces_changelog_core::{ReadOp, StoreReadOp};
 
-        let (state, entry_key) = store_read_test_state().await;
+        let (state, prefix) = store_read_test_state().await;
         let root = state.db.root_hash();
 
-        let read_op = ReadOp::Prefix(store_prefix("prefs"));
-        let proof = state.handle_store_read(&read_op, &root).await.unwrap();
+        // first 2 keys, ascending.
+        let read = StoreReadOp {
+            op: ReadOp::Prefix(prefix),
+            descending: false,
+            limit: Some(2),
+        };
+        let proof = state.handle_store_read(&read, &root).await.unwrap();
 
-        let verified = verify_store_proof(&read_op, &proof, &root).unwrap();
-        assert_eq!(verified.kv_pairs, vec![(entry_key, b"ciphertext".to_vec())]);
+        let verified = verify_store_tracer_proof(&read, &proof, &root).unwrap();
+        // Only the returned keys are proven — c and d never appear.
+        assert_eq!(store_keys(&verified), vec![b"a".to_vec(), b"b".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn handle_store_read_descending_limit_narrows_provably() {
+        use encrypted_spaces_backend::merk_storage::proofs::verify_store_tracer_proof;
+        use encrypted_spaces_changelog_core::{ReadOp, StoreReadOp};
+
+        let (state, prefix) = store_read_test_state().await;
+        let root = state.db.root_hash();
+
+        // last 2 keys (descending narrows the low end). kv_pairs stay ascending.
+        let read = StoreReadOp {
+            op: ReadOp::Prefix(prefix),
+            descending: true,
+            limit: Some(2),
+        };
+        let proof = state.handle_store_read(&read, &root).await.unwrap();
+
+        let verified = verify_store_tracer_proof(&read, &proof, &root).unwrap();
+        assert_eq!(store_keys(&verified), vec![b"c".to_vec(), b"d".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn handle_store_read_tampered_proof_is_rejected() {
+        use encrypted_spaces_backend::merk_storage::proofs::verify_store_tracer_proof;
+        use encrypted_spaces_changelog_core::{ReadOp, StoreReadOp};
+
+        let (state, prefix) = store_read_test_state().await;
+        let root = state.db.root_hash();
+
+        // A limit-2 proof cannot be re-verified as if it were an unlimited read:
+        // the reconstructed narrowing would demand a different ReadOp.
+        let limited = StoreReadOp {
+            op: ReadOp::Prefix(prefix.clone()),
+            descending: false,
+            limit: Some(2),
+        };
+        let proof = state.handle_store_read(&limited, &root).await.unwrap();
+
+        let unlimited = StoreReadOp::new(ReadOp::Prefix(prefix));
+        assert!(verify_store_tracer_proof(&unlimited, &proof, &root).is_err());
     }
 
     #[tokio::test]
     async fn handle_store_read_rejects_empty_commitment() {
-        use encrypted_spaces_changelog_core::ReadOp;
+        use encrypted_spaces_changelog_core::{ReadOp, StoreReadOp};
 
-        let (state, entry_key) = store_read_test_state().await;
+        let (state, prefix) = store_read_test_state().await;
         let err = state
-            .handle_store_read(&ReadOp::Key(entry_key), &[])
+            .handle_store_read(&StoreReadOp::new(ReadOp::Prefix(prefix)), &[])
             .await
             .expect_err("empty commitment must be rejected");
         assert!(matches!(err, SdkError::ValidationError(_)));
@@ -3727,33 +3800,14 @@ mod tests {
 
     #[tokio::test]
     async fn handle_store_read_stale_commitment_requires_fast_forward() {
-        use encrypted_spaces_changelog_core::ReadOp;
+        use encrypted_spaces_changelog_core::{ReadOp, StoreReadOp};
 
-        let (state, entry_key) = store_read_test_state().await;
+        let (state, prefix) = store_read_test_state().await;
         let err = state
-            .handle_store_read(&ReadOp::Key(entry_key), &[0u8; 32])
+            .handle_store_read(&StoreReadOp::new(ReadOp::Prefix(prefix)), &[0u8; 32])
             .await
             .expect_err("commitment mismatch must be rejected");
         assert!(matches!(err, SdkError::FastForwardRequired { .. }));
-    }
-
-    #[tokio::test]
-    async fn handle_store_read_rejects_range() {
-        use encrypted_spaces_changelog_core::ReadOp;
-
-        let (state, _entry_key) = store_read_test_state().await;
-        let root = state.db.root_hash();
-        let err = state
-            .handle_store_read(
-                &ReadOp::Range {
-                    start: b"a".to_vec(),
-                    end: b"z".to_vec(),
-                },
-                &root,
-            )
-            .await
-            .expect_err("range reads are unsupported");
-        assert!(matches!(err, SdkError::ValidationError(_)));
     }
 
     fn noop_collecting_builder() -> CollectingOperationBuilder {

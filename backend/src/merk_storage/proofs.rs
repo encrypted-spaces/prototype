@@ -15,7 +15,7 @@ use {
 #[cfg(any(feature = "merk", feature = "merk_verify"))]
 use {
     encrypted_spaces_changelog_core::{
-        prefix_successor, verify_trace, ReadOp, TraceStep, TracerProof,
+        prefix_successor, verify_trace, ReadOp, StoreReadOp, TraceStep, TracerProof,
     },
     merk::proofs::Query as MerkQuery,
     std::collections::HashMap,
@@ -244,6 +244,37 @@ impl MerkStorage {
             .map_err(|e| SdkError::DatabaseError(format!("Failed to generate proof: {e:?}")))?;
 
         Ok(proof)
+    }
+
+    /// Generate a tracer proof for a namespaced key-value store read.
+    ///
+    /// Discovers the present keys in the read's base range, applies the limit
+    /// narrowing (so a limited read proves and transfers only the keys it
+    /// returns), and traces a single read step over the narrowed range. The
+    /// verifier reconstructs the same narrowing from the authenticated entries
+    /// (see [`verify_store_tracer_proof`]).
+    pub async fn prove_store_read(&self, read: &StoreReadOp) -> Result<Vec<u8>> {
+        let Some(tree) = self.merk.snapshot() else {
+            return Err(SdkError::DatabaseError(
+                "Tree is empty, cannot generate store read proof".to_string(),
+            ));
+        };
+
+        // Discover present keys in the base range (ascending) so we can apply
+        // the same limit narrowing the verifier will re-derive from the proof.
+        let (start, end) = store_op_range(&read.op)?;
+        let present: Vec<Vec<u8>> = collect_range(&tree, &start, Some(&end))
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        let narrowing = store_narrowing_keys(&present, read.descending, read.limit);
+        let narrowed = narrow_store_op(&read.op, read.descending, read.limit, &narrowing)?;
+
+        let steps = vec![InputStep::Read(vec![narrowed])];
+        let tracer_proof = create_trace_full(&tree, &steps);
+        postcard::to_allocvec(&StoreReadProof { tracer_proof }).map_err(|e| {
+            SdkError::SerializationError(format!("Failed to serialize StoreReadProof: {e}"))
+        })
     }
 
     /// Generate a proof for a SELECT query.
@@ -591,8 +622,7 @@ fn verify_merk_query(
 }
 
 /// The half-open key range covering every key with the given prefix:
-/// `[prefix, prefix_end)`. Shared by [`MerkStorage::prove_prefix`] and
-/// [`verify_store_proof`] so prover and verifier agree on the exact range.
+/// `[prefix, prefix_end)`. Used by [`MerkStorage::prove_prefix`].
 fn prefix_scan_range(prefix: &[u8]) -> std::ops::Range<Vec<u8>> {
     let mut end = prefix.to_vec();
     if let Some(last) = end.last_mut() {
@@ -605,36 +635,145 @@ fn prefix_scan_range(prefix: &[u8]) -> std::ops::Range<Vec<u8>> {
     prefix.to_vec()..end
 }
 
-/// Verify a key-value store read proof for a single `ReadOp` and return the
-/// authenticated rows.
-///
-/// Stores have no columns or schema, so `main_rows` / `rows_by_table` are
-/// empty; only `kv_pairs` (raw, still-encrypted entry values) and the
-/// authenticated `read_ops` are populated, for the cache to ingest.
+/// The half-open `[start, end)` byte range a store read op covers, in
+/// entry-key space. Shared by prover and verifier so both agree on the base
+/// range before any limit narrowing.
 #[cfg(any(feature = "merk", feature = "merk_verify"))]
-pub fn verify_store_proof(
-    read_op: &ReadOp,
+fn store_op_range(op: &ReadOp) -> Result<(Vec<u8>, Vec<u8>)> {
+    Ok(match op {
+        ReadOp::Key(k) => (k.clone(), prefix_successor_required(k)?),
+        ReadOp::Prefix(p) => (p.clone(), prefix_successor_required(p)?),
+        ReadOp::Range { start, end } => (start.clone(), end.clone()),
+    })
+}
+
+/// The kept key set for a limited store read: the first (or last, if
+/// `descending`) `limit` present keys, in `[start, end)` byte order.
+///
+/// `present_asc` must be the present entry keys in ascending byte order (the
+/// order `collect_range` yields on the prover, and the order the authenticated
+/// proof entries arrive in on the verifier). Both sides call this so the
+/// narrowing agrees.
+#[cfg(any(feature = "merk", feature = "merk_verify"))]
+fn store_narrowing_keys(
+    present_asc: &[Vec<u8>],
+    descending: bool,
+    limit: Option<u32>,
+) -> std::collections::BTreeSet<Vec<u8>> {
+    let mut keys: Vec<Vec<u8>> = present_asc.to_vec();
+    if descending {
+        keys.reverse();
+    }
+    if let Some(limit) = limit {
+        keys.truncate(limit as usize);
+    }
+    keys.into_iter().collect()
+}
+
+/// Narrow a store read's base range to exactly the kept keys when a limit
+/// binds. Ascending keeps the low end and tightens `end` past the largest
+/// kept key; descending keeps the high end and lifts `start` to the smallest
+/// kept key. Mirrors the SELECT [`narrow_first_op`] limit logic (no cursor).
+#[cfg(any(feature = "merk", feature = "merk_verify"))]
+fn narrow_store_op(
+    op: &ReadOp,
+    descending: bool,
+    limit: Option<u32>,
+    narrowing_keys: &std::collections::BTreeSet<Vec<u8>>,
+) -> Result<ReadOp> {
+    let limit_narrows = matches!(limit, Some(limit)
+        if narrowing_keys.len() >= limit as usize);
+    if !limit_narrows {
+        return Ok(op.clone());
+    }
+    let (mut start, mut end) = store_op_range(op)?;
+    if descending {
+        start = narrowing_keys.first().unwrap().clone();
+    } else {
+        end = prefix_successor_required(narrowing_keys.last().unwrap())?;
+    }
+    Ok(ReadOp::Range { start, end })
+}
+
+/// Tracer-based proof for a namespaced key-value store read. Wraps a single
+/// `TracerProof` with one `InputStep::Read` whose (possibly limit-narrowed)
+/// `ReadOp` authenticates the complete set of present keys in the proven
+/// range — so a limited read proves and transfers only the keys it returns.
+#[cfg(any(feature = "merk", feature = "merk_verify"))]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoreReadProof {
+    tracer_proof: TracerProof,
+}
+
+/// Verify a key-value store read proof and return the authenticated rows.
+///
+/// Re-derives the limit narrowing from the authenticated entries and demands
+/// `ReadOp` set-equality against the proof, so the server cannot omit,
+/// reorder, or invent keys. Stores have no columns or schema, so `main_rows`
+/// / `rows_by_table` are empty; only `kv_pairs` (raw, still-encrypted entry
+/// values, ascending) and the authenticated `read_ops` are populated, for the
+/// cache to ingest. Presentation order/limit/decrypt happen in the runtime
+/// `Store` layer.
+#[cfg(any(feature = "merk", feature = "merk_verify"))]
+pub fn verify_store_tracer_proof(
+    read: &StoreReadOp,
     proof: &[u8],
     commitment: &[u8; 32],
 ) -> Result<VerifiedRows> {
-    let kv_pairs = match read_op {
-        ReadOp::Key(key) => verify_proof(proof, commitment, std::slice::from_ref(key))?,
-        ReadOp::Prefix(prefix) => {
-            let mut query = MerkQuery::new();
-            query.insert_range(prefix_scan_range(prefix));
-            verify_merk_query(proof, query, *commitment)?
-        }
-        ReadOp::Range { start, end } => {
-            let mut query = MerkQuery::new();
-            query.insert_range(start.clone()..end.clone());
-            verify_merk_query(proof, query, *commitment)?
-        }
+    let store_proof: StoreReadProof = postcard::from_bytes(proof).map_err(|e| {
+        SdkError::SerializationError(format!("Failed to deserialize StoreReadProof: {e}"))
+    })?;
+    let tracer = &store_proof.tracer_proof;
+
+    if tracer.expected_start_root != *commitment {
+        return Err(SdkError::ValidationError(
+            "Store read proof root does not match commitment".into(),
+        ));
+    }
+    // Read-only: net change is zero and no write steps sneak in.
+    if tracer.expected_start_root != tracer.expected_end_root {
+        return Err(SdkError::ValidationError(
+            "Read-only store proof must have start_root == end_root".into(),
+        ));
+    }
+    if tracer
+        .steps
+        .iter()
+        .any(|step| matches!(step, TraceStep::Write(_)))
+    {
+        return Err(SdkError::ValidationError(
+            "Read-only store proof must not contain write steps".into(),
+        ));
+    }
+
+    let read_results = verify_trace(tracer).map_err(|_| {
+        SdkError::ValidationError("Store read TracerProof verification failed".into())
+    })?;
+    let Some(step) = read_results.first() else {
+        return Err(SdkError::ValidationError(
+            "Store read proof missing its read step".into(),
+        ));
     };
+
+    // Authenticated entries, ascending (proof/BST order).
+    let entries: Vec<(Vec<u8>, Vec<u8>)> = step
+        .iter()
+        .flat_map(|pr| pr.results.iter().cloned())
+        .collect();
+    let present_asc: Vec<Vec<u8>> = entries.iter().map(|(k, _)| k.clone()).collect();
+
+    // Reconstruct the server's narrowing from the authenticated entries and
+    // require the proven ReadOp to match exactly.
+    let narrowing = store_narrowing_keys(&present_asc, read.descending, read.limit);
+    let expected = narrow_store_op(&read.op, read.descending, read.limit, &narrowing)?;
+    let actual: Vec<&ReadOp> = step.iter().map(|pr| &pr.op).collect();
+    verify_read_ops(&[expected], &actual, "store read proof")?;
+
     Ok(VerifiedRows {
         main_rows: Vec::new(),
         rows_by_table: HashMap::new(),
-        kv_pairs,
-        read_ops: vec![read_op.clone()],
+        kv_pairs: entries,
+        read_ops: actual.into_iter().cloned().collect(),
     })
 }
 

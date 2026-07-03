@@ -43,21 +43,30 @@ message SelectResponse {
   repeated bytes values_sidecar = 2;    // Full bytes for hash-backed columns; receiver re-hashes.
 }
 
-// Read from a namespaced key-value store. The `read_op` oneof mirrors the two
-// `ReadOp` variants the store transports support: a single `key` point read,
-// or a `prefix` scan. (`ReadOp::Range` is rejected client-side, so it has no
-// wire form here.) `commitment` is the client's data commitment; the server
-// only proves against a matching root and otherwise returns fast_forward_required.
+// Read from a namespaced key-value store. The `selector` oneof is the base
+// range: a single `key` point read, a `prefix` scan, or an explicit `range`.
+// `descending` + `limit` narrow the read to the first (or last) N present keys,
+// bound provably into the returned proof. `commitment` is the client's data
+// commitment; the server only proves against a matching root and otherwise
+// returns fast_forward_required.
 message StoreReadRequest {
-  oneof read_op {
+  oneof selector {
     bytes key = 1;
     bytes prefix = 2;
+    StoreReadRange range = 4;
   }
   bytes commitment = 3;
+  bool descending = 5;
+  optional uint32 limit = 6;
+}
+
+message StoreReadRange {
+  bytes start = 1;    // inclusive
+  bytes end = 2;      // exclusive
 }
 
 message StoreReadResponse {
-  bytes proof = 1;    // Merk proof over the requested key/prefix; values stay encrypted.
+  bytes proof = 1;    // Tracer proof over the (narrowed) range; values stay encrypted.
 }
 
 message ChangeRequest {

@@ -115,11 +115,11 @@ impl Transport for CountingTransport {
 
     async fn store_read(
         &self,
-        read_op: encrypted_spaces_changelog_core::ReadOp,
+        read: encrypted_spaces_changelog_core::StoreReadOp,
         commitment: &[u8; 32],
     ) -> Result<VerifiedRows> {
         self.store_read_calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.store_read(read_op, commitment).await
+        self.inner.store_read(read, commitment).await
     }
 
     fn as_any(&self) -> &dyn Any {

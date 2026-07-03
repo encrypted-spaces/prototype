@@ -217,40 +217,82 @@ impl KvCache {
         true
     }
 
-    /// Try to answer a store point read (`get`) from the cache.
+    /// Try to answer a store read (`get().all()`/`first()`/`last()`/`limit()`)
+    /// from the cache, honoring `descending` and `limit`.
     ///
-    /// `Hit(Some(bytes))` returns the still-encrypted stored value;
-    /// `Hit(None)` is an authenticated absence (tombstone or a known gap in
-    /// a covered range); `Miss` means the cache can't answer and the caller
-    /// must fetch. Decryption happens in the runtime layer.
-    pub fn store_get(&self, store: &str, key: &[u8]) -> CacheResult<Option<Vec<u8>>> {
-        let entry_key = keys::store_entry_key(store, key);
-        match self.storage.lookup_point(&entry_key) {
-            Some(value) => CacheResult::Hit(value),
-            None => CacheResult::Miss,
+    /// `op` is the base selector in entry-key space (`Key` for a point, or a
+    /// `Prefix`/`Range` scan). Returns raw `(entry_key, still-encrypted value)`
+    /// pairs in the requested order, already truncated to `limit`.
+    ///
+    /// A limited read hits when the cache fully covers enough of the range
+    /// *from the read's leading end* — the covered prefix (ascending) or suffix
+    /// (descending) — to contain the first `limit` present keys, or when the
+    /// whole range is covered. An unlimited read needs full coverage. Anything
+    /// short returns `Miss` and the caller fetches a (narrowed) proof.
+    pub fn store_read(
+        &self,
+        op: &ReadOp,
+        descending: bool,
+        limit: Option<u32>,
+    ) -> CacheResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        // Point reads are answered from the point/interval map directly.
+        if let ReadOp::Key(k) = op {
+            return match self.storage.lookup_point(k) {
+                Some(Some(v)) => CacheResult::Hit(vec![(k.clone(), v)]),
+                Some(None) => CacheResult::Hit(Vec::new()),
+                None => CacheResult::Miss,
+            };
         }
-    }
 
-    /// Try to answer a whole-store scan (`list`) from the cache.
-    ///
-    /// `Hit` only when the entire store prefix is covered, so the returned
-    /// set is authoritative (no missing entries). Each pair is
-    /// `(raw_key_bytes, still-encrypted value)`.
-    pub fn store_scan(&self, store: &str) -> CacheResult<Vec<(Vec<u8>, Vec<u8>)>> {
-        let prefix = keys::store_prefix(store);
-        let Some(end) = prefix_successor(&prefix) else {
-            return CacheResult::Miss;
+        let (start, end) = match op {
+            ReadOp::Prefix(p) => match prefix_successor(p) {
+                Some(end) => (p.clone(), end),
+                None => return CacheResult::Miss,
+            },
+            ReadOp::Range { start, end } => (start.clone(), end.clone()),
+            ReadOp::Key(_) => unreachable!("handled above"),
         };
-        if !self.storage.covers_range(&prefix, &end) {
-            return CacheResult::Miss;
-        }
-        let mut out = Vec::new();
-        for (k, v) in self.storage.iter_range_present(&prefix, &end) {
-            if let Ok(ParsedKey::StoreEntry { key, .. }) = parse_key(k) {
-                out.push((key, v.clone()));
+
+        let collect = |lo: &[u8], hi: &[u8]| -> Vec<(Vec<u8>, Vec<u8>)> {
+            self.storage
+                .iter_range_present(lo, hi)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+
+        let Some(limit) = limit.map(|l| l as usize) else {
+            // Unlimited: require the whole range to be covered.
+            if !self.storage.covers_range(&start, &end) {
+                return CacheResult::Miss;
+            }
+            let mut pairs = collect(&start, &end);
+            if descending {
+                pairs.reverse();
+            }
+            return CacheResult::Hit(pairs);
+        };
+
+        if descending {
+            let covered_start = self.storage.covered_suffix_start(&start, &end);
+            let mut pairs = collect(&covered_start, &end);
+            pairs.reverse();
+            // Enough from the top, or the whole range is covered.
+            if pairs.len() >= limit || covered_start.as_slice() <= start.as_slice() {
+                pairs.truncate(limit);
+                CacheResult::Hit(pairs)
+            } else {
+                CacheResult::Miss
+            }
+        } else {
+            let covered_end = self.storage.covered_prefix_end(&start, &end);
+            let mut pairs = collect(&start, &covered_end);
+            if pairs.len() >= limit || covered_end.as_slice() >= end.as_slice() {
+                pairs.truncate(limit);
+                CacheResult::Hit(pairs)
+            } else {
+                CacheResult::Miss
             }
         }
-        CacheResult::Hit(out)
     }
 
     /// Try to answer `query` from the cache. Returns `Hit(rows)` if every

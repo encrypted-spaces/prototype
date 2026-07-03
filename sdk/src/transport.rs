@@ -75,15 +75,16 @@ pub trait Transport: Send + Sync + 'static {
         schemas: &HashMap<String, Schema>,
     ) -> Result<VerifiedRows>;
 
-    /// Read from a key-value store: prove the given `read_op` (a single
-    /// `ReadOp::Key` for `get`, or `ReadOp::Prefix` for a whole-store scan)
-    /// against `commitment`, verify it, and return the authenticated rows.
+    /// Read from a key-value store: prove `read` (a base `ReadOp` plus optional
+    /// order and limit) against `commitment`, verify the tracer proof, and
+    /// return the authenticated rows. A limited read proves and transfers only
+    /// the keys it returns.
     ///
-    /// The default errors "unsupported"; in-process transports override it.
-    /// A networked (proto) implementation is a follow-up.
+    /// The default errors "unsupported"; transports that can reach storage
+    /// override it.
     async fn store_read(
         &self,
-        _read_op: encrypted_spaces_changelog_core::ReadOp,
+        _read: encrypted_spaces_changelog_core::StoreReadOp,
         _commitment: &[u8; 32],
     ) -> Result<VerifiedRows> {
         Err(SdkError::ValidationError(

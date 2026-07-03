@@ -100,16 +100,22 @@ Use a store through the `Space::store` handle:
 ```rust
 let store = space.store("prefs")?;
 store.put("theme", b"dark".to_vec()).await?;
-let value = store.get("theme").await?;          // Option<Vec<u8>>
 store.delete("theme").await?;
-let ui = store.list_prefix("ui/").await?;        // Vec<(key, value)>, key order
+
+// Reads go through `get()`, a builder: pick a selector (key / prefix / range,
+// default whole store), an order (ascending / descending), and a bound
+// (limit / first / last), then run it with all/first/last.
+let theme = store.get().key("theme").first().await?;   // Option<(key, value)>
+let ui    = store.get().prefix("ui/").all().await?;     // Vec<(key, value)>, key order
+let head  = store.get().range("a", "m").limit(10).all().await?;
+let newest = store.get().last().await?;                 // largest key
 ```
 
 Notes and constraints:
 
 - **Open access, still authenticated.** Writes flow through the same zkVM verifier as table writes: it authenticates the writer's membership, checks the entries target a single declared store, and applies them. It performs no per-key authorization — there is no `allow` or `only_via_actions` for stores in this version, and a `store` block may not contain any children.
 - **Flat namespace.** A store name may not collide with a table (or another store), and may not start with `_`.
-- **Reads.** Served from the local KV cache when possible; a cache miss fetches and verifies a Merk proof, splices it in, and re-reads. (The networked transport's store read is a follow-up; in-process/`LocalTransport` is supported today.)
+- **Reads.** Served from the local KV cache when possible; a cache miss fetches and verifies a tracer proof, splices it in, and re-reads. Both in-process (`LocalTransport`) and networked (WebSocket) transports are supported. `limit`/`first`/`last` are **proof-bounded**: the proof authenticates only the keys returned (the first or last N of the selected range), not the whole store.
 - **Relationship to `_retention`.** Stores are the purpose-built primitive that the internal `_retention` "temporary KV-store shim" (`backend/src/internal_schemas.kdl`) anticipated; migrating retention state onto a store is future work.
 
 Per-store access control (`rules { allow ... }`, per-key ownership) and store actions are an explicit follow-up.

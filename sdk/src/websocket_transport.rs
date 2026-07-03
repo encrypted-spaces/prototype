@@ -3,12 +3,14 @@ use base64::Engine;
 use encrypted_spaces_backend::{
     access_control::AuthContext,
     error::{Result, SdkError},
-    merk_storage::proofs::{verify_query_proof_with_hashed_values, verify_store_proof, VerifiedRows},
+    merk_storage::proofs::{
+        verify_query_proof_with_hashed_values, verify_store_tracer_proof, VerifiedRows,
+    },
     proto::{
         db_request, db_response, store_read_request, values_sidecar_from_proto,
         values_sidecar_to_proto, ws_frame, AddMemberRequest, ChangeRequest, DbRequest, DbResponse,
-        Ephemeral, FastForwardRequest, RemoveMemberRequest, SelectRequest, StoreReadRequest,
-        WsFrame,
+        Ephemeral, FastForwardRequest, RemoveMemberRequest, SelectRequest, StoreReadRange,
+        StoreReadRequest, WsFrame,
     },
     query::Query,
     schema::Schema,
@@ -729,28 +731,28 @@ impl Transport for WebSocketTransport {
 
     async fn store_read(
         &self,
-        read_op: encrypted_spaces_changelog_core::ReadOp,
+        read: encrypted_spaces_changelog_core::StoreReadOp,
         commitment: &[u8; 32],
     ) -> Result<VerifiedRows> {
         use encrypted_spaces_changelog_core::ReadOp;
 
-        // Mirror the ReadOp variants onto the wire oneof. Range reads have no
-        // wire form and are rejected here, matching `LocalTransport::store_read`.
-        let proto_read_op = match &read_op {
-            ReadOp::Key(key) => store_read_request::ReadOp::Key(key.clone()),
-            ReadOp::Prefix(prefix) => store_read_request::ReadOp::Prefix(prefix.clone()),
-            ReadOp::Range { .. } => {
-                return Err(SdkError::ValidationError(
-                    "store_read does not support range reads".into(),
-                ));
-            }
+        // Map the base ReadOp onto the wire selector oneof.
+        let selector = match &read.op {
+            ReadOp::Key(key) => store_read_request::Selector::Key(key.clone()),
+            ReadOp::Prefix(prefix) => store_read_request::Selector::Prefix(prefix.clone()),
+            ReadOp::Range { start, end } => store_read_request::Selector::Range(StoreReadRange {
+                start: start.clone(),
+                end: end.clone(),
+            }),
         };
 
         let req = DbRequest {
             request_id: uuid::Uuid::new_v4().to_string(),
             operation: Some(db_request::Operation::StoreRead(StoreReadRequest {
-                read_op: Some(proto_read_op),
+                selector: Some(selector),
                 commitment: commitment.to_vec(),
+                descending: read.descending,
+                limit: read.limit,
             })),
         };
 
@@ -758,8 +760,8 @@ impl Transport for WebSocketTransport {
 
         if let Some(db_response::Result::StoreRead(store_resp)) = resp.result {
             // The server proved against its root; verify against our own
-            // commitment using the original ReadOp we still hold.
-            verify_store_proof(&read_op, &store_resp.proof, commitment)
+            // commitment, re-deriving the narrowing from the read descriptor.
+            verify_store_tracer_proof(&read, &store_resp.proof, commitment)
         } else {
             Err(SdkError::DatabaseError("unexpected response type".into()))
         }

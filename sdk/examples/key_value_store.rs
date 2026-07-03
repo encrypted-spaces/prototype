@@ -1,8 +1,13 @@
-//! Key-value store example — demonstrates the Store API (put/get/delete/list_prefix).
+//! Key-value store example — demonstrates the Store API: put/delete writes and
+//! the `get()` read builder (key / prefix / range selectors, ascending /
+//! descending order, and provable `limit` / `first` / `last`).
 //!
 //! A `store` is a namespaced, open key-value map: any space member can read,
 //! write, overwrite, or delete any key. Values are encrypted client-side by
 //! default. Keys and values are opaque bytes; this demo uses UTF-8 strings.
+//!
+//! Reads are backed by a tracer proof, so a limited read (`first`/`last`/
+//! `limit`) proves and transfers only the keys it returns — not the whole store.
 //!
 //! Run with:
 //!   cargo run --example key_value_store -p encrypted-spaces-sdk --features local-transport,testing
@@ -11,12 +16,13 @@ use encrypted_spaces_backend::app_schema::SchemaStore;
 use encrypted_spaces_sdk::testing::initial_internal_data_commitment;
 use encrypted_spaces_sdk::{ApplicationSchema, LocalTransport, Space};
 
-/// Render an optional store value as readable text.
-fn show(value: &Option<Vec<u8>>) -> String {
-    match value {
-        Some(bytes) => format!("Some({:?})", String::from_utf8_lossy(bytes)),
-        None => "None".to_string(),
-    }
+/// Render a `(key, value)` pair as readable text.
+fn show(pair: &(Vec<u8>, Vec<u8>)) -> String {
+    format!(
+        "{} = {}",
+        String::from_utf8_lossy(&pair.0),
+        String::from_utf8_lossy(&pair.1),
+    )
 }
 
 #[tokio::main]
@@ -40,12 +46,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = space.store("prefs")?;
 
     // -----------------------
-    // PUT & GET
+    // PUT & POINT READ
     // -----------------------
-    println!("=== Put & get ===");
+    println!("=== Put & point read ===");
     store.put("theme", b"dark".to_vec()).await?;
     println!("  put theme = dark");
-    println!("  get theme -> {}", show(&store.get("theme").await?));
+    let theme = store.get().key("theme").first().await?;
+    println!("  get key theme -> {:?}", theme.as_ref().map(show));
     println!();
 
     // -----------------------
@@ -53,33 +60,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // -----------------------
     println!("=== Overwrite (latest value wins) ===");
     store.put("theme", b"light".to_vec()).await?;
-    println!("  put theme = light");
-    println!("  get theme -> {}", show(&store.get("theme").await?));
+    let theme = store.get().key("theme").first().await?;
+    println!(
+        "  put theme = light; get key theme -> {:?}",
+        theme.as_ref().map(show)
+    );
     println!();
 
     // -----------------------
     // MISSING KEY
     // -----------------------
-    println!("=== Missing key returns None ===");
-    println!("  get absent -> {}", show(&store.get("absent").await?));
+    println!("=== Missing key ===");
+    let absent = store.get().key("absent").first().await?;
+    println!("  get key absent -> {absent:?}");
     println!();
 
     // -----------------------
     // PREFIX SCAN
     // -----------------------
-    println!("=== Prefix scan (list_prefix) ===");
+    println!("=== Prefix scan ===");
     store.put("ui/theme", b"light".to_vec()).await?;
     store.put("ui/lang", b"en".to_vec()).await?;
     store.put("net/proxy", b"none".to_vec()).await?;
     println!("  put ui/theme, ui/lang, net/proxy");
-    println!("  list_prefix(\"ui/\") in key order:");
-    for (key, value) in store.list_prefix("ui/").await? {
-        println!(
-            "    {} = {}",
-            String::from_utf8_lossy(&key),
-            String::from_utf8_lossy(&value),
-        );
+    println!("  get prefix \"ui/\" all:");
+    for pair in store.get().prefix("ui/").all().await? {
+        println!("    {}", show(&pair));
     }
+    println!();
+
+    // -----------------------
+    // RANGE + LIMIT (provable)
+    // -----------------------
+    println!("=== Range & limit ===");
+    for k in ["a", "b", "c", "d", "e"] {
+        store.put(k, format!("v-{k}").into_bytes()).await?;
+    }
+    println!("  put a, b, c, d, e");
+    println!("  get range [a, d) all:");
+    for pair in store.get().range("a", "d").all().await? {
+        println!("    {}", show(&pair));
+    }
+    println!("  get range [a, e) limit 2 (proof covers only these two):");
+    for pair in store.get().range("a", "e").limit(2).all().await? {
+        println!("    {}", show(&pair));
+    }
+    println!();
+
+    // -----------------------
+    // FIRST / LAST
+    // -----------------------
+    println!("=== First & last ===");
+    let first = store.get().range("a", "e").first().await?;
+    let last = store.get().range("a", "e").last().await?;
+    println!("  first key in [a, e) -> {:?}", first.as_ref().map(show));
+    println!("  last key in  [a, e) -> {:?}", last.as_ref().map(show));
     println!();
 
     // -----------------------
@@ -87,8 +122,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // -----------------------
     println!("=== Delete ===");
     store.delete("theme").await?;
-    println!("  delete theme");
-    println!("  get theme -> {}", show(&store.get("theme").await?));
+    let theme = store.get().key("theme").first().await?;
+    println!("  delete theme; get key theme -> {theme:?}");
     println!();
 
     Ok(())

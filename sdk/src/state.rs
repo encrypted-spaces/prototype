@@ -3,8 +3,8 @@ use crate::sync_decrypt::SyncDecryptContext;
 use crate::SpaceKeyManager;
 use crate::{DataCommitment, Space, SpaceId, Transport};
 use encrypted_spaces_acl_types::Action;
-use encrypted_spaces_backend::app_schema::SchemaStore;
 use encrypted_spaces_backend::access_control::AuthContext;
+use encrypted_spaces_backend::app_schema::SchemaStore;
 use encrypted_spaces_backend::{
     error::{Result, SdkError},
     schema::Schema,
