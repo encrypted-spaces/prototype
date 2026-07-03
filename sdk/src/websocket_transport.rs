@@ -3,11 +3,12 @@ use base64::Engine;
 use encrypted_spaces_backend::{
     access_control::AuthContext,
     error::{Result, SdkError},
-    merk_storage::proofs::{verify_query_proof_with_hashed_values, VerifiedRows},
+    merk_storage::proofs::{verify_query_proof_with_hashed_values, verify_store_proof, VerifiedRows},
     proto::{
-        db_request, db_response, values_sidecar_from_proto, values_sidecar_to_proto, ws_frame,
-        AddMemberRequest, ChangeRequest, DbRequest, DbResponse, Ephemeral, FastForwardRequest,
-        RemoveMemberRequest, SelectRequest, WsFrame,
+        db_request, db_response, store_read_request, values_sidecar_from_proto,
+        values_sidecar_to_proto, ws_frame, AddMemberRequest, ChangeRequest, DbRequest, DbResponse,
+        Ephemeral, FastForwardRequest, RemoveMemberRequest, SelectRequest, StoreReadRequest,
+        WsFrame,
     },
     query::Query,
     schema::Schema,
@@ -569,6 +570,7 @@ impl WebSocketTransport {
                 db_request::Operation::RemoveMember(_) => "RemoveMember",
                 db_request::Operation::List(_) => "List",
                 db_request::Operation::FetchMyKeyDelivery(_) => "FetchMyKeyDelivery",
+                db_request::Operation::StoreRead(_) => "StoreRead",
             }
         }
         let opn = req.operation.as_ref().map(op_name).unwrap_or("<none>");
@@ -720,6 +722,44 @@ impl Transport for WebSocketTransport {
                 schemas,
                 &hashed_values,
             )
+        } else {
+            Err(SdkError::DatabaseError("unexpected response type".into()))
+        }
+    }
+
+    async fn store_read(
+        &self,
+        read_op: encrypted_spaces_changelog_core::ReadOp,
+        commitment: &[u8; 32],
+    ) -> Result<VerifiedRows> {
+        use encrypted_spaces_changelog_core::ReadOp;
+
+        // Mirror the ReadOp variants onto the wire oneof. Range reads have no
+        // wire form and are rejected here, matching `LocalTransport::store_read`.
+        let proto_read_op = match &read_op {
+            ReadOp::Key(key) => store_read_request::ReadOp::Key(key.clone()),
+            ReadOp::Prefix(prefix) => store_read_request::ReadOp::Prefix(prefix.clone()),
+            ReadOp::Range { .. } => {
+                return Err(SdkError::ValidationError(
+                    "store_read does not support range reads".into(),
+                ));
+            }
+        };
+
+        let req = DbRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            operation: Some(db_request::Operation::StoreRead(StoreReadRequest {
+                read_op: Some(proto_read_op),
+                commitment: commitment.to_vec(),
+            })),
+        };
+
+        let resp = self.send_request(req).await?;
+
+        if let Some(db_response::Result::StoreRead(store_resp)) = resp.result {
+            // The server proved against its root; verify against our own
+            // commitment using the original ReadOp we still hold.
+            verify_store_proof(&read_op, &store_resp.proof, commitment)
         } else {
             Err(SdkError::DatabaseError("unexpected response type".into()))
         }

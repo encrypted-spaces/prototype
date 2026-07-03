@@ -124,6 +124,7 @@ pub(crate) fn op_name(op: &Option<db_request::Operation>) -> &'static str {
         db_request::Operation::RemoveMember(_) => "RemoveMember",
         db_request::Operation::FetchMyKeyDelivery(_) => "FetchMyKeyDelivery",
         db_request::Operation::Retention(_) => "Retention",
+        db_request::Operation::StoreRead(_) => "StoreRead",
     }
 }
 
@@ -2424,6 +2425,46 @@ impl SpaceState {
         })
     }
 
+    /// Verify the client's data commitment matches the server root, then
+    /// generate a store-read proof for `read_op`. Returns the raw Merk proof
+    /// bytes; the client verifies them with `verify_store_proof`. Mirrors
+    /// [`SpaceState::handle_select`] — on commitment mismatch it returns
+    /// `SdkError::FastForwardRequired` rather than a proof the client can't
+    /// verify. Range reads are rejected (see `ReadOp::Range`).
+    pub async fn handle_store_read(
+        &self,
+        read_op: &encrypted_spaces_changelog_core::ReadOp,
+        commitment: &[u8],
+    ) -> Result<Vec<u8>, SdkError> {
+        use encrypted_spaces_changelog_core::ReadOp;
+
+        if commitment.is_empty() {
+            return Err(SdkError::ValidationError(
+                "store read request must include a data commitment".into(),
+            ));
+        }
+
+        let root = self.db.root_hash();
+        if commitment != root {
+            return Err(SdkError::FastForwardRequired {
+                reason: format!(
+                    "client data commitment does not match server root \
+                     (client={}, server={})",
+                    hex::encode(commitment),
+                    hex::encode(root),
+                ),
+            });
+        }
+
+        match read_op {
+            ReadOp::Key(key) => self.db.prove_keys(std::slice::from_ref(key)).await,
+            ReadOp::Prefix(prefix) => self.db.prove_prefix(prefix).await,
+            ReadOp::Range { .. } => Err(SdkError::ValidationError(
+                "store_read does not support range reads".into(),
+            )),
+        }
+    }
+
     ///
     /// Returns fast-forward data that includes a RISC0 proof when available:
     /// - If the client is at change_id 0, they get the full proof.
@@ -3173,6 +3214,9 @@ async fn process_request_directly(
         Some(db_request::Operation::Retention(req)) => {
             handle_retention_request(&request.request_id, req, &app_cfg, &auth_context).await
         }
+        Some(db_request::Operation::StoreRead(req)) => {
+            handle_store_read(&request.request_id, req, &app_cfg, &auth_context).await
+        }
         Some(db_request::Operation::FetchMyKeyDelivery(req)) => {
             crate::key_delivery::handle_fetch_my_key_delivery_request(
                 &request.request_id,
@@ -3233,6 +3277,44 @@ async fn handle_select(
                 proof: select_response.proof,
                 values_sidecar: proto::values_sidecar_to_proto(&select_response.hashed_values),
             }),
+        ),
+        Err(SdkError::FastForwardRequired { reason, .. }) => {
+            fast_forward_required_response(request_id, &reason)
+        }
+        Err(e) => error_response(request_id, &e.to_string()),
+    }
+}
+
+async fn handle_store_read(
+    request_id: &str,
+    req: proto::StoreReadRequest,
+    app_cfg: &AppConfig,
+    auth_context: &AuthContext,
+) -> DbResponse {
+    use encrypted_spaces_changelog_core::ReadOp;
+    use proto::store_read_request::ReadOp as ProtoReadOp;
+
+    let read_op = match req.read_op {
+        Some(ProtoReadOp::Key(key)) => ReadOp::Key(key),
+        Some(ProtoReadOp::Prefix(prefix)) => ReadOp::Prefix(prefix),
+        None => return error_response(request_id, "missing_read_op"),
+    };
+
+    log::info!(
+        "space={} store_read: request_id={request_id} read_op={read_op:?}",
+        auth_context.space_id
+    );
+
+    let space = get_or_create_space(auth_context.space_id, Some(app_cfg)).await;
+    let result = space
+        .lock()
+        .await
+        .handle_store_read(&read_op, &req.commitment)
+        .await;
+    match result {
+        Ok(proof) => ok_response(
+            request_id,
+            db_response::Result::StoreRead(proto::StoreReadResponse { proof }),
         ),
         Err(SdkError::FastForwardRequired { reason, .. }) => {
             fast_forward_required_response(request_id, &reason)
@@ -3569,6 +3651,109 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    async fn store_read_test_state() -> (SpaceState, Vec<u8>) {
+        use encrypted_spaces_backend::merk_storage::Op;
+        use encrypted_spaces_storage_encoding::keys::store_entry_key;
+
+        let state = SpaceState::init_server(
+            None,
+            Some(SpaceInitConfig {
+                space_id: SpaceId::random(),
+                artifact_path: None,
+                verbose_logfile: None,
+                bootstrap_data: BootstrapDataSource::None,
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Seed one store entry directly into the tree. `handle_store_read`
+        // proves over the raw (still-encrypted) stored bytes, so any bytes work.
+        let entry_key = store_entry_key("prefs", b"theme");
+        state
+            .db
+            .apply_batch_ops(vec![(entry_key.clone(), Op::Put(b"ciphertext".to_vec()))])
+            .unwrap();
+        (state, entry_key)
+    }
+
+    #[tokio::test]
+    async fn handle_store_read_key_proof_verifies_and_carries_value() {
+        use encrypted_spaces_backend::merk_storage::proofs::verify_store_proof;
+        use encrypted_spaces_changelog_core::ReadOp;
+
+        let (state, entry_key) = store_read_test_state().await;
+        let root = state.db.root_hash();
+
+        let read_op = ReadOp::Key(entry_key.clone());
+        let proof = state.handle_store_read(&read_op, &root).await.unwrap();
+
+        // The proof the server generated must verify against the client's
+        // commitment and surface the stored (key, value) pair.
+        let verified = verify_store_proof(&read_op, &proof, &root).unwrap();
+        assert_eq!(verified.kv_pairs, vec![(entry_key, b"ciphertext".to_vec())]);
+    }
+
+    #[tokio::test]
+    async fn handle_store_read_prefix_proof_verifies() {
+        use encrypted_spaces_backend::merk_storage::proofs::verify_store_proof;
+        use encrypted_spaces_changelog_core::ReadOp;
+        use encrypted_spaces_storage_encoding::keys::store_prefix;
+
+        let (state, entry_key) = store_read_test_state().await;
+        let root = state.db.root_hash();
+
+        let read_op = ReadOp::Prefix(store_prefix("prefs"));
+        let proof = state.handle_store_read(&read_op, &root).await.unwrap();
+
+        let verified = verify_store_proof(&read_op, &proof, &root).unwrap();
+        assert_eq!(verified.kv_pairs, vec![(entry_key, b"ciphertext".to_vec())]);
+    }
+
+    #[tokio::test]
+    async fn handle_store_read_rejects_empty_commitment() {
+        use encrypted_spaces_changelog_core::ReadOp;
+
+        let (state, entry_key) = store_read_test_state().await;
+        let err = state
+            .handle_store_read(&ReadOp::Key(entry_key), &[])
+            .await
+            .expect_err("empty commitment must be rejected");
+        assert!(matches!(err, SdkError::ValidationError(_)));
+    }
+
+    #[tokio::test]
+    async fn handle_store_read_stale_commitment_requires_fast_forward() {
+        use encrypted_spaces_changelog_core::ReadOp;
+
+        let (state, entry_key) = store_read_test_state().await;
+        let err = state
+            .handle_store_read(&ReadOp::Key(entry_key), &[0u8; 32])
+            .await
+            .expect_err("commitment mismatch must be rejected");
+        assert!(matches!(err, SdkError::FastForwardRequired { .. }));
+    }
+
+    #[tokio::test]
+    async fn handle_store_read_rejects_range() {
+        use encrypted_spaces_changelog_core::ReadOp;
+
+        let (state, _entry_key) = store_read_test_state().await;
+        let root = state.db.root_hash();
+        let err = state
+            .handle_store_read(
+                &ReadOp::Range {
+                    start: b"a".to_vec(),
+                    end: b"z".to_vec(),
+                },
+                &root,
+            )
+            .await
+            .expect_err("range reads are unsupported");
+        assert!(matches!(err, SdkError::ValidationError(_)));
     }
 
     fn noop_collecting_builder() -> CollectingOperationBuilder {

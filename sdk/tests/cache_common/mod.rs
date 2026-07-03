@@ -5,6 +5,11 @@
 //! calls so tests can assert "this was a cache hit" by checking the
 //! counter didn't grow across a select. Modeled after the equivalent
 //! helper on Trevor's branch, trimmed to what these tests need.
+//!
+//! This module is included by several test binaries (`cache_regression`,
+//! `store_integration`), each of which uses a different subset of the
+//! helpers, so items unused by one binary trip `dead_code` there.
+#![allow(dead_code)]
 
 use std::any::Any;
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -12,6 +12,7 @@ message DbRequest {
     RemoveMemberRequest remove_member = 6;
     FetchMyKeyDeliveryRequest fetch_my_key_delivery = 8;
     RetentionRequest retention = 9;
+    StoreReadRequest store_read = 7;
   }
 }
 
@@ -27,6 +28,7 @@ message DbResponse {
     RemoveMemberResponse remove_member = 8;
     FetchMyKeyDeliveryResponse fetch_my_key_delivery = 10;
     RetentionResponse retention = 11;
+    StoreReadResponse store_read = 9;
   }
 }
 
@@ -39,6 +41,23 @@ message SelectRequest {
 message SelectResponse {
   bytes proof = 1;
   repeated bytes values_sidecar = 2;    // Full bytes for hash-backed columns; receiver re-hashes.
+}
+
+// Read from a namespaced key-value store. The `read_op` oneof mirrors the two
+// `ReadOp` variants the store transports support: a single `key` point read,
+// or a `prefix` scan. (`ReadOp::Range` is rejected client-side, so it has no
+// wire form here.) `commitment` is the client's data commitment; the server
+// only proves against a matching root and otherwise returns fast_forward_required.
+message StoreReadRequest {
+  oneof read_op {
+    bytes key = 1;
+    bytes prefix = 2;
+  }
+  bytes commitment = 3;
+}
+
+message StoreReadResponse {
+  bytes proof = 1;    // Merk proof over the requested key/prefix; values stay encrypted.
 }
 
 message ChangeRequest {
