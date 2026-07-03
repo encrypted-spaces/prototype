@@ -4,7 +4,7 @@ use encrypted_spaces_backend::{
     access_control::AuthContext,
     error::{Result, SdkError},
     merk_storage::proofs::{
-        verify_query_proof_with_hashed_values, verify_store_tracer_proof, VerifiedRows,
+        verify_query_proof_with_hashed_values, verify_store_tracer_proof, StoreReadOp, VerifiedRows,
     },
     proto::{
         db_request, db_response, store_read_request, values_sidecar_from_proto,
@@ -18,6 +18,7 @@ use encrypted_spaces_backend::{
 use encrypted_spaces_changelog_core::changelog::{
     Change, ChangeResponse, ChangelogEntry, FastForwardData,
 };
+use encrypted_spaces_changelog_core::ReadOp;
 use encrypted_spaces_key_manager::{InviteRequest, RekeyRequest};
 use prost::Message;
 pub(crate) const DEBUG: bool = true;
@@ -729,13 +730,7 @@ impl Transport for WebSocketTransport {
         }
     }
 
-    async fn store_read(
-        &self,
-        read: encrypted_spaces_changelog_core::StoreReadOp,
-        commitment: &[u8; 32],
-    ) -> Result<VerifiedRows> {
-        use encrypted_spaces_changelog_core::ReadOp;
-
+    async fn store_read(&self, read: StoreReadOp, commitment: &[u8; 32]) -> Result<VerifiedRows> {
         // Map the base ReadOp onto the wire selector oneof.
         let selector = match &read.op {
             ReadOp::Key(key) => store_read_request::Selector::Key(key.clone()),

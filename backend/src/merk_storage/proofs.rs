@@ -15,7 +15,7 @@ use {
 #[cfg(any(feature = "merk", feature = "merk_verify"))]
 use {
     encrypted_spaces_changelog_core::{
-        prefix_successor, verify_trace, ReadOp, StoreReadOp, TraceStep, TracerProof,
+        prefix_successor, verify_trace, ReadOp, TraceStep, TracerProof,
     },
     merk::proofs::Query as MerkQuery,
     std::collections::HashMap,
@@ -793,6 +793,35 @@ pub fn verify_proof(
     }
 
     verify_merk_query(proof, query, *expected_root)
+}
+
+/// A namespaced key-value store read: a base selector (`op`) plus optional
+/// ordering and limit. When `limit` is set, the proof is narrowed to exactly
+/// the returned keys (the first/last `limit` present keys of `op`'s range in
+/// byte order), so a limited read proves and transfers only what it returns.
+/// `descending` selects the high end (`last`); ascending (default) the low end
+/// (`first`). Both prover and verifier derive the same narrowing independently.
+#[cfg(any(feature = "merk", feature = "merk_verify"))]
+#[derive(Clone, Debug)]
+pub struct StoreReadOp {
+    /// Base range to read (`Key` for a point, `Prefix`/`Range` for a scan).
+    pub op: ReadOp,
+    /// Walk order: `false` = ascending (default), `true` = descending.
+    pub descending: bool,
+    /// Keep only the first (or last, if `descending`) N present keys.
+    pub limit: Option<u32>,
+}
+
+#[cfg(any(feature = "merk", feature = "merk_verify"))]
+impl StoreReadOp {
+    /// An unlimited ascending read of `op`.
+    pub fn new(op: ReadOp) -> Self {
+        Self {
+            op,
+            descending: false,
+            limit: None,
+        }
+    }
 }
 
 /// Result of verifying a SELECT proof: the post-grouping rows the caller

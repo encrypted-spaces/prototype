@@ -16,8 +16,8 @@ use encrypted_spaces_backend::{
     app_schema::{SchemaBundle, SchemaTable},
     error::SdkError,
     internal_schemas,
-    merk_storage::{execute_query, stored_value, MerkStorage},
-    proto::{self, db_request, db_response, DbRequest, DbResponse},
+    merk_storage::{execute_query, proofs::StoreReadOp, stored_value, MerkStorage},
+    proto::{self, db_request, db_response, store_read_request::Selector, DbRequest, DbResponse},
     query::{ComparisonOperator, Predicate, Query, QueryOperation, QueryParam},
     schema::{ColumnType, Schema, MAX_STRING_COLUMN_BYTES},
     schema_kdl,
@@ -30,6 +30,7 @@ use encrypted_spaces_changelog_core::changelog::{
 };
 use encrypted_spaces_changelog_core::ops::extract_row_id_from_invite_user_proof;
 use encrypted_spaces_changelog_core::time::validate_change_timestamp_at_acceptance;
+use encrypted_spaces_changelog_core::ReadOp;
 use encrypted_spaces_crypto::signature::Ed25519Signature;
 use encrypted_spaces_crypto::KeyCommitment;
 use encrypted_spaces_crypto::Mkem;
@@ -2436,7 +2437,7 @@ impl SpaceState {
     /// verify.
     pub async fn handle_store_read(
         &self,
-        read: &encrypted_spaces_changelog_core::StoreReadOp,
+        read: &StoreReadOp,
         commitment: &[u8],
     ) -> Result<Vec<u8>, SdkError> {
         if commitment.is_empty() {
@@ -3286,13 +3287,10 @@ async fn handle_store_read(
     app_cfg: &AppConfig,
     auth_context: &AuthContext,
 ) -> DbResponse {
-    use encrypted_spaces_changelog_core::{ReadOp, StoreReadOp};
-    use proto::store_read_request::Selector as ProtoSelector;
-
     let op = match req.selector {
-        Some(ProtoSelector::Key(key)) => ReadOp::Key(key),
-        Some(ProtoSelector::Prefix(prefix)) => ReadOp::Prefix(prefix),
-        Some(ProtoSelector::Range(range)) => ReadOp::Range {
+        Some(Selector::Key(key)) => ReadOp::Key(key),
+        Some(Selector::Prefix(prefix)) => ReadOp::Prefix(prefix),
+        Some(Selector::Range(range)) => ReadOp::Range {
             start: range.start,
             end: range.end,
         },
@@ -3590,12 +3588,16 @@ fn value_to_insert_query(table_name: &str, row: Value) -> Result<Query, ServerEr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use encrypted_spaces_backend::merk_storage::{column_key, column_key_placeholder};
+    use encrypted_spaces_backend::merk_storage::proofs::{verify_store_tracer_proof, VerifiedRows};
+    use encrypted_spaces_backend::merk_storage::{column_key, column_key_placeholder, Op};
     use encrypted_spaces_backend::schema::ColumnDefinition;
     use encrypted_spaces_changelog_core::changelog::ROOT_TREE_PATH;
     use encrypted_spaces_crypto::signature::{Ed25519Signature, SignatureKeyPair};
     use encrypted_spaces_key_manager::{CollectingOperationBuilder, SimpleKeyId};
     use encrypted_spaces_retention::simple_line2::StarkProver;
+    use encrypted_spaces_storage_encoding::keys::{
+        parse_key, store_entry_key, store_prefix, ParsedKey,
+    };
 
     // --- Async state tests ---
     // Use unique byte patterns per test to avoid SPACES map collisions when tests run in parallel.
@@ -3660,9 +3662,6 @@ mod tests {
     /// A space seeded with store `prefs` holding keys a,b,c,d (values va..vd),
     /// plus the store prefix for whole-store reads.
     async fn store_read_test_state() -> (SpaceState, Vec<u8>) {
-        use encrypted_spaces_backend::merk_storage::Op;
-        use encrypted_spaces_storage_encoding::keys::{store_entry_key, store_prefix};
-
         let state = SpaceState::init_server(
             None,
             Some(SpaceInitConfig {
@@ -3692,10 +3691,7 @@ mod tests {
     }
 
     // The user key each authenticated store entry decodes to.
-    fn store_keys(
-        verified: &encrypted_spaces_backend::merk_storage::proofs::VerifiedRows,
-    ) -> Vec<Vec<u8>> {
-        use encrypted_spaces_storage_encoding::keys::{parse_key, ParsedKey};
+    fn store_keys(verified: &VerifiedRows) -> Vec<Vec<u8>> {
         verified
             .kv_pairs
             .iter()
@@ -3708,9 +3704,6 @@ mod tests {
 
     #[tokio::test]
     async fn handle_store_read_whole_store_proof_verifies() {
-        use encrypted_spaces_backend::merk_storage::proofs::verify_store_tracer_proof;
-        use encrypted_spaces_changelog_core::{ReadOp, StoreReadOp};
-
         let (state, prefix) = store_read_test_state().await;
         let root = state.db.root_hash();
 
@@ -3726,9 +3719,6 @@ mod tests {
 
     #[tokio::test]
     async fn handle_store_read_ascending_limit_narrows_provably() {
-        use encrypted_spaces_backend::merk_storage::proofs::verify_store_tracer_proof;
-        use encrypted_spaces_changelog_core::{ReadOp, StoreReadOp};
-
         let (state, prefix) = store_read_test_state().await;
         let root = state.db.root_hash();
 
@@ -3747,9 +3737,6 @@ mod tests {
 
     #[tokio::test]
     async fn handle_store_read_descending_limit_narrows_provably() {
-        use encrypted_spaces_backend::merk_storage::proofs::verify_store_tracer_proof;
-        use encrypted_spaces_changelog_core::{ReadOp, StoreReadOp};
-
         let (state, prefix) = store_read_test_state().await;
         let root = state.db.root_hash();
 
@@ -3767,9 +3754,6 @@ mod tests {
 
     #[tokio::test]
     async fn handle_store_read_tampered_proof_is_rejected() {
-        use encrypted_spaces_backend::merk_storage::proofs::verify_store_tracer_proof;
-        use encrypted_spaces_changelog_core::{ReadOp, StoreReadOp};
-
         let (state, prefix) = store_read_test_state().await;
         let root = state.db.root_hash();
 
@@ -3788,8 +3772,6 @@ mod tests {
 
     #[tokio::test]
     async fn handle_store_read_rejects_empty_commitment() {
-        use encrypted_spaces_changelog_core::{ReadOp, StoreReadOp};
-
         let (state, prefix) = store_read_test_state().await;
         let err = state
             .handle_store_read(&StoreReadOp::new(ReadOp::Prefix(prefix)), &[])
@@ -3800,8 +3782,6 @@ mod tests {
 
     #[tokio::test]
     async fn handle_store_read_stale_commitment_requires_fast_forward() {
-        use encrypted_spaces_changelog_core::{ReadOp, StoreReadOp};
-
         let (state, prefix) = store_read_test_state().await;
         let err = state
             .handle_store_read(&StoreReadOp::new(ReadOp::Prefix(prefix)), &[0u8; 32])

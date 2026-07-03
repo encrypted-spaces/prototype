@@ -5,7 +5,7 @@ use encrypted_spaces_backend::{
     error::{Result, SdkError},
     internal_schemas::is_reserved_table_name,
     merk_storage::proofs::{
-        verify_query_proof_with_hashed_values, verify_store_tracer_proof, VerifiedRows,
+        verify_query_proof_with_hashed_values, verify_store_tracer_proof, StoreReadOp, VerifiedRows,
     },
     query::Query,
     schema::Schema,
@@ -405,11 +405,7 @@ impl Transport for LocalTransport {
         )
     }
 
-    async fn store_read(
-        &self,
-        read: encrypted_spaces_changelog_core::StoreReadOp,
-        commitment: &[u8; 32],
-    ) -> Result<VerifiedRows> {
+    async fn store_read(&self, read: StoreReadOp, commitment: &[u8; 32]) -> Result<VerifiedRows> {
         let state = self.state.lock().await;
         let proof = state.db.prove_store_read(&read).await?;
         verify_store_tracer_proof(&read, &proof, commitment)

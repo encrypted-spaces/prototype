@@ -9,8 +9,9 @@
 use std::sync::Arc;
 
 use encrypted_spaces_backend::error::{Result, SdkError};
+use encrypted_spaces_backend::merk_storage::proofs::StoreReadOp;
 use encrypted_spaces_changelog_core::changelog::OpType;
-use encrypted_spaces_changelog_core::{prefix_successor, ReadOp, StoreReadOp};
+use encrypted_spaces_changelog_core::{prefix_successor, ReadOp};
 use encrypted_spaces_crypto::encryption::{
     ciphertext_key_id, decrypt_field, encrypt_field, EncryptionKey,
 };

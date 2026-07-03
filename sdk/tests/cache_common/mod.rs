@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use encrypted_spaces_backend::access_control::AuthContext;
 use encrypted_spaces_backend::error::Result;
-use encrypted_spaces_backend::merk_storage::proofs::VerifiedRows;
+use encrypted_spaces_backend::merk_storage::proofs::{StoreReadOp, VerifiedRows};
 use encrypted_spaces_backend::query::Query;
 use encrypted_spaces_changelog_core::changelog::{Change, ChangeResponse, FastForwardData};
 use encrypted_spaces_key_manager::{InviteRequest, RekeyRequest};
@@ -113,11 +113,7 @@ impl Transport for CountingTransport {
         self.inner.select(query, commitment, schemas).await
     }
 
-    async fn store_read(
-        &self,
-        read: encrypted_spaces_changelog_core::StoreReadOp,
-        commitment: &[u8; 32],
-    ) -> Result<VerifiedRows> {
+    async fn store_read(&self, read: StoreReadOp, commitment: &[u8; 32]) -> Result<VerifiedRows> {
         self.store_read_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.store_read(read, commitment).await
     }

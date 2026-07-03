@@ -99,33 +99,6 @@ pub enum ReadOp {
     Range { start: Vec<u8>, end: Vec<u8> },
 }
 
-/// A namespaced key-value store read: a base selector (`op`) plus optional
-/// ordering and limit. When `limit` is set, the proof is narrowed to exactly
-/// the returned keys (the first/last `limit` present keys of `op`'s range in
-/// byte order), so a limited read proves and transfers only what it returns.
-/// `descending` selects the high end (`last`); ascending (default) the low end
-/// (`first`). Both prover and verifier derive the same narrowing independently.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct StoreReadOp {
-    /// Base range to read (`Key` for a point, `Prefix`/`Range` for a scan).
-    pub op: ReadOp,
-    /// Walk order: `false` = ascending (default), `true` = descending.
-    pub descending: bool,
-    /// Keep only the first (or last, if `descending`) N present keys.
-    pub limit: Option<u32>,
-}
-
-impl StoreReadOp {
-    /// An unlimited ascending read of `op`.
-    pub fn new(op: ReadOp) -> Self {
-        Self {
-            op,
-            descending: false,
-            limit: None,
-        }
-    }
-}
-
 /// A read query with optional results.
 ///
 /// Results are not serialized (they're derived from the pruned tree during

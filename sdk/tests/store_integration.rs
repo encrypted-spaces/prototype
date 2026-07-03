@@ -1,14 +1,16 @@
 //! End-to-end tests for namespaced key-value stores (`Space::store`).
 //!
-//! Exercises the full vertical: the runtime `Store` handle, the
-//! `StorePut`/`StoreDelete` verifier ops, and the `KvCache` read path
-//! (cache hit after a local write; cache miss + proven fetch for a second
-//! actor).
+//! Exercises the full vertical: the runtime `Store` handle and its `get()`
+//! read builder (key / prefix / range, order, provable limit / first / last),
+//! the `StorePut`/`StoreDelete` verifier ops, and the `KvCache` read path
+//! (cache hit after a local write; coverage-aware limited reads; cache miss +
+//! proven fetch for a second actor).
 
 mod cache_common;
 
 use cache_common::CountingTransport;
 use encrypted_spaces_backend::app_schema::SchemaStore;
+use encrypted_spaces_sdk::store::Store;
 use encrypted_spaces_sdk::testing::initial_internal_data_commitment;
 use encrypted_spaces_sdk::{ApplicationSchema, LocalTransport, Space};
 
@@ -28,6 +30,19 @@ async fn setup() -> std::result::Result<(Space, CountingTransport), Box<dyn std:
     let space = Space::create(counting.clone(), ApplicationSchema::for_testing(vec![], dc)).await?;
     space.create_store(&prefs_store()).await?;
     Ok((space, counting))
+}
+
+/// Put each of `keys` with its own bytes as the value.
+async fn seed(store: &Store, keys: &[&str]) -> TestResult {
+    for k in keys {
+        store.put(*k, k.as_bytes().to_vec()).await?;
+    }
+    Ok(())
+}
+
+/// The keys of a read result, dropping the values.
+fn keys_of(pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<Vec<u8>> {
+    pairs.into_iter().map(|(k, _)| k).collect()
 }
 
 #[tokio::test]
@@ -103,17 +118,8 @@ async fn prefix_scan_returns_matching_keys_in_order() -> TestResult {
 async fn range_scan_is_half_open() -> TestResult {
     let (space, _t) = setup().await?;
     let store = space.store("prefs")?;
-    for k in ["a", "b", "c", "d"] {
-        store.put(k, k.as_bytes().to_vec()).await?;
-    }
-    let keys: Vec<Vec<u8>> = store
-        .get()
-        .range("b", "d")
-        .all()
-        .await?
-        .into_iter()
-        .map(|(k, _)| k)
-        .collect();
+    seed(&store, &["a", "b", "c", "d"]).await?;
+    let keys = keys_of(store.get().range("b", "d").all().await?);
     assert_eq!(keys, vec![b"b".to_vec(), b"c".to_vec()]);
     Ok(())
 }
@@ -122,9 +128,7 @@ async fn range_scan_is_half_open() -> TestResult {
 async fn first_and_last_pick_the_range_ends() -> TestResult {
     let (space, _t) = setup().await?;
     let store = space.store("prefs")?;
-    for k in ["b", "d", "a", "c"] {
-        store.put(k, k.as_bytes().to_vec()).await?;
-    }
+    seed(&store, &["b", "d", "a", "c"]).await?;
     assert_eq!(
         store.get().first().await?,
         Some((b"a".to_vec(), b"a".to_vec())),
@@ -140,18 +144,8 @@ async fn first_and_last_pick_the_range_ends() -> TestResult {
 async fn descending_limit_returns_largest_keys() -> TestResult {
     let (space, _t) = setup().await?;
     let store = space.store("prefs")?;
-    for k in ["a", "b", "c", "d"] {
-        store.put(k, k.as_bytes().to_vec()).await?;
-    }
-    let keys: Vec<Vec<u8>> = store
-        .get()
-        .descending()
-        .limit(2)
-        .all()
-        .await?
-        .into_iter()
-        .map(|(k, _)| k)
-        .collect();
+    seed(&store, &["a", "b", "c", "d"]).await?;
+    let keys = keys_of(store.get().descending().limit(2).all().await?);
     assert_eq!(keys, vec![b"d".to_vec(), b"c".to_vec()]);
     Ok(())
 }
@@ -160,9 +154,7 @@ async fn descending_limit_returns_largest_keys() -> TestResult {
 async fn repeated_limited_read_is_a_coverage_cache_hit() -> TestResult {
     let (space, transport) = setup().await?;
     let store = space.store("prefs")?;
-    for k in ["a", "b", "c", "d", "e"] {
-        store.put(k, k.as_bytes().to_vec()).await?;
-    }
+    seed(&store, &["a", "b", "c", "d", "e"]).await?;
 
     // The first limited read proves a narrowed range; the repeat is answered
     // from the coverage that fetch established.
@@ -175,8 +167,7 @@ async fn repeated_limited_read_is_a_coverage_cache_hit() -> TestResult {
         "repeat limited read should hit the coverage cache"
     );
     assert_eq!(first, second);
-    let keys: Vec<Vec<u8>> = first.into_iter().map(|(k, _)| k).collect();
-    assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
+    assert_eq!(keys_of(first), vec![b"a".to_vec(), b"b".to_vec()]);
     Ok(())
 }
 

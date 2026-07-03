@@ -20,5 +20,5 @@ pub use ffproof_tracer_shared::{
     apply_batch, collect_range, decode_pruned_compact_to_merk, encode_pruned_compact,
     prefix_successor, pruned_to_merk, verify_trace, BatchOp, InputStep, ProvenRead,
     PrunedMerkleTree, PrunedMerkleTreeStats, PrunedWitnessDecodeError, ReadOp, ReadResults,
-    StoreReadOp, TraceStep, TracerProof, VerifyTraceError,
+    TraceStep, TracerProof, VerifyTraceError,
 };
