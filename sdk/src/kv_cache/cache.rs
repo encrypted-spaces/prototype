@@ -71,6 +71,26 @@ impl CacheUpdate {
 pub struct KvCache {
     anchor: DataCommitment,
     storage: CoverageStore,
+    /// Runtime kill-switch. When `false` the cache never returns a `Hit` and
+    /// never accumulates entries. Controlled by the `CACHE_DISABLED` env var on
+    /// native targets; always enabled on wasm (no `std::env` there).
+    enabled: bool,
+}
+
+/// Whether the cache is enabled. On native, `CACHE_DISABLED=1`/`true` turns it
+/// off; anything else (including unset) leaves it on. On wasm there is no
+/// `std::env`, so the cache is always enabled.
+fn cache_enabled() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::env::var("CACHE_DISABLED")
+            .map(|v| v != "1" && !v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        true
+    }
 }
 
 impl KvCache {
@@ -78,6 +98,16 @@ impl KvCache {
         Self {
             anchor,
             storage: CoverageStore::new(),
+            enabled: cache_enabled(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_enabled(anchor: DataCommitment, enabled: bool) -> Self {
+        Self {
+            anchor,
+            storage: CoverageStore::new(),
+            enabled,
         }
     }
 
@@ -103,6 +133,9 @@ impl KvCache {
         kv_pairs: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
         coverage_ranges: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
     ) {
+        if !self.enabled {
+            return;
+        }
         for (k, v) in kv_pairs {
             self.storage.put_point(k, Some(v));
         }
@@ -115,14 +148,19 @@ impl KvCache {
     /// step. Atomic at the Rust-struct level — readers never observe an
     /// anchor that doesn't match the storage.
     pub fn advance_anchor(&mut self, new_root: DataCommitment, update: CacheUpdate) {
-        for w in update.writes {
-            match w {
-                CacheWrite::Put(k, v) => self.storage.put_point(k, Some(v)),
-                CacheWrite::Delete(k) => self.storage.put_point(k, None),
+        // When disabled, skip populating storage but still advance the anchor —
+        // anchor bookkeeping is not cache data and downstream invariants depend
+        // on it.
+        if self.enabled {
+            for w in update.writes {
+                match w {
+                    CacheWrite::Put(k, v) => self.storage.put_point(k, Some(v)),
+                    CacheWrite::Delete(k) => self.storage.put_point(k, None),
+                }
             }
-        }
-        for (start, end) in update.coverage_extensions {
-            self.storage.extend_coverage(start, end);
+            for (start, end) in update.coverage_extensions {
+                self.storage.extend_coverage(start, end);
+            }
         }
         self.anchor = new_root;
     }
@@ -143,6 +181,11 @@ impl KvCache {
     ) -> bool {
         if self.anchor != expected_anchor {
             return false;
+        }
+        // Anchor matched — the splice is "applied" for the caller's purposes.
+        // When disabled we skip storing anything but still report success.
+        if !self.enabled {
+            return true;
         }
         for (k, v) in &verified.kv_pairs {
             self.storage.put_point(k.clone(), Some(v.clone()));
@@ -189,6 +232,9 @@ impl KvCache {
         schemas: &HashMap<String, Schema>,
         decrypt: Option<&dyn SyncDecryptResolver>,
     ) -> Result<CacheResult<Vec<serde_json::Value>>> {
+        if !self.enabled {
+            return Ok(CacheResult::Miss);
+        }
         if decrypt.is_some_and(|context| context.anchor() != self.anchor) {
             return Ok(CacheResult::Miss);
         }
@@ -414,6 +460,9 @@ impl KvCache {
         schemas: &HashMap<String, Schema>,
         decrypt: Option<&dyn SyncDecryptResolver>,
     ) -> Result<CacheResult<Vec<serde_json::Value>>> {
+        if !self.enabled {
+            return Ok(CacheResult::Miss);
+        }
         if decrypt.is_some_and(|context| context.anchor() != self.anchor) {
             return Ok(CacheResult::Miss);
         }
@@ -945,6 +994,49 @@ mod tests {
             .try_select(&select_all_query(TABLE), &HashMap::new(), None)
             .unwrap();
         assert!(matches!(result, CacheResult::Miss));
+    }
+
+    #[test]
+    fn disabled_cache_always_misses() {
+        let mut cache = KvCache::with_enabled([0; 32], false);
+        let verified = full_table_verified(
+            TABLE,
+            &[
+                (1, "text", serde_json::json!("hello")),
+                (2, "text", serde_json::json!("world")),
+            ],
+        );
+        // Ingest is accepted (anchor matched) but stores nothing.
+        assert!(cache.apply_select([0; 32], &verified));
+        assert_eq!(cache.storage.point_count(), 0);
+
+        let schemas = HashMap::from([(TABLE.to_string(), plaintext_text_schema(TABLE))]);
+        let result = cache
+            .try_select(&select_all_query(TABLE), &schemas, None)
+            .unwrap();
+        assert!(matches!(result, CacheResult::Miss));
+    }
+
+    #[test]
+    fn enabled_cache_hits() {
+        // Control for `disabled_cache_always_misses`: the same ingest hits when
+        // the cache is enabled.
+        let mut cache = KvCache::with_enabled([0; 32], true);
+        let verified = full_table_verified(
+            TABLE,
+            &[
+                (1, "text", serde_json::json!("hello")),
+                (2, "text", serde_json::json!("world")),
+            ],
+        );
+        assert!(cache.apply_select([0; 32], &verified));
+        assert_eq!(cache.storage.point_count(), 2);
+
+        let schemas = HashMap::from([(TABLE.to_string(), plaintext_text_schema(TABLE))]);
+        let result = cache
+            .try_select(&select_all_query(TABLE), &schemas, None)
+            .unwrap();
+        assert!(matches!(result, CacheResult::Hit(_)));
     }
 
     #[test]

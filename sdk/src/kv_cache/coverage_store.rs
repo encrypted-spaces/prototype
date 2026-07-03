@@ -91,6 +91,12 @@ impl CoverageStore {
         self.points.get(key)
     }
 
+    /// Number of point entries currently stored (test-only assertion helper).
+    #[cfg(test)]
+    pub fn point_count(&self) -> usize {
+        self.points.len()
+    }
+
     /// True iff the half-open range `[start, end)` is fully contained in a
     /// single coverage interval.
     pub fn covers_range(&self, start: &[u8], end: &[u8]) -> bool {
