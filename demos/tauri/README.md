@@ -44,6 +44,11 @@ We use Next.js (in static export mode) as the frontend framework. The same React
   ```bash
   sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
   ```
+- **Color emoji font** (Linux/WSL): the chat UI uses emoji for message reactions. Minimal Ubuntu/WSL images ship no color emoji font, so most reactions render as empty rectangles (□) — only the few emoji that happen to exist in DejaVu Sans show up. Install one and refresh the font cache:
+  ```bash
+  sudo apt install fonts-noto-color-emoji && fc-cache -f
+  ```
+  Then **fully quit and relaunch** the app — WebKitGTK only scans fonts at process startup, so a rebuild or hot-reload alone won't pick up the new font.
 
 ## Running the Demo
 
