@@ -13,7 +13,7 @@ use once_cell::sync::OnceCell;
 use serde::Serialize;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc};
 
@@ -187,6 +187,12 @@ pub enum EntrySummary {
 pub struct Inspector {
     tx: mpsc::UnboundedSender<InspectorEvent>,
     broadcast_tx: broadcast::Sender<InspectorEvent>,
+    /// Every event emitted this run, in order. The broadcast channel only
+    /// carries events sent after a subscriber connects, so a Live WS client
+    /// that opens mid-session would miss the `SchemaSnapshot` / `MerkSnapshot`
+    /// emitted at space creation. Replaying this backlog on connect lets it
+    /// render state established before it connected.
+    history: Arc<Mutex<Vec<InspectorEvent>>>,
 }
 
 impl Inspector {
@@ -202,12 +208,21 @@ impl Inspector {
         let (tx, mut rx) = mpsc::unbounded_channel::<InspectorEvent>();
         let (broadcast_tx, _) = broadcast::channel::<InspectorEvent>(BROADCAST_CAPACITY);
         let broadcast_tx_writer = broadcast_tx.clone();
+        let history: Arc<Mutex<Vec<InspectorEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let history_writer = Arc::clone(&history);
 
         // Writer task: drains events, appends a JSON line per event, and
         // forwards to live subscribers. Synchronous file I/O is fine here —
         // observability sits off the request critical path.
         tokio::spawn(async move {
             while let Some(ev) = rx.recv().await {
+                // Record into history BEFORE broadcasting. A client subscribes
+                // and then snapshots history; recording first guarantees every
+                // event lands in the snapshot, the broadcast, or both (harmless
+                // duplicates) — never neither.
+                if let Ok(mut h) = history_writer.lock() {
+                    h.push(ev.clone());
+                }
                 match serde_json::to_string(&ev) {
                     Ok(line) => {
                         if let Err(e) = writeln!(file, "{line}") {
@@ -223,7 +238,11 @@ impl Inspector {
         });
 
         log::info!("inspector: NDJSON sink open at {}", path.display());
-        Ok(Arc::new(Self { tx, broadcast_tx }))
+        Ok(Arc::new(Self {
+            tx,
+            broadcast_tx,
+            history,
+        }))
     }
 
     /// Construct an inspector from `CYPHERSPACES_INSPECTOR_LOG` if set,
@@ -257,6 +276,17 @@ impl Inspector {
     /// Subscribe to the live event stream (used by future WS endpoint).
     pub fn subscribe(&self) -> broadcast::Receiver<InspectorEvent> {
         self.broadcast_tx.subscribe()
+    }
+
+    /// Snapshot of every event emitted so far this run. A new Live WS client
+    /// replays this backlog before tailing `subscribe()`, so it renders state
+    /// (schema, Merk tree, membership) that was established before it
+    /// connected. Take this *after* subscribing so no event falls in the gap.
+    pub fn history_snapshot(&self) -> Vec<InspectorEvent> {
+        self.history
+            .lock()
+            .map(|h| h.clone())
+            .unwrap_or_default()
     }
 }
 

@@ -111,7 +111,19 @@ async fn stream_events(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ws_stream = ws.await?;
     let (mut write, _read) = futures_util::StreamExt::split(ws_stream);
+
+    // Subscribe first, then snapshot the backlog: any event emitted before the
+    // subscribe is in the snapshot, anything after is on `rx`, so nothing is
+    // lost (a rare event in the overlap is delivered twice, which the frontend
+    // reducers tolerate). Replaying the backlog lets this client render state
+    // established before it connected — notably the `SchemaSnapshot`.
     let mut rx = inspector.subscribe();
+    for ev in inspector.history_snapshot() {
+        let line = serde_json::to_string(&ev)?;
+        if write.send(Message::Text(line)).await.is_err() {
+            return Ok(());
+        }
+    }
 
     loop {
         match rx.recv().await {
