@@ -11,6 +11,8 @@ import { fmtMs, truncHex } from "../store/reducer";
 interface Props {
   events: InspectorEvent[];
   cursor: number;
+  /** When true, hide read-only `Select` operations (and their proofs). */
+  hideSelects?: boolean;
   onSelect: (i: number) => void;
 }
 
@@ -44,8 +46,19 @@ function groupEvents(events: InspectorEvent[]): Group[] {
   return groups;
 }
 
-export function OperationsLog({ events, cursor, onSelect }: Props) {
-  const groups = useMemo(() => groupEvents(events), [events]);
+export function OperationsLog({ events, cursor, hideSelects, onSelect }: Props) {
+  const allGroups = useMemo(() => groupEvents(events), [events]);
+  // Reads (Select ops) don't mutate state and can dominate the log; let the
+  // viewer drop them to focus on the write history. Filtering whole groups
+  // keeps the original event indices intact, so the playback cursor still maps.
+  const groups = useMemo(() => {
+    if (!hideSelects) return allGroups;
+    return allGroups.filter((g) => {
+      if (g.kind !== "op") return true;
+      const head = events[g.headIdx];
+      return !(head.kind === "Request" && head.op === "Select");
+    });
+  }, [allGroups, hideSelects, events]);
 
   // Cards default to collapsed. Track per-group expansion explicitly so
   // re-renders don't lose user state.

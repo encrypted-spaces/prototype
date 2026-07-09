@@ -33,6 +33,7 @@ export default function App() {
   const [sourceMode, setSourceMode] = useState<SourceMode>("file");
   const [viewMode, setViewMode] = useState<ViewMode>("operations");
   const [explainMode, setExplainMode] = useState<boolean>(false);
+  const [hideSelects, setHideSelects] = useState<boolean>(false);
   const playback = usePlayback(events);
   const playbackRef = useRef(playback);
   useEffect(() => {
@@ -141,6 +142,15 @@ export default function App() {
         >
           {explainMode ? "Explain: on" : "Explain"}
         </button>
+        {viewMode === "operations" && (
+          <button
+            className={`explain-toggle ${hideSelects ? "active" : ""}`}
+            onClick={() => setHideSelects((v) => !v)}
+            title="Hide read-only Select operations (and their proofs) from the log"
+          >
+            {hideSelects ? "Selects: hidden" : "Hide selects"}
+          </button>
+        )}
         <PlaybackControls playback={playback} total={events.length} />
       </div>
 
@@ -163,6 +173,7 @@ export default function App() {
             <OperationsLog
               events={events}
               cursor={playback.cursor}
+              hideSelects={hideSelects}
               onSelect={(i) => {
                 playback.setCursor(i);
                 setDrawerIdx(i);
