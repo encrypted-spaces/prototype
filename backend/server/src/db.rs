@@ -320,27 +320,6 @@ fn build_schema_tables(names: &BTreeSet<String>, db: &MerkStorage) -> Vec<inspec
         .collect()
 }
 
-/// Collect distinct table names from any schema-related parsed keys in
-/// `change.entry.message.entries`. Used to keep the inspector's known-table
-/// set fresh as `CreateSpace` / dynamic table additions land.
-fn schema_tables_in_change(change: &Change) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    for kv in &change.entry.message.entries {
-        if let Ok(p) = parse_key(&kv.key) {
-            match p {
-                ParsedKey::Schema { table }
-                | ParsedKey::SchemaColumns { table }
-                | ParsedKey::SchemaNextId { table }
-                | ParsedKey::SchemaIdMode { table } => {
-                    out.insert(table);
-                }
-                _ => {}
-            }
-        }
-    }
-    out
-}
-
 fn build_entry_summaries(change: &Change, db: &MerkStorage) -> Vec<inspector::EntrySummary> {
     let mut out = Vec::with_capacity(change.entry.message.entries.len());
     for kv in &change.entry.message.entries {
@@ -914,13 +893,13 @@ impl SpaceState {
         // the first tracked change will see as its old_root
         new_server_state.tree_snapshot = new_server_state.db.snapshot();
 
-        // Seed the inspector's known-table set with any user schemas that
-        // were applied at init, then emit the initial SchemaSnapshot. The
-        // set may grow later as dynamic table creations (CreateSpace) write
-        // schema keys; see `handle_change` for the on-demand re-emit.
-        for s in schema.iter().flat_map(|v| v.iter()) {
-            new_server_state.inspector_tables.insert(s.name.clone());
-        }
+        // Seed the inspector's known-table set: internal tables come from the
+        // constructor, and application tables are read straight from the tree
+        // (their schemas live there — they aren't carried as signed change
+        // entries). The set is refreshed after a `CreateSpace` lands; see
+        // `handle_change`.
+        let app_tables = new_server_state.app_table_names();
+        new_server_state.inspector_tables.extend(app_tables);
         let snapshot_tables =
             build_schema_tables(&new_server_state.inspector_tables, &new_server_state.db);
         new_server_state.emit_inspector(InspectorEvent::SchemaSnapshot {
@@ -2565,21 +2544,25 @@ impl SpaceState {
         let space_str = self.space_id.to_string();
         let entries = build_entry_summaries(change, &self.db);
 
-        // If this change touched any schema keys (e.g. CreateSpace adding
-        // user tables), update the known-table set and re-emit a fresh
-        // SchemaSnapshot so the UI's Tables tab picks up the new schemas.
-        let new_schema_tables = schema_tables_in_change(change);
-        let schema_added = new_schema_tables
-            .iter()
-            .any(|t| !self.inspector_tables.contains(t));
-        if schema_added {
-            self.inspector_tables.extend(new_schema_tables);
-            let tables = build_schema_tables(&self.inspector_tables, &self.db);
-            self.emit_inspector(InspectorEvent::SchemaSnapshot {
-                ts_ms: inspector::now_ms(),
-                space_id: space_str.clone(),
-                tables,
-            });
+        // Application table schemas are created by `CreateSpace` and written
+        // to the tree, not carried as signed change entries, so scanning
+        // `change` never reveals them. After a `CreateSpace` lands, refresh the
+        // known-table set from the tree and re-emit a SchemaSnapshot so the
+        // UI's Tables tab picks up the application's tables.
+        if self.inspector.is_some() && entry.message.op_type == OpType::CreateSpace {
+            let app_tables = self.app_table_names();
+            let added = app_tables
+                .iter()
+                .any(|t| !self.inspector_tables.contains(t));
+            if added {
+                self.inspector_tables.extend(app_tables);
+                let tables = build_schema_tables(&self.inspector_tables, &self.db);
+                self.emit_inspector(InspectorEvent::SchemaSnapshot {
+                    ts_ms: inspector::now_ms(),
+                    space_id: space_str.clone(),
+                    tables,
+                });
+            }
         }
 
         self.emit_inspector(InspectorEvent::MerkUpdate {
