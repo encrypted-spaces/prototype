@@ -71,3 +71,9 @@ export function fmtMs(ts: number): string {
   const pad = (n: number, w = 2) => n.toString().padStart(w, "0");
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
 }
+
+/// Seconds-precision clock time (HH:MM:SS), for summary stats where the
+/// millisecond tail from `fmtMs` is just noise.
+export function fmtSec(ts: number): string {
+  return fmtMs(ts).split(".")[0];
+}

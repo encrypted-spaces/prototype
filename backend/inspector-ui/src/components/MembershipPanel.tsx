@@ -2,7 +2,7 @@
 // the membership store; cursor-sensitive so it matches playback.
 
 import type { MembershipState } from "../store/membership";
-import { fmtMs } from "../store/reducer";
+import { fmtSec } from "../store/reducer";
 
 interface Props {
   state: MembershipState;
@@ -31,7 +31,7 @@ export function MembershipPanel({ state }: Props) {
         <div className="memb-stat">
           <div className="memb-stat-label">Last rekey</div>
           <div className="memb-stat-value mono">
-            {state.lastRekeyTs != null ? fmtMs(state.lastRekeyTs) : "—"}
+            {state.lastRekeyTs != null ? fmtSec(state.lastRekeyTs) : "—"}
           </div>
         </div>
       </div>
@@ -59,7 +59,7 @@ export function MembershipPanel({ state }: Props) {
             .reverse()
             .map((e, i) => (
               <div key={i} className={`memb-event memb-${e.kind}`}>
-                <span className="memb-event-ts mono">{fmtMs(e.ts_ms)}</span>
+                <span className="memb-event-ts mono">{fmtSec(e.ts_ms)}</span>
                 <span className="memb-event-kind">{e.kind}</span>
                 <span className="memb-event-uid mono">
                   uid={e.uid ?? "-"}
