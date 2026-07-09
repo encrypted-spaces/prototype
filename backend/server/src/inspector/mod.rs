@@ -2,7 +2,7 @@
 //!
 //! Emits structured events to an NDJSON file and to an in-process broadcast
 //! channel (consumed by `/_inspect/ws` subscribers). Activation: set
-//! `CYPHERSPACES_INSPECTOR_LOG=/path/to/inspector.ndjson` before starting
+//! `ENCRYPTED_SPACES_INSPECTOR_LOG=/path/to/inspector.ndjson` before starting
 //! the server or constructing a `LocalTransport`.
 //!
 //! See `INSPECTOR_PLAN.md` at the repo root for the full design.
@@ -20,7 +20,7 @@ use tokio::sync::{broadcast, mpsc};
 const BROADCAST_CAPACITY: usize = 1024;
 
 /// Process-wide singleton. Initialized lazily from
-/// `CYPHERSPACES_INSPECTOR_LOG` on first access; subsequent calls return
+/// `ENCRYPTED_SPACES_INSPECTOR_LOG` on first access; subsequent calls return
 /// the same handle (or `None` if telemetry is disabled).
 static GLOBAL: OnceCell<Option<Arc<Inspector>>> = OnceCell::new();
 
@@ -251,12 +251,12 @@ impl Inspector {
         }))
     }
 
-    /// Construct an inspector from `CYPHERSPACES_INSPECTOR_LOG` if set,
+    /// Construct an inspector from `ENCRYPTED_SPACES_INSPECTOR_LOG` if set,
     /// otherwise return `None`. Failures to open the file are logged and
     /// produce `None` rather than panicking — telemetry must never break
     /// the server.
     pub fn from_env() -> Option<Arc<Self>> {
-        let path = std::env::var("CYPHERSPACES_INSPECTOR_LOG").ok()?;
+        let path = std::env::var("ENCRYPTED_SPACES_INSPECTOR_LOG").ok()?;
         match Self::new_with_file(PathBuf::from(path)) {
             Ok(insp) => Some(insp),
             Err(e) => {
@@ -267,7 +267,7 @@ impl Inspector {
     }
 
     /// Return the process-wide inspector, initializing it from
-    /// `CYPHERSPACES_INSPECTOR_LOG` on first access. All call sites share
+    /// `ENCRYPTED_SPACES_INSPECTOR_LOG` on first access. All call sites share
     /// the same writer task and broadcast channel.
     pub fn global() -> Option<Arc<Inspector>> {
         GLOBAL.get_or_init(Self::from_env).clone()

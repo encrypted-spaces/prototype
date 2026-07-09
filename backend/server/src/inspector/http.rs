@@ -83,7 +83,7 @@ async fn handle_ws(req: Request<Body>) -> Result<Response<Body>, Infallible> {
             return Ok(Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
                 .body(Body::from(
-                    "inspector disabled — set CYPHERSPACES_INSPECTOR_LOG and restart",
+                    "inspector disabled — set ENCRYPTED_SPACES_INSPECTOR_LOG and restart",
                 ))
                 .unwrap());
         }

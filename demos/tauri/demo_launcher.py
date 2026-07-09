@@ -787,14 +787,14 @@ class DemoLauncher(App):
     def _resolve_inspector_log_path(self) -> str:
         """Return the inspector log path the backend should write to.
 
-        Honors `CYPHERSPACES_INSPECTOR_LOG` from the environment when set,
+        Honors `ENCRYPTED_SPACES_INSPECTOR_LOG` from the environment when set,
         otherwise falls back to `logs/inspector.ndjson` next to the other
         launcher logs. This default ensures the inspector's live WebSocket
         endpoint at `/_inspect/ws` is always available — the backend keys
         its broadcast channel off the same env var, so leaving it unset
         would disable live mode in the demo.
         """
-        path = os.environ.get("CYPHERSPACES_INSPECTOR_LOG")
+        path = os.environ.get("ENCRYPTED_SPACES_INSPECTOR_LOG")
         if path:
             return path
         LOGS_DIR.mkdir(exist_ok=True)
@@ -804,7 +804,7 @@ class DemoLauncher(App):
     async def _launch_server(self):
         env = {} if self.use_risc0 else {"RISC0_SKIP_BUILD": "1"}
         env["RUST_LOG"] = self.log_level
-        env["CYPHERSPACES_INSPECTOR_LOG"] = self._resolve_inspector_log_path()
+        env["ENCRYPTED_SPACES_INSPECTOR_LOG"] = self._resolve_inspector_log_path()
         if self.cache_disabled:
             env["CACHE_DISABLED"] = "1"
 
@@ -926,7 +926,7 @@ class DemoLauncher(App):
 
         env = {} if self.use_risc0 else {"RISC0_SKIP_BUILD": "1"}
         env["RUST_LOG"] = self.log_level
-        env["CYPHERSPACES_INSPECTOR_LOG"] = self._resolve_inspector_log_path()
+        env["ENCRYPTED_SPACES_INSPECTOR_LOG"] = self._resolve_inspector_log_path()
         if self.cache_disabled:
             env["CACHE_DISABLED"] = "1"
 

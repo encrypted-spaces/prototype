@@ -159,7 +159,7 @@ pub struct SpaceState {
     /// Per-space store mapping SHA-256 hashes to full values for hash-backed columns.
     pub hash_store: HashMap<[u8; 32], Vec<u8>>,
     /// Inspector telemetry sink, if enabled via
-    /// `CYPHERSPACES_INSPECTOR_LOG`.
+    /// `ENCRYPTED_SPACES_INSPECTOR_LOG`.
     inspector: Option<Arc<Inspector>>,
     /// Table names known to the inspector. Seeded with internal table names at
     /// init and updated whenever a change writes a schema key, so dynamically

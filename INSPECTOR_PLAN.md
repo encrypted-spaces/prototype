@@ -139,7 +139,7 @@ keeps replay trivial (file = recording); same encoder feeds the WebSocket.
   4 bytes, hides internal-table prefixes, etc. Cheap up front, expensive
   to retrofit.
 - **Config gate.** Shipped as a single environment variable rather than an
-  `AppConfig` section: setting `CYPHERSPACES_INSPECTOR_LOG=<path>` enables the
+  `AppConfig` section: setting `ENCRYPTED_SPACES_INSPECTOR_LOG=<path>` enables the
   inspector and writes NDJSON to `<path>`; unset = fully disabled (singleton
   stays `None`, zero overhead). The inspector HTTP/WS endpoints are served on
   the same port as the protobuf WS (default `127.0.0.1:8080`) under `/_inspect`
@@ -185,7 +185,7 @@ version-controlled recordings for later phases.
    currently hand-maintained in `inspector-ui/src/types/events.ts` and kept in
    sync with the Rust `InspectorEvent` enum manually. Revisit if drift becomes
    painful.
-4. **Acceptance**: `CYPHERSPACES_INSPECTOR_LOG=/path/to/log.ndjson`, run a
+4. **Acceptance**: `ENCRYPTED_SPACES_INSPECTOR_LOG=/path/to/log.ndjson`, run a
    Tauri demo session, get a coherent NDJSON file. Sanity-check with
    `jq .kind inspector.ndjson | sort | uniq -c`.
 
@@ -265,7 +265,7 @@ single user-facing action like "Alice sends a message" produces a
 `ProofEmitted`, and the audience loses the thread. The fix is a UI mode
 that groups those into one card per high-level operation.
 
-1. **Taxonomy source.** Import `cypherspaces_changelog_core::changelog::OpType`
+1. **Taxonomy source.** Import `encrypted_spaces_changelog_core::changelog::OpType`
    (defined in `ffproof/changelog_core/src/changelog.rs:42`) — covers the
    14 changelog-level operations (CreateSpace, InviteUser, RefreshKeys,
    RemoveUser, Extend, Reduce, Rekey, Insert, Update, Delete, ListAppend,

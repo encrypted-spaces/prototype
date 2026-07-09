@@ -246,7 +246,7 @@ streams events in real time.
 To override the file path:
 
 ```bash
-export CYPHERSPACES_INSPECTOR_LOG=/tmp/inspector.ndjson
+export ENCRYPTED_SPACES_INSPECTOR_LOG=/tmp/inspector.ndjson
 python3 demo_launcher.py
 ```
 
