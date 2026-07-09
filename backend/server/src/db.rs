@@ -19,7 +19,7 @@ use encrypted_spaces_backend::{
     internal_schemas,
     merk_storage::{execute_query, stored_value, MerkStorage},
     proto::{self, db_request, db_response, DbRequest, DbResponse},
-    query::{ComparisonOperator, Predicate, Query, QueryOperation, QueryParam},
+    query::{ComparisonOperator, Order, Predicate, Query, QueryOperation, QueryParam},
     schema::{ColumnType, Schema, MAX_STRING_COLUMN_BYTES},
     schema_kdl,
     storage::Storage,
@@ -481,6 +481,72 @@ fn op_display_label(change: &Change) -> String {
         }
     }
     base.to_string()
+}
+
+/// One-line, SQL-ish summary of a query for the inspector's Proofs panel.
+/// Surfaces exactly what a `Select` proof attests to; the predicate/limit
+/// also explain size — a point lookup proves one row, a wide range or high
+/// limit proves many and yields a larger proof.
+fn describe_query(query: &Query) -> String {
+    fn fmt_param(p: &QueryParam) -> String {
+        match p {
+            QueryParam::Null => "null".to_string(),
+            QueryParam::Integer(i) => i.to_string(),
+            QueryParam::Real(r) => r.to_string(),
+            QueryParam::Text(s) => format!("\"{s}\""),
+            QueryParam::Blob(b) => format!("<{} B blob>", b.len()),
+            QueryParam::Boolean(b) => b.to_string(),
+        }
+    }
+
+    let cols = match &query.operation {
+        QueryOperation::Select(cols) if !cols.is_empty() => cols.join(", "),
+        _ => "*".to_string(),
+    };
+    let mut s = format!("SELECT {cols} FROM {}", query.table);
+
+    if let Some(j) = &query.join {
+        s.push_str(&format!(
+            " JOIN {} ON {}={}",
+            j.table, j.on_condition.0, j.on_condition.1
+        ));
+    }
+
+    if let Some(pred) = &query.predicate {
+        let op = match pred.operator {
+            ComparisonOperator::Equal => "==",
+            ComparisonOperator::In => "IN",
+            ComparisonOperator::GreaterThan => ">",
+            ComparisonOperator::GreaterThanOrEqual => ">=",
+            ComparisonOperator::LessThan => "<",
+            ComparisonOperator::LessThanOrEqual => "<=",
+            ComparisonOperator::Between => "BETWEEN",
+        };
+        let vals = match pred.operator {
+            ComparisonOperator::In => format!(
+                "({})",
+                pred.values.iter().map(fmt_param).collect::<Vec<_>>().join(", ")
+            ),
+            ComparisonOperator::Between => format!(
+                "{} AND {}",
+                pred.values.first().map(fmt_param).unwrap_or_default(),
+                pred.values.get(1).map(fmt_param).unwrap_or_default(),
+            ),
+            _ => pred.values.first().map(fmt_param).unwrap_or_default(),
+        };
+        s.push_str(&format!(" WHERE {} {op} {vals}", pred.column));
+        if let Some(cursor) = pred.cursor_id {
+            s.push_str(&format!(" [after id {cursor}]"));
+        }
+    }
+
+    if query.order == Order::Desc {
+        s.push_str(" ORDER DESC");
+    }
+    if let Some(limit) = query.limit {
+        s.push_str(&format!(" LIMIT {limit}"));
+    }
+    s
 }
 
 #[derive(Debug)]
@@ -2641,6 +2707,7 @@ impl SpaceState {
             proof_size_bytes: response.pruned_merkle_tree.len(),
             covers_entries: Some(1),
             gen_ms: None,
+            query: None,
         });
 
         self.change_responses.push(response.clone());
@@ -2838,6 +2905,7 @@ impl SpaceState {
             proof_size_bytes: proof.len(),
             covers_entries: None,
             gen_ms: None,
+            query: Some(describe_query(query)),
         });
         Ok(SelectProofResponse {
             proof,
@@ -3023,6 +3091,7 @@ impl SpaceState {
                 proof_size_bytes: ff_proof.proof.len(),
                 covers_entries: Some(covers),
                 gen_ms: None,
+                query: None,
             });
         }
 

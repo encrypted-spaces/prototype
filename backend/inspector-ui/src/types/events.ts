@@ -121,6 +121,8 @@ export interface ProofEmittedEv {
   proof_size_bytes: number;
   covers_entries: number | null;
   gen_ms: number | null;
+  /** For `select` proofs: a one-line summary of the proven query. */
+  query?: string | null;
 }
 
 export type InspectorEvent =

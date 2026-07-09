@@ -87,6 +87,12 @@ pub enum InspectorEvent {
         proof_size_bytes: usize,
         covers_entries: Option<u32>,
         gen_ms: Option<u64>,
+        /// For `Select` proofs, a one-line summary of the proven query
+        /// (table, predicate, limit, …). This is what the proof attests to,
+        /// and it explains size differences — wider ranges / higher limits
+        /// cover more rows and produce larger proofs. `None` for other kinds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
     },
 }
 

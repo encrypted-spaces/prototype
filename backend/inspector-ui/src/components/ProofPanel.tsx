@@ -14,7 +14,7 @@ interface Props {
 function explain(kind: ProofEmittedEv["proof_kind"]): string {
   switch (kind) {
     case "select":
-      return "Proves the query result matches the current Merk root — the client verifies without trusting the server.";
+      return "Proves the query result matches the current Merk root — the client verifies without trusting the server. Size scales with the rows covered: a point lookup proves one row; a wide range or high limit proves many and is larger.";
     case "fast_forward":
       return "Lets a joining (or stale) client skip past changelog entries: one proof replaces replaying every change.";
     case "update":
@@ -73,6 +73,12 @@ export function ProofPanel({ events, cursor, onSelect }: Props) {
               </div>
             )}
           </div>
+          {ev.query && (
+            <div className="proof-query">
+              <div className="proof-stat-label">Query</div>
+              <div className="proof-query-text mono">{ev.query}</div>
+            </div>
+          )}
           <div className="proof-explain">{explain(ev.proof_kind)}</div>
         </div>
       ))}

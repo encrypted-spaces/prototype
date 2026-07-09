@@ -869,6 +869,21 @@ html, body, #root {
   font-weight: 500;
 }
 
+.proof-query {
+  margin-bottom: 8px;
+}
+.proof-query-text {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--fg);
+  background: var(--bg-row-active);
+  border-radius: 4px;
+  padding: 5px 7px;
+  line-height: 1.4;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
 .proof-explain {
   color: var(--fg-dim);
   font-size: 11px;
