@@ -289,10 +289,7 @@ impl Inspector {
     /// (schema, Merk tree, membership) that was established before it
     /// connected. Take this *after* subscribing so no event falls in the gap.
     pub fn history_snapshot(&self) -> Vec<InspectorEvent> {
-        self.history
-            .lock()
-            .map(|h| h.clone())
-            .unwrap_or_default()
+        self.history.lock().map(|h| h.clone()).unwrap_or_default()
     }
 }
 

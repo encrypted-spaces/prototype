@@ -525,7 +525,11 @@ fn describe_query(query: &Query) -> String {
         let vals = match pred.operator {
             ComparisonOperator::In => format!(
                 "({})",
-                pred.values.iter().map(fmt_param).collect::<Vec<_>>().join(", ")
+                pred.values
+                    .iter()
+                    .map(fmt_param)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             ComparisonOperator::Between => format!(
                 "{} AND {}",
