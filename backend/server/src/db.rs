@@ -420,8 +420,10 @@ fn build_entry_summaries(change: &Change, db: &MerkStorage) -> Vec<inspector::En
                 });
             }
             ParsedKey::ActionMarker { primary_table } => {
+                // The marker value is the invoked action's name (UTF-8).
+                let name = std::str::from_utf8(value_bytes).unwrap_or("<non-utf8>");
                 out.push(inspector::EntrySummary::Other {
-                    label: format!("action marker {primary_table}"),
+                    label: format!("action: {name} → {primary_table}"),
                     value_size,
                 });
             }
@@ -450,6 +452,35 @@ fn op_type_label(op: encrypted_spaces_changelog_core::changelog::OpType) -> &'st
         Action => "Action",
         Noop => "Noop",
     }
+}
+
+/// For an `Action` op the signed entry's first kv is the action marker: its
+/// key is `ActionMarker { primary_table }` and its value is the invoked
+/// action's name as UTF-8 (e.g. `send_message`). Returns
+/// `(primary_table, action_name)` when the change is a well-formed action.
+fn action_invocation(change: &Change) -> Option<(String, String)> {
+    let marker = change.entry.message.entries.first()?;
+    let primary_table = match parse_key(&marker.key) {
+        Ok(ParsedKey::ActionMarker { primary_table }) => primary_table,
+        _ => return None,
+    };
+    let name = std::str::from_utf8(&marker.value).ok()?.to_string();
+    Some((primary_table, name))
+}
+
+/// Human-facing operation label for inspector events. Mirrors
+/// [`op_type_label`] but, for `Action` ops, appends the invoked action's
+/// name (e.g. `Action:send_message`) so the ops/wire/MMR views show what the
+/// action does rather than a bare `Action`.
+fn op_display_label(change: &Change) -> String {
+    let op = change.entry.message.op_type;
+    let base = op_type_label(op);
+    if op == OpType::Action {
+        if let Some((_table, name)) = action_invocation(change) {
+            return format!("{base}:{name}");
+        }
+    }
+    base.to_string()
 }
 
 #[derive(Debug)]
@@ -2412,7 +2443,7 @@ impl SpaceState {
             ts_ms: inspector::now_ms(),
             space_id: self.space_id.to_string(),
             request_id: String::new(),
-            op: op_type_label(entry.message.op_type).to_string(),
+            op: op_display_label(change),
             uid: Some(entry.uid as i64),
         });
         self.verify_change_signature(change, &change.hashed_values)?;
@@ -2540,7 +2571,7 @@ impl SpaceState {
             hashed_values: response_hashed_values,
         };
 
-        let op_label = op_type_label(entry.message.op_type);
+        let op_label = op_display_label(change);
         let space_str = self.space_id.to_string();
         let entries = build_entry_summaries(change, &self.db);
 
@@ -5151,6 +5182,48 @@ mod tests {
         };
         state.db.import_actions(&[action]).await.unwrap();
         state
+    }
+
+    #[test]
+    fn action_display_surfaces_the_invoked_action_name() {
+        use encrypted_spaces_storage_encoding::keys::{action_marker_key, column_key};
+
+        let marker_key = action_marker_key("messages");
+        let content_key = column_key("messages", 1, "content");
+        let change = Change::new(
+            OpType::Action,
+            1,
+            ROOT_TREE_PATH,
+            &[marker_key.as_slice(), content_key.as_slice()],
+            &[b"send_message", b"hello"],
+            0,
+            0,
+            [0u8; 32],
+        )
+        .unwrap();
+
+        // The action name is decoded from the marker kv's value.
+        let (table, name) = action_invocation(&change).expect("action invocation");
+        assert_eq!(table, "messages");
+        assert_eq!(name, "send_message");
+
+        // Ops/wire/MMR views show "Action:send_message" rather than "Action".
+        assert_eq!(op_display_label(&change), "Action:send_message");
+
+        // A non-action op keeps its plain label.
+        let insert = Change::new(
+            OpType::Insert,
+            1,
+            ROOT_TREE_PATH,
+            &[column_key("messages", 1, "content").as_slice()],
+            &[b"hi"],
+            0,
+            0,
+            [0u8; 32],
+        )
+        .unwrap();
+        assert_eq!(action_invocation(&insert), None);
+        assert_eq!(op_display_label(&insert), "Insert");
     }
 
     #[tokio::test]
