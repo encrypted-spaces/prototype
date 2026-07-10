@@ -4,6 +4,7 @@ use crate::SpaceKeyManager;
 use crate::{DataCommitment, Space, SpaceId, Transport};
 use encrypted_spaces_acl_types::Action;
 use encrypted_spaces_backend::access_control::AuthContext;
+use encrypted_spaces_backend::app_schema::SchemaStore;
 use encrypted_spaces_backend::{
     error::{Result, SdkError},
     schema::Schema,
@@ -65,6 +66,11 @@ pub(crate) struct State {
     /// shape they're invoking.
     #[serde(default)]
     pub(crate) actions: HashMap<String, Action>,
+    /// Key-value stores declared in the schema, by name.  Populated from
+    /// the imported [`SchemaBundle`] during space init; consulted by
+    /// `Space::store` to learn each store's value-encryption mode.
+    #[serde(default)]
+    pub(crate) stores: HashMap<String, SchemaStore>,
     /// Current changelog commitment.
     /// Kept up-to-date for each change/FF proof.
     pub(crate) current_clc_state: ClcState,
@@ -313,6 +319,7 @@ mod tests {
             key_valid_from_change_id: 0,
             table_schemas: HashMap::new(),
             actions: HashMap::new(),
+            stores: HashMap::new(),
             current_clc_state: initial_clc_state(&initial_dc),
             current_change_entry: None,
             ff_image_id: EXTEND_FF_ID,

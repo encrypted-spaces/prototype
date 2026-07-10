@@ -3,11 +3,14 @@ use base64::Engine;
 use encrypted_spaces_backend::{
     access_control::AuthContext,
     error::{Result, SdkError},
-    merk_storage::proofs::{verify_query_proof_with_hashed_values, VerifiedRows},
+    merk_storage::proofs::{
+        verify_query_proof_with_hashed_values, verify_store_tracer_proof, StoreReadOp, VerifiedRows,
+    },
     proto::{
-        db_request, db_response, values_sidecar_from_proto, values_sidecar_to_proto, ws_frame,
-        AddMemberRequest, ChangeRequest, DbRequest, DbResponse, Ephemeral, FastForwardRequest,
-        RemoveMemberRequest, SelectRequest, WsFrame,
+        db_request, db_response, store_read_request, values_sidecar_from_proto,
+        values_sidecar_to_proto, ws_frame, AddMemberRequest, ChangeRequest, DbRequest, DbResponse,
+        Ephemeral, FastForwardRequest, RemoveMemberRequest, SelectRequest, StoreReadRange,
+        StoreReadRequest, WsFrame,
     },
     query::Query,
     schema::Schema,
@@ -15,6 +18,7 @@ use encrypted_spaces_backend::{
 use encrypted_spaces_changelog_core::changelog::{
     Change, ChangeResponse, ChangelogEntry, FastForwardData,
 };
+use encrypted_spaces_changelog_core::ReadOp;
 use encrypted_spaces_key_manager::{InviteRequest, RekeyRequest};
 use prost::Message;
 pub(crate) const DEBUG: bool = true;
@@ -569,6 +573,7 @@ impl WebSocketTransport {
                 db_request::Operation::RemoveMember(_) => "RemoveMember",
                 db_request::Operation::List(_) => "List",
                 db_request::Operation::FetchMyKeyDelivery(_) => "FetchMyKeyDelivery",
+                db_request::Operation::StoreRead(_) => "StoreRead",
             }
         }
         let opn = req.operation.as_ref().map(op_name).unwrap_or("<none>");
@@ -720,6 +725,38 @@ impl Transport for WebSocketTransport {
                 schemas,
                 &hashed_values,
             )
+        } else {
+            Err(SdkError::DatabaseError("unexpected response type".into()))
+        }
+    }
+
+    async fn store_read(&self, read: StoreReadOp, commitment: &[u8; 32]) -> Result<VerifiedRows> {
+        // Map the base ReadOp onto the wire selector oneof.
+        let selector = match &read.op {
+            ReadOp::Key(key) => store_read_request::Selector::Key(key.clone()),
+            ReadOp::Prefix(prefix) => store_read_request::Selector::Prefix(prefix.clone()),
+            ReadOp::Range { start, end } => store_read_request::Selector::Range(StoreReadRange {
+                start: start.clone(),
+                end: end.clone(),
+            }),
+        };
+
+        let req = DbRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            operation: Some(db_request::Operation::StoreRead(StoreReadRequest {
+                selector: Some(selector),
+                commitment: commitment.to_vec(),
+                descending: read.descending,
+                limit: read.limit,
+            })),
+        };
+
+        let resp = self.send_request(req).await?;
+
+        if let Some(db_response::Result::StoreRead(store_resp)) = resp.result {
+            // The server proved against its root; verify against our own
+            // commitment, re-deriving the narrowing from the read descriptor.
+            verify_store_tracer_proof(&read, &store_resp.proof, commitment)
         } else {
             Err(SdkError::DatabaseError("unexpected response type".into()))
         }

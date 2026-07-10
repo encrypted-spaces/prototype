@@ -18,6 +18,26 @@ pub struct SchemaTable {
     pub rows: Vec<Value>,
 }
 
+/// A namespaced key-value store declared in an application schema.
+///
+/// Unlike a [`SchemaTable`], a store has no columns, indexes, or access
+/// control: it is an open key-value collection any space member can
+/// read/write/overwrite/delete.  Keys are opaque plaintext bytes; values
+/// are opaque bytes, encrypted client-side unless `encrypted_values` is
+/// false.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaStore {
+    pub name: String,
+    /// Whether values are encrypted client-side before storage.  Defaults
+    /// to `true`; set false only for non-sensitive metadata.
+    #[serde(default = "default_true")]
+    pub encrypted_values: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// Application schema format: table schemas + access control rules.
 ///
 /// This is the preferred format for defining an application's schema.
@@ -46,4 +66,8 @@ pub struct SchemaBundle {
     /// the table are rejected by the verifier.
     #[serde(default)]
     pub acl_only_via_actions: std::collections::BTreeMap<(String, String), Vec<String>>,
+    /// Namespaced key-value stores declared in the schema.  Empty for
+    /// schemas that don't declare any.
+    #[serde(default)]
+    pub stores: Vec<SchemaStore>,
 }

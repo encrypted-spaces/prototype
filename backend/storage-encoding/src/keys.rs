@@ -121,6 +121,12 @@ const TAG_INDEX: &str = "I";
 /// format tokens, not stored in authenticated state.
 const TAG_MARKER: &str = "M";
 
+/// Key type tag for store entries.  Stores are namespaced key-value
+/// collections (see `store_entry_key`); entries live under this tag so
+/// they never collide with row/index/schema keys and a prefix scan over
+/// `tuple("T", store)` is a clean, order-preserving range.
+const TAG_STORE: &str = "T";
+
 /// On-wire format version for the action storage value.
 ///
 /// The stored bytes are `[ACTION_STORAGE_VERSION, postcard(ActionBody)...]`.
@@ -518,6 +524,35 @@ pub fn action_marker_key(primary_table: &str) -> Vec<u8> {
     ])
 }
 
+/// Build the declaration key for a store.
+///
+/// Format: `tuple("S", store, "store")`.  The value is a single byte:
+/// `1` = values are encrypted client-side, `0` = plaintext.  This record
+/// lives in the schema (`"S"`) namespace so the initial merk root
+/// (`DATA_COMMITMENT`) covers every declared store, and the verifier can
+/// authenticate that a write targets a declared store by reading it.
+pub fn store_schema_key(store: &str) -> Vec<u8> {
+    encode_tuple(&[TAG_SCHEMA.into(), store.into(), "store".into()])
+}
+
+/// Build the key for a single store entry.
+///
+/// Format: `tuple("T", store, key_bytes)`.  Keys are opaque plaintext
+/// bytes (needed for lookup); the value is opaque bytes (encrypted
+/// client-side unless the store was declared plaintext).  Byte keys sort
+/// lexicographically, so range/prefix scans over a store are ordered.
+pub fn store_entry_key(store: &str, key: &[u8]) -> Vec<u8> {
+    encode_tuple(&[TAG_STORE.into(), store.into(), key.to_vec().into()])
+}
+
+/// Build a key prefix for iterating every entry in a store.
+///
+/// Format: `tuple("T", store)` — a clean byte-prefix of every
+/// `store_entry_key` for `store`.
+pub fn store_prefix(store: &str) -> Vec<u8> {
+    encode_tuple(&[TAG_STORE.into(), store.into()])
+}
+
 /// Prepend [`ACTION_STORAGE_VERSION`] to a serialized action body.
 pub fn encode_action_value(body: Vec<u8>) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + body.len());
@@ -597,6 +632,19 @@ pub enum ParsedKey {
     ActionMarker {
         primary_table: String,
     },
+    /// `tuple("S", store, "store")` — the store declaration record.
+    StoreSchema {
+        store: String,
+    },
+    /// `tuple("T", store, key_bytes)` — a single store entry.
+    StoreEntry {
+        store: String,
+        key: Vec<u8>,
+    },
+    /// `tuple("T", store)` — a store-entry prefix (whole-store scan).
+    StorePrefix {
+        store: String,
+    },
 }
 
 /// Borrowed view of an exact `tuple("R", table, row_id, column)` key.
@@ -632,6 +680,7 @@ pub fn parse_key(key: &[u8]) -> Result<ParsedKey, KeyError> {
         TAG_ROW => parse_row_elements(&elements),
         TAG_INDEX => parse_index_elements(&elements),
         TAG_MARKER => parse_marker_elements(&elements),
+        TAG_STORE => parse_store_elements(&elements),
         _ => Err(KeyError(format!("Unknown key type: {tag}"))),
     }
 }
@@ -795,6 +844,7 @@ fn parse_schema_elements(elements: &[TupleElement]) -> Result<ParsedKey, KeyErro
                 "columns" => return Ok(ParsedKey::SchemaColumns { table }),
                 "next_id" => return Ok(ParsedKey::SchemaNextId { table }),
                 "id_mode" => return Ok(ParsedKey::SchemaIdMode { table }),
+                "store" => return Ok(ParsedKey::StoreSchema { store: table }),
                 "acl" => {
                     if elements.len() < 4 {
                         return Err(KeyError("acl key missing op".into()));
@@ -872,6 +922,30 @@ fn parse_index_elements(elements: &[TupleElement]) -> Result<ParsedKey, KeyError
         value,
         row_id,
     })
+}
+
+fn parse_store_elements(elements: &[TupleElement]) -> Result<ParsedKey, KeyError> {
+    if elements.len() < 2 {
+        return Err(KeyError("Store key missing store name".into()));
+    }
+
+    let store = element_to_string(&elements[1])?;
+
+    // 2-element key: ("T", store) -> whole-store prefix.
+    if elements.len() < 3 {
+        return Ok(ParsedKey::StorePrefix { store });
+    }
+
+    let key = element_to_bytes(&elements[2])?;
+    Ok(ParsedKey::StoreEntry { store, key })
+}
+
+fn element_to_bytes(elem: &TupleElement) -> Result<Vec<u8>, KeyError> {
+    match elem {
+        TupleElement::Bytes(b) => Ok(b.clone()),
+        TupleElement::String(s) => Ok(s.clone().into_bytes()),
+        _ => Err(KeyError("Expected bytes element".into())),
+    }
 }
 
 fn element_to_string(elem: &TupleElement) -> Result<String, KeyError> {
@@ -986,6 +1060,75 @@ mod tests {
                 row_id
             }
         );
+    }
+
+    #[test]
+    fn test_store_schema_key_roundtrip() {
+        let key = store_schema_key("prefs");
+        assert_eq!(
+            parse_key(&key).unwrap(),
+            ParsedKey::StoreSchema {
+                store: "prefs".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_store_entry_key_roundtrip() {
+        let key = store_entry_key("prefs", b"theme");
+        assert_eq!(
+            parse_key(&key).unwrap(),
+            ParsedKey::StoreEntry {
+                store: "prefs".to_string(),
+                key: b"theme".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_store_entry_key_binary_key_roundtrip() {
+        // Keys are opaque bytes, including embedded nulls and non-UTF-8.
+        let raw = vec![0x00u8, 0xFF, 0x01, 0x00, 0x80];
+        let key = store_entry_key("blobs", &raw);
+        assert_eq!(
+            parse_key(&key).unwrap(),
+            ParsedKey::StoreEntry {
+                store: "blobs".to_string(),
+                key: raw,
+            }
+        );
+    }
+
+    #[test]
+    fn test_store_prefix_roundtrip_and_containment() {
+        let prefix = store_prefix("prefs");
+        assert_eq!(
+            parse_key(&prefix).unwrap(),
+            ParsedKey::StorePrefix {
+                store: "prefs".to_string()
+            }
+        );
+        // The whole-store prefix is a byte-prefix of every entry key.
+        let entry = store_entry_key("prefs", b"theme");
+        assert!(entry.starts_with(&prefix));
+        // A different store's entries are not covered by this prefix.
+        let other = store_entry_key("other", b"theme");
+        assert!(!other.starts_with(&prefix));
+    }
+
+    #[test]
+    fn test_store_entry_key_sort_order() {
+        let store = "prefs";
+        assert!(store_entry_key(store, b"a") < store_entry_key(store, b"b"));
+        assert!(store_entry_key(store, b"a") < store_entry_key(store, b"aa"));
+        assert!(store_entry_key(store, b"") < store_entry_key(store, b"a"));
+    }
+
+    #[test]
+    fn test_store_and_table_schema_keys_disjoint() {
+        // A store declaration and a table schema with the same name occupy
+        // distinct keys, so the flat "S" namespace stays unambiguous.
+        assert_ne!(store_schema_key("prefs"), schema_key("prefs"));
     }
 
     #[test]

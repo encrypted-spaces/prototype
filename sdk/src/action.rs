@@ -14,10 +14,11 @@
 //! itself.
 
 use crate::changelog::ChangeBuilder;
-use crate::table::InsertBuilder;
+use crate::table::{InsertBuilder, Table};
 use crate::Space;
 use encrypted_spaces_acl_types::{Action, ActionLeg};
 use encrypted_spaces_backend::error::{Result, SdkError};
+use encrypted_spaces_backend::merk_storage::ID_FIELD;
 use encrypted_spaces_backend::query::{
     ComparisonOperator, Predicate, Query, QueryOperation, QueryParam,
 };
@@ -202,6 +203,26 @@ impl Space {
         )?;
 
         let primary_table = _action.legs[0].table().to_string();
+
+        // Cache-first pre-check: a delete-primary action targeting a row that is
+        // not present would affect zero rows. Resolve it (cache first, then a
+        // verified server read) and skip submitting when absent — mirroring
+        // `build_update_or_delete`, so the no-op never reaches the chain.
+        let probe: Vec<serde_json::Value> = {
+            let table: Table<serde_json::Value> =
+                Table::new(primary_table.clone(), Arc::new(self.clone()));
+            let mut select = table.select().columns(&[ID_FIELD]);
+            select.query.predicate = Some(Predicate {
+                column: ID_FIELD.to_string(),
+                operator: ComparisonOperator::Equal,
+                values: vec![QueryParam::Integer(row_id)],
+                cursor_id: None,
+            });
+            select.all().await?
+        };
+        if probe.is_empty() {
+            return Ok(0);
+        }
 
         // Build the signed entry's kvs: only the primary leg's row.
         // Cascade legs are derived at verification time by reading the

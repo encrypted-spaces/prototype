@@ -5,6 +5,7 @@ pub use encrypted_spaces_backend::schema::ColumnType;
 pub use encrypted_spaces_backend::schema::Schema;
 use encrypted_spaces_backend::schema_kdl::parse_schema_bundle;
 use encrypted_spaces_backend::{
+    app_schema::SchemaStore,
     error::{Result, SdkError},
     merk_storage::ID_FIELD,
     schema::ColumnDefinition,
@@ -16,6 +17,14 @@ impl Space {
     /// Register a table schema.
     pub fn register_table_schema(&self, schema: Schema) {
         self.with_state_mut(|state| state.table_schemas.insert(schema.name.clone(), schema));
+    }
+
+    /// Register a key-value store declaration locally, so [`Space::store`]
+    /// can resolve it. Used by joined actors (whose schema bytes already
+    /// declared the store on the backend) and by tests; the backend
+    /// declaration is unaffected.
+    pub fn register_store(&self, store: SchemaStore) {
+        self.with_state_mut(|state| state.stores.insert(store.name.clone(), store));
     }
 
     /// Get the schema for a table.
@@ -51,20 +60,19 @@ pub enum ApplicationSchema {
 }
 
 impl ApplicationSchema {
-    pub(crate) async fn into_parts(
-        self,
-    ) -> Result<(
-        DataCommitment,
-        HashMap<String, Schema>,
-        HashMap<String, Action>,
-        FfImageId,
-    )> {
+    pub(crate) async fn into_parts(self) -> Result<SchemaParts> {
         match self {
             ApplicationSchema::WithDataCommitment(schemas, commitment, image_id) => {
                 let map = schemas.into_iter().map(|s| (s.name.clone(), s)).collect();
-                // Explicit-schemas mode doesn't carry actions; callers
-                // can `register_action` after-the-fact for tests.
-                Ok((commitment, map, HashMap::new(), image_id))
+                // Explicit-schemas mode doesn't carry actions or stores;
+                // callers can register them after-the-fact for tests.
+                Ok(SchemaParts {
+                    commitment,
+                    schemas: map,
+                    actions: HashMap::new(),
+                    stores: HashMap::new(),
+                    image_id,
+                })
             }
             ApplicationSchema::FromBytes(bytes, commitment, image_id) => {
                 Self::app_schema_bundle_into_parts(bytes, commitment, image_id).await
@@ -76,12 +84,7 @@ impl ApplicationSchema {
         bytes: &[u8],
         commitment: DataCommitment,
         image_id: FfImageId,
-    ) -> Result<(
-        DataCommitment,
-        HashMap<String, Schema>,
-        HashMap<String, Action>,
-        FfImageId,
-    )> {
+    ) -> Result<SchemaParts> {
         let text = std::str::from_utf8(bytes).map_err(|e| {
             SdkError::SchemaParsingError(format!("Schema bytes are not valid UTF-8: {e}"))
         })?;
@@ -97,9 +100,31 @@ impl ApplicationSchema {
             .into_iter()
             .map(|a| (a.name.clone(), a))
             .collect();
+        let stores = bundle
+            .stores
+            .into_iter()
+            .map(|s| (s.name.clone(), s))
+            .collect();
 
-        Ok((commitment, schemas, actions, image_id))
+        Ok(SchemaParts {
+            commitment,
+            schemas,
+            actions,
+            stores,
+            image_id,
+        })
     }
+}
+
+/// The runtime-facing pieces of an [`ApplicationSchema`], produced by
+/// [`ApplicationSchema::into_parts`] and used to populate space state.
+#[derive(Debug)]
+pub(crate) struct SchemaParts {
+    pub commitment: DataCommitment,
+    pub schemas: HashMap<String, Schema>,
+    pub actions: HashMap<String, Action>,
+    pub stores: HashMap<String, SchemaStore>,
+    pub image_id: FfImageId,
 }
 
 #[derive(Debug)]
@@ -522,13 +547,14 @@ mod tests {
         let image_id: FfImageId = [7u32; 8];
         let app = ApplicationSchema::WithDataCommitment(vec![schema], commitment, image_id);
 
-        let (out_commit, out_map, out_actions, out_image_id) = app.into_parts().await.unwrap();
+        let parts = app.into_parts().await.unwrap();
 
-        assert_eq!(out_commit, commitment);
-        assert_eq!(out_map.len(), 1);
-        assert!(out_map.contains_key("things"));
-        assert!(out_actions.is_empty());
-        assert_eq!(out_image_id, image_id);
+        assert_eq!(parts.commitment, commitment);
+        assert_eq!(parts.schemas.len(), 1);
+        assert!(parts.schemas.contains_key("things"));
+        assert!(parts.actions.is_empty());
+        assert!(parts.stores.is_empty());
+        assert_eq!(parts.image_id, image_id);
     }
 
     #[tokio::test]

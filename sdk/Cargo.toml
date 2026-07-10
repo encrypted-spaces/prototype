@@ -91,3 +91,7 @@ required-features = ["testing"]
 [[example]]
 name = "task_list"
 required-features = ["local-transport", "testing"]
+
+[[example]]
+name = "key_value_store"
+required-features = ["local-transport", "testing"]

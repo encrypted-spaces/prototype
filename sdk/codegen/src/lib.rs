@@ -551,6 +551,7 @@ mod tests {
                 },
             ],
             acl_only_via_actions: Default::default(),
+            stores: Vec::new(),
         }
     }
 
@@ -580,6 +581,22 @@ mod tests {
         bundle.actions.clear();
         let out = render(&bundle, &[0u8; 32], &[0u32; 8], "/dev/null");
         assert!(!out.contains("pub trait Actions"));
+    }
+
+    #[test]
+    fn render_handles_bundle_with_stores() {
+        // Codegen emits no per-store accessors in this version, but a
+        // bundle carrying stores must still render without panicking. The
+        // store's contribution to DATA_COMMITMENT is covered at the backend
+        // layer (`import_stores` changes the merk root).
+        use encrypted_spaces_backend::app_schema::SchemaStore;
+        let mut bundle = sample_bundle();
+        bundle.stores.push(SchemaStore {
+            name: "prefs".to_string(),
+            encrypted_values: true,
+        });
+        let out = render(&bundle, &[0u8; 32], &[0u32; 8], "/dev/null");
+        assert!(out.contains("pub const DATA_COMMITMENT"));
     }
 
     #[test]

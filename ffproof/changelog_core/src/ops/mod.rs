@@ -11,6 +11,7 @@ pub mod reduce_op;
 pub mod refresh_keys_op;
 pub mod rekey_op;
 pub mod remove_user_op;
+pub mod store_op;
 pub mod update_op;
 
 use crate::changelog::{ChangelogEntry, ChangelogError, KvData, OpType, MAX_LOGMSG_ENTRIES};
@@ -20,8 +21,8 @@ use encrypted_spaces_storage_encoding::keys::{
     acl_only_via_actions_key, acl_rule_key, action_storage_key, column_key, decode_action_value,
     index_key, index_value_prefix, parse_column_key_ref, parse_key, row_id_to_bytes, row_key,
     schema_columns_key, schema_id_mode_key, schema_indexes_key, schema_list_columns_key,
-    schema_next_id_key, ParsedKey, TupleConversionError, KEY_HISTORY_TABLE, RETENTION_TABLE,
-    USERS_TABLE,
+    schema_next_id_key, store_schema_key, ParsedKey, TupleConversionError, KEY_HISTORY_TABLE,
+    RETENTION_TABLE, USERS_TABLE,
 };
 use encrypted_spaces_storage_encoding::stored_value::{bytes_to_value, value_to_bytes};
 use encrypted_spaces_storage_encoding::{decode_column_names, TupleElement};
@@ -42,6 +43,7 @@ pub use reduce_op::ReduceOp;
 pub use refresh_keys_op::{RefreshKeysOp, REFRESH_KEYS_ALLOWED_COLUMNS};
 pub use rekey_op::RekeyOp;
 pub use remove_user_op::RemoveUserOp;
+pub use store_op::{StoreDeleteOp, StorePutOp};
 pub use update_op::UpdateOp;
 
 // ─── Shared column-op validation helpers ─────────────────────────────────────
@@ -1006,6 +1008,43 @@ pub(crate) fn read_schema_columns(
     Ok(cols)
 }
 
+/// Authenticate that `store` is declared (`store_schema_key` present), caching
+/// the positive result in the `OpContext` so repeated store writes — many
+/// entries in one change, or many changes across a FF proof sequence — issue
+/// the `store_schema_key` read at most once.
+///
+/// On a cache miss, issues one deterministic read of `store_schema_key(store)`;
+/// absence means the store isn't declared and the write is rejected (a client
+/// cannot fabricate a namespace).
+pub(crate) fn validate_store_declared(
+    store: &str,
+    op_name: &str,
+    reader: &mut dyn OpReader,
+    ctx: &OpContext,
+) -> Result<(), ChangelogError> {
+    if ctx
+        .static_cache
+        .state
+        .borrow()
+        .declared_stores
+        .contains(store)
+    {
+        return Ok(());
+    }
+    let read = reader.read(ReadOp::Key(store_schema_key(store)))?;
+    if read.results.is_empty() {
+        return Err(ChangelogError::Generic(format!(
+            "{op_name}: store '{store}' is not declared"
+        )));
+    }
+    ctx.static_cache
+        .state
+        .borrow_mut()
+        .declared_stores
+        .insert(store.to_string());
+    Ok(())
+}
+
 /// Read the compact indexed-column-names list from the tree.
 ///
 /// Reads `schema_indexes_key(table)` which stores a null-separated UTF-8
@@ -1939,6 +1978,10 @@ struct StaticMetadataCacheState {
     actions: BTreeMap<(String, String), Option<Action>>,
     only_via_actions: BTreeMap<(String, String), Option<Vec<String>>>,
     auto_increment: BTreeMap<String, bool>,
+    /// Stores confirmed declared (`store_schema_key` present). Only positive
+    /// results are cached — an undeclared store rejects the write outright,
+    /// and declarations are immutable for the life of a space.
+    declared_stores: BTreeSet<String>,
 }
 
 impl StaticMetadataCacheState {
@@ -1950,6 +1993,7 @@ impl StaticMetadataCacheState {
         self.actions.clear();
         self.only_via_actions.clear();
         self.auto_increment.clear();
+        self.declared_stores.clear();
     }
 }
 
@@ -2083,6 +2127,8 @@ pub fn dispatch_extract_and_validate(
         OpType::Reduce => ReduceOp::extract_and_validate(entry, reader, ctx),
         OpType::Rekey => RekeyOp::extract_and_validate(entry, reader, ctx),
         OpType::Action => ActionOp::extract_and_validate(entry, reader, ctx),
+        OpType::StorePut => StorePutOp::extract_and_validate(entry, reader, ctx),
+        OpType::StoreDelete => StoreDeleteOp::extract_and_validate(entry, reader, ctx),
         OpType::Noop => Ok(OpVerifyResult {
             write_steps: Vec::new(),
         }),

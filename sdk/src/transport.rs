@@ -1,7 +1,7 @@
 use encrypted_spaces_backend::{
     access_control::AuthContext,
     error::{Result, SdkError},
-    merk_storage::proofs::VerifiedRows,
+    merk_storage::proofs::{StoreReadOp, VerifiedRows},
     query::Query,
     schema::Schema,
 };
@@ -74,6 +74,19 @@ pub trait Transport: Send + Sync + 'static {
         commitment: &[u8; 32],
         schemas: &HashMap<String, Schema>,
     ) -> Result<VerifiedRows>;
+
+    /// Read from a key-value store: prove `read` (a base `ReadOp` plus optional
+    /// order and limit) against `commitment`, verify the tracer proof, and
+    /// return the authenticated rows. A limited read proves and transfers only
+    /// the keys it returns.
+    ///
+    /// The default errors "unsupported"; transports that can reach storage
+    /// override it.
+    async fn store_read(&self, _read: StoreReadOp, _commitment: &[u8; 32]) -> Result<VerifiedRows> {
+        Err(SdkError::ValidationError(
+            "store_read is not supported by this transport".into(),
+        ))
+    }
 
     /// Upcast to `&dyn Any` for runtime downcasts to concrete transport types.
     fn as_any(&self) -> &dyn Any;

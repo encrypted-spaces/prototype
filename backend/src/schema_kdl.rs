@@ -19,6 +19,9 @@
 //!             }
 //!         }
 //!     }`
+//!   - `store "<name>" encrypted=#true?` — a namespaced key-value store.
+//!     Stores are open (any member reads/writes/overwrites/deletes any
+//!     key); they have no columns and no `rules` block in this version.
 //!
 //! Tables can omit the `rules { }` block (default-open).  The primary
 //! leg of an `action` (`insert` / `update` / `delete`) implicitly
@@ -29,9 +32,9 @@
 //! by `sdk-codegen` from the parsed schema; it is *not* declared in
 //! the schema KDL.
 
-use crate::app_schema::{SchemaBundle, SchemaTable};
+use crate::app_schema::{SchemaBundle, SchemaStore, SchemaTable};
 use crate::error::{Result, SdkError};
-use crate::internal_schemas::ACCESS_CONTROL_TABLE_NAME;
+use crate::internal_schemas::{is_reserved_table_name, ACCESS_CONTROL_TABLE_NAME};
 use crate::schema::{ColumnDefinition, ColumnType, Schema};
 use encrypted_spaces_acl_types::{
     parse_access_rule, parse_assertion, AccessOperation, AccessRule, Action, ActionLeg, Assertion,
@@ -50,6 +53,7 @@ pub fn parse_schema_bundle(text: &str) -> Result<SchemaBundle> {
     let mut acl_only_via_actions: std::collections::BTreeMap<(String, String), Vec<String>> =
         std::collections::BTreeMap::new();
     let mut seen_action_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stores: Vec<SchemaStore> = Vec::new();
 
     for node in doc.nodes() {
         match node.name().value() {
@@ -61,12 +65,34 @@ pub fn parse_schema_bundle(text: &str) -> Result<SchemaBundle> {
                 &mut actions,
                 &mut seen_action_names,
             )?,
+            "store" => parse_store_node(node, &mut stores)?,
             other => {
                 return Err(SdkError::SchemaParsingError(format!(
-                    "Unknown top-level node '{other}' in schema (only `table` is allowed at the \
-                     top level; ACL clauses and actions nest inside a table's `rules` block)"
+                    "Unknown top-level node '{other}' in schema (only `table` and `store` are \
+                     allowed at the top level; ACL clauses and actions nest inside a table's \
+                     `rules` block)"
                 )));
             }
+        }
+    }
+
+    // Store names share a single flat namespace with tables and with each
+    // other, because a store declaration (`tuple("S", name, "store")`)
+    // and a table schema (`tuple("S", name, ...)`) would otherwise be
+    // ambiguous under the same name.
+    for (i, store) in stores.iter().enumerate() {
+        if tables.iter().any(|t| t.table == store.name) {
+            return Err(SdkError::SchemaParsingError(format!(
+                "store \"{}\" collides with a table of the same name; tables and stores share \
+                 one namespace",
+                store.name
+            )));
+        }
+        if stores[..i].iter().any(|s| s.name == store.name) {
+            return Err(SdkError::SchemaParsingError(format!(
+                "store \"{}\" is declared more than once",
+                store.name
+            )));
         }
     }
 
@@ -119,7 +145,42 @@ pub fn parse_schema_bundle(text: &str) -> Result<SchemaBundle> {
         tables: all_tables,
         actions,
         acl_only_via_actions,
+        stores,
     })
+}
+
+/// Parse a top-level `store "<name>" encrypted=#true?` node.
+///
+/// Phase 1 stores are open key-value collections: no columns, no
+/// `rules`/ACL, no actions.  Any child block is rejected so that adding
+/// per-store rules later is an additive change rather than a silent
+/// no-op on existing schemas.
+fn parse_store_node(node: &KdlNode, stores: &mut Vec<SchemaStore>) -> Result<()> {
+    let name = string_arg(node, "store")?.to_string();
+
+    if is_reserved_table_name(&name) {
+        return Err(SdkError::SchemaParsingError(format!(
+            "store \"{name}\": names starting with `_` are reserved for internal use"
+        )));
+    }
+
+    let encrypted_values = bool_attr(node, "encrypted")?.unwrap_or(true);
+
+    if let Some(children) = node.children() {
+        if let Some(first) = children.nodes().first() {
+            return Err(SdkError::SchemaParsingError(format!(
+                "store \"{name}\": unexpected `{}` node.  Stores are open key-value collections \
+                 with no columns or rules in this version",
+                first.name().value()
+            )));
+        }
+    }
+
+    stores.push(SchemaStore {
+        name,
+        encrypted_values,
+    });
+    Ok(())
 }
 
 fn validate_hash_backed_semantic_refs(
@@ -768,6 +829,84 @@ mod tests {
         assert!(!schema.columns[1].plaintext);
         assert!(schema.columns[2].plaintext); // list implicitly plaintext
         assert!(!schema.columns[2].indexed);
+    }
+
+    #[test]
+    fn parses_store_with_defaults() {
+        let kdl = r#"
+            store "prefs"
+        "#;
+        let bundle = parse_schema_bundle(kdl).unwrap();
+        assert_eq!(bundle.stores.len(), 1);
+        assert_eq!(bundle.stores[0].name, "prefs");
+        assert!(bundle.stores[0].encrypted_values);
+        assert!(bundle.tables.is_empty());
+    }
+
+    #[test]
+    fn parses_store_with_plaintext_values() {
+        let kdl = r#"
+            store "metadata" encrypted=#false
+        "#;
+        let bundle = parse_schema_bundle(kdl).unwrap();
+        assert_eq!(bundle.stores.len(), 1);
+        assert!(!bundle.stores[0].encrypted_values);
+    }
+
+    #[test]
+    fn parses_tables_and_stores_together() {
+        let kdl = r#"
+            table "channels" {
+                column "id" type="int" plaintext=#true
+            }
+            store "prefs"
+            store "cache" encrypted=#false
+        "#;
+        let bundle = parse_schema_bundle(kdl).unwrap();
+        assert_eq!(bundle.tables.len(), 1);
+        assert_eq!(bundle.stores.len(), 2);
+    }
+
+    #[test]
+    fn store_rejects_child_block() {
+        let kdl = r#"
+            store "prefs" {
+                column "id" type="int"
+            }
+        "#;
+        let err = parse_schema_bundle(kdl).unwrap_err().to_string();
+        assert!(err.contains("no columns or rules"), "got: {err}");
+    }
+
+    #[test]
+    fn store_rejects_reserved_name() {
+        let kdl = r#"
+            store "_users"
+        "#;
+        let err = parse_schema_bundle(kdl).unwrap_err().to_string();
+        assert!(err.contains("reserved"), "got: {err}");
+    }
+
+    #[test]
+    fn store_rejects_collision_with_table() {
+        let kdl = r#"
+            table "prefs" {
+                column "id" type="int" plaintext=#true
+            }
+            store "prefs"
+        "#;
+        let err = parse_schema_bundle(kdl).unwrap_err().to_string();
+        assert!(err.contains("collides with a table"), "got: {err}");
+    }
+
+    #[test]
+    fn store_rejects_duplicate_name() {
+        let kdl = r#"
+            store "prefs"
+            store "prefs"
+        "#;
+        let err = parse_schema_bundle(kdl).unwrap_err().to_string();
+        assert!(err.contains("declared more than once"), "got: {err}");
     }
 
     #[test]

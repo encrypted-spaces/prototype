@@ -5,6 +5,11 @@
 //! calls so tests can assert "this was a cache hit" by checking the
 //! counter didn't grow across a select. Modeled after the equivalent
 //! helper on Trevor's branch, trimmed to what these tests need.
+//!
+//! This module is included by several test binaries (`cache_regression`,
+//! `store_integration`), each of which uses a different subset of the
+//! helpers, so items unused by one binary trip `dead_code` there.
+#![allow(dead_code)]
 
 use std::any::Any;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,7 +17,7 @@ use std::sync::Arc;
 
 use encrypted_spaces_backend::access_control::AuthContext;
 use encrypted_spaces_backend::error::Result;
-use encrypted_spaces_backend::merk_storage::proofs::VerifiedRows;
+use encrypted_spaces_backend::merk_storage::proofs::{StoreReadOp, VerifiedRows};
 use encrypted_spaces_backend::query::Query;
 use encrypted_spaces_changelog_core::changelog::{Change, ChangeResponse, FastForwardData};
 use encrypted_spaces_key_manager::{InviteRequest, RekeyRequest};
@@ -67,6 +72,7 @@ pub fn tags_schema() -> Schema {
 pub struct CountingTransport {
     inner: LocalTransport,
     select_calls: Arc<AtomicUsize>,
+    store_read_calls: Arc<AtomicUsize>,
 }
 
 impl CountingTransport {
@@ -74,7 +80,12 @@ impl CountingTransport {
         Self {
             inner,
             select_calls: Arc::new(AtomicUsize::new(0)),
+            store_read_calls: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    pub fn store_read_count(&self) -> usize {
+        self.store_read_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -100,6 +111,11 @@ impl Transport for CountingTransport {
     ) -> Result<VerifiedRows> {
         self.select_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.select(query, commitment, schemas).await
+    }
+
+    async fn store_read(&self, read: StoreReadOp, commitment: &[u8; 32]) -> Result<VerifiedRows> {
+        self.store_read_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.store_read(read, commitment).await
     }
 
     fn as_any(&self) -> &dyn Any {

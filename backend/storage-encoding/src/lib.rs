@@ -18,9 +18,9 @@ pub use keys::{
     acl_only_via_actions_key, acl_rule_key, action_marker_key, action_storage_key, bytes_to_row_id,
     column_key_placeholder, decode_action_value, encode_action_value, index_column_prefix,
     index_key, index_value_prefix, parse_column_key_ref, parse_key, row_id_to_bytes, row_key,
-    row_prefix, schema_columns_key, schema_indexes_key, schema_key, users_row_key, ColumnKeyRef,
-    KeyError, ParsedKey, TupleConversionError, ACTION_STORAGE_VERSION, RETENTION_TABLE,
-    USERS_TABLE,
+    row_prefix, schema_columns_key, schema_indexes_key, schema_key, store_entry_key, store_prefix,
+    store_schema_key, users_row_key, ColumnKeyRef, KeyError, ParsedKey, TupleConversionError,
+    ACTION_STORAGE_VERSION, RETENTION_TABLE, USERS_TABLE,
 };
 pub use tuple::{decode_tuple, encode_tuple, DecodeError, TupleElement};
 

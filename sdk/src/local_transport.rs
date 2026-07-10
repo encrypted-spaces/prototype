@@ -4,7 +4,9 @@ use encrypted_spaces_backend::{
     access_control::{AccessOperation, AccessRule, AuthContext},
     error::{Result, SdkError},
     internal_schemas::is_reserved_table_name,
-    merk_storage::proofs::{verify_query_proof_with_hashed_values, VerifiedRows},
+    merk_storage::proofs::{
+        verify_query_proof_with_hashed_values, verify_store_tracer_proof, StoreReadOp, VerifiedRows,
+    },
     query::Query,
     schema::Schema,
     storage::Storage as StorageTrait,
@@ -268,6 +270,35 @@ impl LocalTransport {
         Ok(())
     }
 
+    /// Declare a key-value store in the local backend storage.
+    ///
+    /// Only available on `LocalTransport` (for testing).  In production,
+    /// stores are declared server-side at space init from the schema
+    /// bundle (see `SpaceState::bootstrap_from_schema_file`).  Resets the
+    /// changelog baseline like [`Self::create_table`] does, so subsequent
+    /// tracked changes replay from the new post-declaration tree.
+    pub async fn create_store(
+        &self,
+        store: &encrypted_spaces_backend::app_schema::SchemaStore,
+    ) -> Result<()> {
+        if is_reserved_table_name(&store.name) {
+            return Err(SdkError::ValidationError(format!(
+                "store '{}' is reserved: names starting with '_' are reserved for internal use",
+                store.name
+            )));
+        }
+        let mut state = self.state.lock().await;
+        state.db.import_stores(std::slice::from_ref(store)).await?;
+
+        let current_root = state.get_root_hash().await;
+        state.changelog = ChangeLog::new(&current_root);
+        state.change_responses.clear();
+        state.ff_proof = None;
+        state.tree_snapshot = state.db.snapshot();
+        state.sigref_map.clear();
+        Ok(())
+    }
+
     /// Inject an access-control rule into the local backend storage and
     /// re-finalize the ACL blob.
     ///
@@ -372,6 +403,12 @@ impl Transport for LocalTransport {
             schemas,
             &select_response.hashed_values,
         )
+    }
+
+    async fn store_read(&self, read: StoreReadOp, commitment: &[u8; 32]) -> Result<VerifiedRows> {
+        let state = self.state.lock().await;
+        let proof = state.db.prove_store_read(&read).await?;
+        verify_store_tracer_proof(&read, &proof, commitment)
     }
 
     #[inline]
@@ -499,6 +536,37 @@ impl crate::Space {
             // Server changelog baseline was reset out-of-band; per-user
             // sigref chains must restart so the next tracked change
             // (sig_ref=0) is accepted by `check_sigref_continuity`.
+            state.sigref_map.clear();
+            state.current_clc_state = crate::state::initial_clc_state(&new_root);
+            state.kv_cache.advance_anchor(new_root, Default::default());
+        });
+        Ok(())
+    }
+
+    /// Declare a key-value store in the local backend and register it
+    /// locally. Test-only; requires a `LocalTransport`-backed `Space`.
+    /// Resets the client state to the new server root, exactly like
+    /// [`Self::create_table`].
+    pub async fn create_store(
+        &self,
+        store: &encrypted_spaces_backend::app_schema::SchemaStore,
+    ) -> Result<()> {
+        let local = self
+            .transport
+            .as_any()
+            .downcast_ref::<LocalTransport>()
+            .expect("Space::create_store requires a LocalTransport-backed Space");
+        local.create_store(store).await?;
+        self.with_state_mut(|state| {
+            state.stores.insert(store.name.clone(), store.clone());
+        });
+
+        let new_root = local.get_root_hash().await?;
+        self.with_state_mut(|state| {
+            state.current_data_commitment = new_root;
+            state.initial_dc = new_root;
+            state.current_change_id = 0;
+            state.my_last_change_id = 0;
             state.sigref_map.clear();
             state.current_clc_state = crate::state::initial_clc_state(&new_root);
             state.kv_cache.advance_anchor(new_root, Default::default());

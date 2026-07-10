@@ -118,6 +118,7 @@ impl Space {
                 key_valid_from_change_id: 0,
                 table_schemas: HashMap::new(),
                 actions: HashMap::new(),
+                stores: HashMap::new(),
                 current_clc_state: state::initial_clc_state(&initial_dc),
                 current_change_entry: None,
                 ff_image_id: EXTEND_FF_ID,

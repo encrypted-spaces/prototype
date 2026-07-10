@@ -234,23 +234,8 @@ impl MerkStorage {
     ///
     /// This is useful for proving all rows in a table or all index entries.
     pub async fn prove_prefix(&self, prefix: &[u8]) -> Result<Vec<u8>> {
-        // Build a range query for the prefix
-        // The range is [prefix, prefix_end) where prefix_end is the lexicographically next prefix
-        let mut end_prefix = prefix.to_vec();
-        // Increment the last byte to get the exclusive end bound
-        // This works for our length-prefixed keys since we want all keys starting with prefix
-        if let Some(last) = end_prefix.last_mut() {
-            if *last < 255 {
-                *last += 1;
-            } else {
-                // If last byte is 255, we need to handle overflow
-                // For simplicity, just append 0xFF to make it larger
-                end_prefix.push(0xFF);
-            }
-        }
-
         let mut query = MerkQuery::new();
-        query.insert_range(prefix.to_vec()..end_prefix);
+        query.insert_range(prefix_scan_range(prefix));
 
         // Generate the proof using prove() which returns encoded bytes
         let proof = self
@@ -259,6 +244,37 @@ impl MerkStorage {
             .map_err(|e| SdkError::DatabaseError(format!("Failed to generate proof: {e:?}")))?;
 
         Ok(proof)
+    }
+
+    /// Generate a tracer proof for a namespaced key-value store read.
+    ///
+    /// Discovers the present keys in the read's base range, applies the limit
+    /// narrowing (so a limited read proves and transfers only the keys it
+    /// returns), and traces a single read step over the narrowed range. The
+    /// verifier reconstructs the same narrowing from the authenticated entries
+    /// (see [`verify_store_tracer_proof`]).
+    pub async fn prove_store_read(&self, read: &StoreReadOp) -> Result<Vec<u8>> {
+        let Some(tree) = self.merk.snapshot() else {
+            return Err(SdkError::DatabaseError(
+                "Tree is empty, cannot generate store read proof".to_string(),
+            ));
+        };
+
+        // Discover present keys in the base range (ascending) so we can apply
+        // the same limit narrowing the verifier will re-derive from the proof.
+        let (start, end) = store_op_range(&read.op)?;
+        let present: Vec<Vec<u8>> = collect_range(&tree, &start, Some(&end))
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        let narrowing = store_narrowing_keys(&present, read.descending, read.limit);
+        let narrowed = narrow_store_op(&read.op, read.descending, read.limit, &narrowing)?;
+
+        let steps = vec![InputStep::Read(vec![narrowed])];
+        let tracer_proof = create_trace_full(&tree, &steps);
+        postcard::to_allocvec(&StoreReadProof { tracer_proof }).map_err(|e| {
+            SdkError::SerializationError(format!("Failed to serialize StoreReadProof: {e}"))
+        })
     }
 
     /// Generate a proof for a SELECT query.
@@ -605,6 +621,162 @@ fn verify_merk_query(
         .map_err(|e| SdkError::DatabaseError(format!("Proof verification failed: {e:?}")))
 }
 
+/// The half-open key range covering every key with the given prefix:
+/// `[prefix, prefix_end)`. Used by [`MerkStorage::prove_prefix`].
+fn prefix_scan_range(prefix: &[u8]) -> std::ops::Range<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    if let Some(last) = end.last_mut() {
+        if *last < 255 {
+            *last += 1;
+        } else {
+            end.push(0xFF);
+        }
+    }
+    prefix.to_vec()..end
+}
+
+/// The half-open `[start, end)` byte range a store read op covers, in
+/// entry-key space. Shared by prover and verifier so both agree on the base
+/// range before any limit narrowing.
+#[cfg(any(feature = "merk", feature = "merk_verify"))]
+fn store_op_range(op: &ReadOp) -> Result<(Vec<u8>, Vec<u8>)> {
+    Ok(match op {
+        ReadOp::Key(k) => (k.clone(), prefix_successor_required(k)?),
+        ReadOp::Prefix(p) => (p.clone(), prefix_successor_required(p)?),
+        ReadOp::Range { start, end } => (start.clone(), end.clone()),
+    })
+}
+
+/// The kept key set for a limited store read: the first (or last, if
+/// `descending`) `limit` present keys, in `[start, end)` byte order.
+///
+/// `present_asc` must be the present entry keys in ascending byte order (the
+/// order `collect_range` yields on the prover, and the order the authenticated
+/// proof entries arrive in on the verifier). Both sides call this so the
+/// narrowing agrees.
+#[cfg(any(feature = "merk", feature = "merk_verify"))]
+fn store_narrowing_keys(
+    present_asc: &[Vec<u8>],
+    descending: bool,
+    limit: Option<u32>,
+) -> std::collections::BTreeSet<Vec<u8>> {
+    let mut keys: Vec<Vec<u8>> = present_asc.to_vec();
+    if descending {
+        keys.reverse();
+    }
+    if let Some(limit) = limit {
+        keys.truncate(limit as usize);
+    }
+    keys.into_iter().collect()
+}
+
+/// Narrow a store read's base range to exactly the kept keys when a limit
+/// binds. Ascending keeps the low end and tightens `end` past the largest
+/// kept key; descending keeps the high end and lifts `start` to the smallest
+/// kept key. Mirrors the SELECT [`narrow_first_op`] limit logic (no cursor).
+#[cfg(any(feature = "merk", feature = "merk_verify"))]
+fn narrow_store_op(
+    op: &ReadOp,
+    descending: bool,
+    limit: Option<u32>,
+    narrowing_keys: &std::collections::BTreeSet<Vec<u8>>,
+) -> Result<ReadOp> {
+    let limit_narrows = matches!(limit, Some(limit)
+        if narrowing_keys.len() >= limit as usize);
+    if !limit_narrows {
+        return Ok(op.clone());
+    }
+    let (mut start, mut end) = store_op_range(op)?;
+    if descending {
+        start = narrowing_keys.first().unwrap().clone();
+    } else {
+        end = prefix_successor_required(narrowing_keys.last().unwrap())?;
+    }
+    Ok(ReadOp::Range { start, end })
+}
+
+/// Tracer-based proof for a namespaced key-value store read. Wraps a single
+/// `TracerProof` with one `InputStep::Read` whose (possibly limit-narrowed)
+/// `ReadOp` authenticates the complete set of present keys in the proven
+/// range — so a limited read proves and transfers only the keys it returns.
+#[cfg(any(feature = "merk", feature = "merk_verify"))]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoreReadProof {
+    tracer_proof: TracerProof,
+}
+
+/// Verify a key-value store read proof and return the authenticated rows.
+///
+/// Re-derives the limit narrowing from the authenticated entries and demands
+/// `ReadOp` set-equality against the proof, so the server cannot omit,
+/// reorder, or invent keys. Stores have no columns or schema, so `main_rows`
+/// / `rows_by_table` are empty; only `kv_pairs` (raw, still-encrypted entry
+/// values, ascending) and the authenticated `read_ops` are populated, for the
+/// cache to ingest. Presentation order/limit/decrypt happen in the runtime
+/// `Store` layer.
+#[cfg(any(feature = "merk", feature = "merk_verify"))]
+pub fn verify_store_tracer_proof(
+    read: &StoreReadOp,
+    proof: &[u8],
+    commitment: &[u8; 32],
+) -> Result<VerifiedRows> {
+    let store_proof: StoreReadProof = postcard::from_bytes(proof).map_err(|e| {
+        SdkError::SerializationError(format!("Failed to deserialize StoreReadProof: {e}"))
+    })?;
+    let tracer = &store_proof.tracer_proof;
+
+    if tracer.expected_start_root != *commitment {
+        return Err(SdkError::ValidationError(
+            "Store read proof root does not match commitment".into(),
+        ));
+    }
+    // Read-only: net change is zero and no write steps sneak in.
+    if tracer.expected_start_root != tracer.expected_end_root {
+        return Err(SdkError::ValidationError(
+            "Read-only store proof must have start_root == end_root".into(),
+        ));
+    }
+    if tracer
+        .steps
+        .iter()
+        .any(|step| matches!(step, TraceStep::Write(_)))
+    {
+        return Err(SdkError::ValidationError(
+            "Read-only store proof must not contain write steps".into(),
+        ));
+    }
+
+    let read_results = verify_trace(tracer).map_err(|_| {
+        SdkError::ValidationError("Store read TracerProof verification failed".into())
+    })?;
+    let Some(step) = read_results.first() else {
+        return Err(SdkError::ValidationError(
+            "Store read proof missing its read step".into(),
+        ));
+    };
+
+    // Authenticated entries, ascending (proof/BST order).
+    let entries: Vec<(Vec<u8>, Vec<u8>)> = step
+        .iter()
+        .flat_map(|pr| pr.results.iter().cloned())
+        .collect();
+    let present_asc: Vec<Vec<u8>> = entries.iter().map(|(k, _)| k.clone()).collect();
+
+    // Reconstruct the server's narrowing from the authenticated entries and
+    // require the proven ReadOp to match exactly.
+    let narrowing = store_narrowing_keys(&present_asc, read.descending, read.limit);
+    let expected = narrow_store_op(&read.op, read.descending, read.limit, &narrowing)?;
+    let actual: Vec<&ReadOp> = step.iter().map(|pr| &pr.op).collect();
+    verify_read_ops(&[expected], &actual, "store read proof")?;
+
+    Ok(VerifiedRows {
+        main_rows: Vec::new(),
+        rows_by_table: HashMap::new(),
+        kv_pairs: entries,
+        read_ops: actual.into_iter().cloned().collect(),
+    })
+}
+
 /// Verify a Merkle proof against an expected root hash.
 ///
 /// Returns the key-value pairs that were proven.
@@ -621,6 +793,35 @@ pub fn verify_proof(
     }
 
     verify_merk_query(proof, query, *expected_root)
+}
+
+/// A namespaced key-value store read: a base selector (`op`) plus optional
+/// ordering and limit. When `limit` is set, the proof is narrowed to exactly
+/// the returned keys (the first/last `limit` present keys of `op`'s range in
+/// byte order), so a limited read proves and transfers only what it returns.
+/// `descending` selects the high end (`last`); ascending (default) the low end
+/// (`first`). Both prover and verifier derive the same narrowing independently.
+#[cfg(any(feature = "merk", feature = "merk_verify"))]
+#[derive(Clone, Debug)]
+pub struct StoreReadOp {
+    /// Base range to read (`Key` for a point, `Prefix`/`Range` for a scan).
+    pub op: ReadOp,
+    /// Walk order: `false` = ascending (default), `true` = descending.
+    pub descending: bool,
+    /// Keep only the first (or last, if `descending`) N present keys.
+    pub limit: Option<u32>,
+}
+
+#[cfg(any(feature = "merk", feature = "merk_verify"))]
+impl StoreReadOp {
+    /// An unlimited ascending read of `op`.
+    pub fn new(op: ReadOp) -> Self {
+        Self {
+            op,
+            descending: false,
+            limit: None,
+        }
+    }
 }
 
 /// Result of verifying a SELECT proof: the post-grouping rows the caller
@@ -1860,6 +2061,62 @@ mod tests {
             .unwrap();
     }
 
+    // Ensure that deleting an absent row remains a graceful zero-row no-op even
+    // when a resource-column delete ACL is present: there is no stored row to
+    // authorize, so E&V skips the ACL check, emits no-op delete ops, and leaves
+    // the root unchanged. Without the absent-row skip the ACL resolves the
+    // resource column to null and fails closed on a row that does not exist.
+    #[tokio::test]
+    async fn test_delete_absent_row_under_acl_is_zero_row_noop() {
+        let schema = table_schema();
+        let storage = MerkStorage::in_memory_with_internal_tables().await.unwrap();
+        storage.create_table(&schema).await.unwrap();
+
+        let sid = sid();
+        let uid = insert_internal_user(&storage, sid).await;
+        let auth = AuthContext::new(Some(uid as i64), sid);
+        // A present row so the table is non-empty and the ACL is exercised.
+        let _present = insert_user_row(&storage, "Alice", 30, &auth).await;
+
+        insert_rule(
+            &storage,
+            &schema.name,
+            "delete",
+            AccessRule::comparison(
+                RuleValue::column(ColumnNamespace::Resource, "age"),
+                RuleComparisonOp::Equal,
+                RuleValue::Int(30),
+            ),
+        )
+        .await;
+        storage.finalize_acl_blob().await.unwrap();
+
+        // Target a row id that was never inserted.
+        const ABSENT_ID: i64 = 999;
+        let delete_query = delete_by_id_query(&schema.name, ABSENT_ID);
+        let delete_change = delete_change_for_query(&delete_query, uid, &schema).unwrap();
+
+        let root_before = storage.root_hash();
+        let proof_bytes = storage
+            .apply_change_with_pruned_tree(&delete_change, 3)
+            .await
+            .expect("absent-row delete under an ACL must be a graceful no-op, not AclDenied");
+        let root_after = storage.root_hash();
+
+        assert_eq!(
+            root_before, root_after,
+            "deleting an absent row must not change the merk root"
+        );
+        ChangeLog::verify_proof_and_validate(
+            &delete_change.entry,
+            &proof_bytes,
+            &root_before,
+            &root_after,
+            3,
+        )
+        .expect("pruned tree proof must verify for a zero-row delete under an ACL");
+    }
+
     #[tokio::test]
     async fn test_delete_row_with_proof_changes_root() {
         let schema = table_schema();
@@ -1891,6 +2148,59 @@ mod tests {
         .unwrap();
         assert_ne!(root_before, root_after, "Root should change after delete");
         assert_eq!(root_after, storage.root_hash());
+    }
+
+    // Ensure that deleting a row that is absent still produces a real,
+    // verifiable change: extract-and-validate emits (no-op) delete ops built
+    // from the entry keys, the merk root is unchanged (old_root == new_root),
+    // the pruned tree and trace are produced without error, and the proof
+    // verifier accepts old_root == new_root and returns the no-op delete ops.
+    #[tokio::test]
+    async fn test_delete_absent_row_is_zero_row_change_with_valid_proof() {
+        let schema = table_schema();
+        let storage = MerkStorage::in_memory_with_internal_tables().await.unwrap();
+        storage.create_table(&schema).await.unwrap();
+        storage.finalize_acl_blob().await.unwrap();
+
+        let sid = sid();
+        let uid = insert_internal_user(&storage, sid).await;
+        let auth = AuthContext::new(Some(uid as i64), sid);
+        // Populate an unrelated row so the table is non-empty (realistic case).
+        let _present = insert_user_row(&storage, "Alice", 30, &auth).await;
+
+        // Target a row id that was never inserted.
+        const ABSENT_ID: i64 = 999;
+        let delete_query = delete_by_id_query(&schema.name, ABSENT_ID);
+        let delete_change = delete_change_for_query(&delete_query, uid, &schema).unwrap();
+
+        let root_before = storage.root_hash();
+        // E&V + apply must succeed even though nothing is present to delete.
+        let proof_bytes = storage
+            .apply_change_with_pruned_tree(&delete_change, 3)
+            .await
+            .expect("zero-row delete should apply, not error");
+        let root_after = storage.root_hash();
+
+        // old_root == new_root: the data commitment is unchanged.
+        assert_eq!(
+            root_before, root_after,
+            "deleting an absent row must not change the merk root"
+        );
+
+        // The client-side verifier accepts old_root == new_root and returns the
+        // (non-empty, no-op) delete write ops derived from the entry keys.
+        let writes = ChangeLog::verify_proof_and_validate(
+            &delete_change.entry,
+            &proof_bytes,
+            &root_before,
+            &root_after,
+            3,
+        )
+        .expect("pruned tree proof must verify for a zero-row delete");
+        assert!(
+            !writes.is_empty(),
+            "E&V should still emit (no-op) delete ops built from the entry keys"
+        );
     }
 
     #[tokio::test]
