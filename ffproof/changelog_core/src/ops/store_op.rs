@@ -1,10 +1,10 @@
 use super::{
-    validate_max_entries, validate_sorted_entries, validate_user_access, OpContext, OpReader,
-    OpVerifier, OpVerifyResult,
+    validate_max_entries, validate_sorted_entries, validate_store_declared, validate_user_access,
+    OpContext, OpReader, OpVerifier, OpVerifyResult,
 };
 use crate::changelog::{ChangelogEntry, ChangelogError, OpType};
-use crate::{BatchOp, ReadOp, TraceStep};
-use encrypted_spaces_storage_encoding::keys::{parse_key, store_schema_key, ParsedKey};
+use crate::{BatchOp, TraceStep};
+use encrypted_spaces_storage_encoding::keys::{parse_key, ParsedKey};
 
 /// Write (insert or overwrite) entries into a declared key-value store.
 pub struct StorePutOp;
@@ -28,11 +28,15 @@ pub struct StoreDeleteOp;
 /// Tree reads are issued in a fixed, data-independent order so the prover
 /// and verifier request identical reads: first the writer's `_users`
 /// status (inside `validate_user_access`), then the store declaration key.
+/// The declaration read is cached on the `OpContext`, so repeated writes to
+/// the same store skip it (see [`validate_store_declared`]); the prover and
+/// verifier share that cache, keeping their read sequences identical.
 fn validate_store_write(
     entry: &ChangelogEntry,
     op_type: OpType,
     op_name: &str,
     reader: &mut dyn OpReader,
+    ctx: &OpContext,
 ) -> Result<String, ChangelogError> {
     validate_max_entries(entry, op_name)?;
     validate_sorted_entries(entry, op_name)?;
@@ -70,13 +74,8 @@ fn validate_store_write(
     validate_user_access(entry, op_type, op_name, reader)?;
 
     // Authenticate that the target store is declared.  One deterministic
-    // read; absence => reject.
-    let read = reader.read(ReadOp::Key(store_schema_key(&store)))?;
-    if read.results.is_empty() {
-        return Err(ChangelogError::Generic(format!(
-            "{op_name}: store '{store}' is not declared"
-        )));
-    }
+    // read on a cache miss; absence => reject.
+    validate_store_declared(&store, op_name, reader, ctx)?;
 
     Ok(store)
 }
@@ -85,9 +84,9 @@ impl OpVerifier for StorePutOp {
     fn extract_and_validate(
         entry: &ChangelogEntry,
         reader: &mut dyn OpReader,
-        _ctx: &OpContext,
+        ctx: &OpContext,
     ) -> Result<OpVerifyResult, ChangelogError> {
-        validate_store_write(entry, OpType::StorePut, "store_put", reader)?;
+        validate_store_write(entry, OpType::StorePut, "store_put", reader, ctx)?;
 
         let ops: Vec<BatchOp> = entry
             .message
@@ -109,9 +108,9 @@ impl OpVerifier for StoreDeleteOp {
     fn extract_and_validate(
         entry: &ChangelogEntry,
         reader: &mut dyn OpReader,
-        _ctx: &OpContext,
+        ctx: &OpContext,
     ) -> Result<OpVerifyResult, ChangelogError> {
-        validate_store_write(entry, OpType::StoreDelete, "store_delete", reader)?;
+        validate_store_write(entry, OpType::StoreDelete, "store_delete", reader, ctx)?;
 
         let ops: Vec<BatchOp> = entry
             .message
@@ -133,8 +132,10 @@ mod tests {
     use super::*;
     use crate::changelog::{KvData, LogMessage};
     use crate::ops::VerifierReader;
-    use crate::ProvenRead;
-    use encrypted_spaces_storage_encoding::keys::{acl_rule_key, column_key, store_entry_key};
+    use crate::{ProvenRead, ReadOp};
+    use encrypted_spaces_storage_encoding::keys::{
+        acl_rule_key, column_key, store_entry_key, store_schema_key,
+    };
     use encrypted_spaces_storage_encoding::stored_value::value_to_bytes;
 
     const USERS_TABLE: &str = "_users";
@@ -246,6 +247,26 @@ mod tests {
         let mut reader = VerifierReader::new(&reads);
         let err = StorePutOp::extract_and_validate(&entry, &mut reader, &ctx()).unwrap_err();
         assert!(err.to_string().contains("not declared"), "got: {err}");
+    }
+
+    #[test]
+    fn store_schema_read_is_cached_across_writes() {
+        // Two writes to the same store share one OpContext, so the
+        // `store_schema_key` read is issued once (first write) and reused from
+        // the cache (second write). Only one `store_declared_read` is provided;
+        // the second entry passing proves it never re-read the declaration.
+        let ctx = ctx();
+        let e1 = put_entry("prefs", vec![(b"a", b"1")]);
+        let e2 = put_entry("prefs", vec![(b"b", b"2")]);
+        let reads = vec![
+            user_read(7),
+            store_declared_read("prefs"),
+            user_read(7), // second write re-checks membership but not the store decl
+        ];
+        let mut reader = VerifierReader::new(&reads);
+        StorePutOp::extract_and_validate(&e1, &mut reader, &ctx).unwrap();
+        StorePutOp::extract_and_validate(&e2, &mut reader, &ctx).unwrap();
+        reader.assert_all_consumed().unwrap();
     }
 
     #[test]
