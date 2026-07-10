@@ -1753,40 +1753,14 @@ impl Space {
         change: Change,
         response: ChangeResponse,
     ) -> Result<CompletedChange> {
-        // Graceful server no-op (e.g. a delete or delete/update action whose
-        // predicate matched no rows): the server writes nothing and appends no
-        // changelog entry, signalled by `rows_affected == 0` together with an
-        // unchanged data root (`old_root == new_root`). There is no entry to
-        // prove incorporated, so the issue #212 discharge requirement does not
-        // apply. We still run the change through `validate_and_apply_change`
-        // (which takes its empty-proof / already-applied branch, or triggers a
-        // fast-forward if the client is behind the server head) to keep client
-        // state consistent, then report the no-op without demanding discharge.
-        // This is sound: the caller is told `0 rows affected`, nothing changed
-        // on-chain, and no cryptographic state advances.
-        if response.rows_affected == 0 && response.old_root == response.new_root {
-            match self.validate_and_apply_change(&change, &response) {
-                Ok(writes) => {
-                    return Ok(CompletedChange {
-                        change,
-                        response,
-                        sequential_writes: Some(writes),
-                        ff_inserted_ids: std::collections::BTreeMap::new(),
-                    })
-                }
-                Err(SdkError::FastForwardRequired { .. }) => {
-                    self.recover_via_fast_forward().await?;
-                    return Ok(CompletedChange {
-                        change,
-                        response,
-                        sequential_writes: None,
-                        ff_inserted_ids: std::collections::BTreeMap::new(),
-                    });
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
+        // Every acknowledged change — including one that touched zero rows (a
+        // delete or delete-primary action whose predicate matched nothing, so
+        // `old_root == new_root`) — must be proven incorporated on the verified
+        // chain before we report success (issue #212). The server logs such a
+        // change as an ordinary entry keeping its real op type, so it discharges
+        // through the same register-pending → discharge → fail-closed path as
+        // any other change. There is no trusted short-circuit: a server that
+        // acknowledges a change it never placed on the chain fails closed below.
         let ack = response.change_id;
         let leaf_hash: [u8; 32] = h_leaf(&change.entry.as_bytes()).into();
 
@@ -4981,6 +4955,7 @@ mod issue212_completion_tests {
     struct AckSkewTransport {
         inner: LocalTransport,
         skew_armed: Arc<AtomicBool>,
+        noop_armed: Arc<AtomicBool>,
     }
 
     impl AckSkewTransport {
@@ -4988,12 +4963,22 @@ mod issue212_completion_tests {
             Self {
                 inner,
                 skew_armed: Arc::new(AtomicBool::new(false)),
+                noop_armed: Arc::new(AtomicBool::new(false)),
             }
         }
 
         /// Arm exactly one upcoming `submit_change` to misreport its change_id.
         fn arm(&self) {
             self.skew_armed.store(true, Ordering::SeqCst);
+        }
+
+        /// Arm exactly one upcoming `submit_change` to dress its (honestly
+        /// applied) change up as a graceful no-op — `rows_affected == 0` with an
+        /// unchanged data root (`old_root == new_root`) and an empty proof —
+        /// while also misreporting its position. This is the exact shape the
+        /// old no-op short-circuit trusted; the SDK must now fail closed.
+        fn arm_noop(&self) {
+            self.noop_armed.store(true, Ordering::SeqCst);
         }
     }
 
@@ -5008,6 +4993,15 @@ mod issue212_completion_tests {
             if self.skew_armed.swap(false, Ordering::SeqCst) {
                 // Claim a later position than the one actually assigned, so a
                 // fast-forward cannot prove the exact entry at `resp.change_id`.
+                resp.change_id += 1;
+            }
+            if self.noop_armed.swap(false, Ordering::SeqCst) {
+                // Forge the old no-op signal (rows_affected 0, unchanged data
+                // root, empty proof) and misreport the position so the exact
+                // entry cannot be proven at the acknowledged change_id.
+                resp.rows_affected = 0;
+                resp.new_root = resp.old_root;
+                resp.pruned_merkle_tree = Vec::new();
                 resp.change_id += 1;
             }
             Ok(resp)
@@ -5214,6 +5208,29 @@ mod issue212_completion_tests {
             })
             .execute()
             .await;
+        assert_failed_closed(res);
+    }
+
+    /// A server that acknowledges a real mutation as a graceful no-op
+    /// (`rows_affected == 0`, `old_root == new_root`, empty proof) must not
+    /// yield a false success. The old short-circuit trusted exactly this
+    /// response shape; every acknowledged change is now required to be proven
+    /// incorporated (issue #212), so the SDK fails closed.
+    #[tokio::test]
+    async fn forged_zero_row_noop_ack_fails_closed() {
+        let (transport, space) = make_space().await;
+        let notes = space.table::<Note>("notes");
+        let id = notes
+            .insert(&Note {
+                id: None,
+                title: "a".into(),
+            })
+            .execute()
+            .await
+            .expect("insert");
+
+        transport.arm_noop();
+        let res = notes.delete().where_eq("id", id).execute().await;
         assert_failed_closed(res);
     }
 

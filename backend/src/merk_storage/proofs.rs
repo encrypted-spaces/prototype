@@ -1860,6 +1860,62 @@ mod tests {
             .unwrap();
     }
 
+    // Ensure that deleting an absent row remains a graceful zero-row no-op even
+    // when a resource-column delete ACL is present: there is no stored row to
+    // authorize, so E&V skips the ACL check, emits no-op delete ops, and leaves
+    // the root unchanged. Without the absent-row skip the ACL resolves the
+    // resource column to null and fails closed on a row that does not exist.
+    #[tokio::test]
+    async fn test_delete_absent_row_under_acl_is_zero_row_noop() {
+        let schema = table_schema();
+        let storage = MerkStorage::in_memory_with_internal_tables().await.unwrap();
+        storage.create_table(&schema).await.unwrap();
+
+        let sid = sid();
+        let uid = insert_internal_user(&storage, sid).await;
+        let auth = AuthContext::new(Some(uid as i64), sid);
+        // A present row so the table is non-empty and the ACL is exercised.
+        let _present = insert_user_row(&storage, "Alice", 30, &auth).await;
+
+        insert_rule(
+            &storage,
+            &schema.name,
+            "delete",
+            AccessRule::comparison(
+                RuleValue::column(ColumnNamespace::Resource, "age"),
+                RuleComparisonOp::Equal,
+                RuleValue::Int(30),
+            ),
+        )
+        .await;
+        storage.finalize_acl_blob().await.unwrap();
+
+        // Target a row id that was never inserted.
+        const ABSENT_ID: i64 = 999;
+        let delete_query = delete_by_id_query(&schema.name, ABSENT_ID);
+        let delete_change = delete_change_for_query(&delete_query, uid, &schema).unwrap();
+
+        let root_before = storage.root_hash();
+        let proof_bytes = storage
+            .apply_change_with_pruned_tree(&delete_change, 3)
+            .await
+            .expect("absent-row delete under an ACL must be a graceful no-op, not AclDenied");
+        let root_after = storage.root_hash();
+
+        assert_eq!(
+            root_before, root_after,
+            "deleting an absent row must not change the merk root"
+        );
+        ChangeLog::verify_proof_and_validate(
+            &delete_change.entry,
+            &proof_bytes,
+            &root_before,
+            &root_after,
+            3,
+        )
+        .expect("pruned tree proof must verify for a zero-row delete under an ACL");
+    }
+
     #[tokio::test]
     async fn test_delete_row_with_proof_changes_root() {
         let schema = table_schema();
@@ -1891,6 +1947,59 @@ mod tests {
         .unwrap();
         assert_ne!(root_before, root_after, "Root should change after delete");
         assert_eq!(root_after, storage.root_hash());
+    }
+
+    // Ensure that deleting a row that is absent still produces a real,
+    // verifiable change: extract-and-validate emits (no-op) delete ops built
+    // from the entry keys, the merk root is unchanged (old_root == new_root),
+    // the pruned tree and trace are produced without error, and the proof
+    // verifier accepts old_root == new_root and returns the no-op delete ops.
+    #[tokio::test]
+    async fn test_delete_absent_row_is_zero_row_change_with_valid_proof() {
+        let schema = table_schema();
+        let storage = MerkStorage::in_memory_with_internal_tables().await.unwrap();
+        storage.create_table(&schema).await.unwrap();
+        storage.finalize_acl_blob().await.unwrap();
+
+        let sid = sid();
+        let uid = insert_internal_user(&storage, sid).await;
+        let auth = AuthContext::new(Some(uid as i64), sid);
+        // Populate an unrelated row so the table is non-empty (realistic case).
+        let _present = insert_user_row(&storage, "Alice", 30, &auth).await;
+
+        // Target a row id that was never inserted.
+        const ABSENT_ID: i64 = 999;
+        let delete_query = delete_by_id_query(&schema.name, ABSENT_ID);
+        let delete_change = delete_change_for_query(&delete_query, uid, &schema).unwrap();
+
+        let root_before = storage.root_hash();
+        // E&V + apply must succeed even though nothing is present to delete.
+        let proof_bytes = storage
+            .apply_change_with_pruned_tree(&delete_change, 3)
+            .await
+            .expect("zero-row delete should apply, not error");
+        let root_after = storage.root_hash();
+
+        // old_root == new_root: the data commitment is unchanged.
+        assert_eq!(
+            root_before, root_after,
+            "deleting an absent row must not change the merk root"
+        );
+
+        // The client-side verifier accepts old_root == new_root and returns the
+        // (non-empty, no-op) delete write ops derived from the entry keys.
+        let writes = ChangeLog::verify_proof_and_validate(
+            &delete_change.entry,
+            &proof_bytes,
+            &root_before,
+            &root_after,
+            3,
+        )
+        .expect("pruned tree proof must verify for a zero-row delete");
+        assert!(
+            !writes.is_empty(),
+            "E&V should still emit (no-op) delete ops built from the entry keys"
+        );
     }
 
     #[tokio::test]

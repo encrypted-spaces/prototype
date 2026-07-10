@@ -60,6 +60,26 @@ impl OpVerifier for DeleteOp {
             for &row_id in columns_by_row.keys() {
                 let existing_values =
                     read_columns_from_tree(&table, row_id, &acl.needed_columns, reader)?;
+                // Deleting an absent row is a no-op with nothing to authorize,
+                // so skip its ACL check (otherwise `evaluate_acl` fails closed
+                // on the missing resource values). A stored row carries all its
+                // columns: if the rule names a real column, its presence in
+                // `existing_values` settles this with no extra read; an id-only
+                // rule reads nothing from the tree, so probe the row's first
+                // column.
+                let row_present = if acl.needed_columns.iter().any(|c| c != "id") {
+                    existing_values.iter().any(|(c, _)| c != "id")
+                } else if let Some(probe_col) = expected_columns.iter().next() {
+                    !reader
+                        .read(ReadOp::Key(column_key(&table, row_id, probe_col)))?
+                        .results
+                        .is_empty()
+                } else {
+                    true
+                };
+                if !row_present {
+                    continue;
+                }
                 evaluate_acl(acl, entry.uid, &existing_values, "delete")?;
             }
         }
@@ -646,6 +666,12 @@ mod tests {
                 results: vec![(schema_columns_key("posts"), b"name".to_vec())],
             },
             acl_rule_read("posts", "delete", &rule),
+            // Presence probe: an id-only rule reads nothing from the tree, so
+            // DeleteOp probes the row's first column to confirm it exists.
+            ProvenRead {
+                op: ReadOp::Key(column_key("posts", 1, "name")),
+                results: vec![(column_key("posts", 1, "name"), stored_i64(1))],
+            },
             ProvenRead {
                 op: ReadOp::Key(schema_indexes_key("posts")),
                 results: vec![],
@@ -697,6 +723,12 @@ mod tests {
                 results: vec![(schema_columns_key("posts"), b"name".to_vec())],
             },
             acl_rule_read("posts", "delete", &rule),
+            // Presence probe: the row exists, so uid=2's unauthorized delete is
+            // evaluated (and denied) rather than skipped as an absent no-op.
+            ProvenRead {
+                op: ReadOp::Key(column_key("posts", 1, "name")),
+                results: vec![(column_key("posts", 1, "name"), stored_i64(1))],
+            },
         ];
         let ctx = OpContext {
             current_change_id: 0,

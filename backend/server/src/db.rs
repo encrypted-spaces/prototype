@@ -372,20 +372,6 @@ pub async fn ensure_initialized(app_cfg: &AppConfig) -> Result<(), ServerError> 
     Ok(())
 }
 
-/// Outcome of [`SpaceState::server_validation_delete`].
-///
-/// `NoMatchingRows` is converted to a successful `ChangeResponse`
-/// with `rows_affected = 0`; any `Err(ServerError)` is propagated
-/// to the client unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeleteValidationOutcome {
-    /// At least one targeted row exists, or the entry has no column
-    /// keys (E&V will surface that structural error).
-    Proceed,
-    /// None of the rows named by the change exist in the tree.
-    NoMatchingRows,
-}
-
 pub async fn dump_tables_to_console(_app_cfg: &AppConfig) -> Result<(), ServerError> {
     let spaces_snapshot: Vec<(SpaceId, Arc<Mutex<SpaceState>>)> = {
         let map = SPACES.lock().await;
@@ -1418,9 +1404,9 @@ impl SpaceState {
     /// no-match-row short-circuits). Today most are intentional
     /// no-ops — the dispatcher invokes them so future server-only
     /// checks have an obvious place to land instead of accreting
-    /// scattered, ad-hoc validation logic. `server_validation_delete`
-    /// is the one non-trivial member; the rest stand as documented
-    /// stubs.
+    /// scattered, ad-hoc validation logic. `server_validation_action`
+    /// does light structural validation of the action marker; the rest
+    /// stand as documented stubs.
     fn server_validation_insert(
         &self,
         _change: &Change,
@@ -1501,55 +1487,16 @@ impl SpaceState {
         Ok(())
     }
 
-    /// Server-only validation for `OpType::Delete`.
+    /// Server-side structural validation for `OpType::Action`.
     ///
-    /// Per design, deleting an individual row that does not exist
-    /// is a no-op and not a security concern, so E&V does not gate
-    /// on per-row presence.  This check only catches the degenerate
-    /// case where *every* targeted row is absent, returning
-    /// [`DeleteValidationOutcome::NoMatchingRows`] so the dispatcher
-    /// can short-circuit with a successful no-op response instead of
-    /// committing an empty change.  Any other failure surfaces as
-    /// `Err(ServerError)` and is propagated to the client.
-    fn server_validation_delete(
-        &self,
-        change: &ChangelogEntry,
-        _auth: &AuthContext,
-    ) -> Result<DeleteValidationOutcome, ServerError> {
-        // Client resolved the WHERE clause before signing, so column
-        // keys carry `row_id` directly.  One probe per unique row_id
-        // is enough to decide presence.
-        let mut seen: BTreeSet<i64> = BTreeSet::new();
-        let mut probe_keys: Vec<&[u8]> = Vec::new();
-        for kv in &change.message.entries {
-            if let Ok(ParsedKey::Column { row_id, .. }) = parse_key(&kv.key) {
-                if seen.insert(row_id) {
-                    probe_keys.push(kv.key.as_slice());
-                }
-            }
-        }
-        if probe_keys.is_empty() {
-            // No column keys — let E&V surface the structural error.
-            return Ok(DeleteValidationOutcome::Proceed);
-        }
-        for key in &probe_keys {
-            if self.db.get_value(key)?.is_some() {
-                return Ok(DeleteValidationOutcome::Proceed);
-            }
-        }
-        Ok(DeleteValidationOutcome::NoMatchingRows)
-    }
-
-    /// Action parallel of [`Self::server_validation_delete`]: if the
-    /// entry invokes an action whose primary leg is `Delete`, probe the
-    /// primary row's column keys.  When none exist in merk, the
-    /// dispatcher reports a graceful no-op (`rows_affected = 0`).  For
-    /// any other primary-leg shape (Insert / Update) we proceed and
-    /// let E&V handle the entry.
-    fn server_validation_action(
-        &self,
-        change: &ChangelogEntry,
-    ) -> Result<DeleteValidationOutcome, ServerError> {
+    /// Parses the position-0 action marker and, when the referenced action is
+    /// locally resolvable, confirms its body deserializes — surfacing a clear
+    /// server error for a malformed action entry before it reaches
+    /// extract-and-validate. Presence of the targeted rows is intentionally
+    /// *not* checked: an action whose primary `Delete` leg matches no rows is a
+    /// legitimate zero-row change that is logged like any other (its data root
+    /// is simply unchanged), so the client can prove it incorporated (#212).
+    fn server_validation_action(&self, change: &ChangelogEntry) -> Result<(), ServerError> {
         // The marker kv is at entry position 0; its key carries the
         // primary table and its value carries the action name.
         let marker_kv = change
@@ -1570,46 +1517,24 @@ impl SpaceState {
         let action_name = std::str::from_utf8(&marker_kv.value)
             .map_err(|e| ServerError::Generic(format!("Action action-marker is not utf8: {e}")))?;
 
-        let stored = self
+        // If the action is locally resolvable, confirm its body decodes.
+        // extract-and-validate performs the authoritative check; a missing
+        // action is left for E&V to reject.
+        let Some(stored_bytes) = self
             .db
-            .get_value(&action_storage_key(&primary_table, action_name))?;
-        let Some(stored_bytes) = stored else {
-            return Ok(DeleteValidationOutcome::Proceed);
+            .get_value(&action_storage_key(&primary_table, action_name))?
+        else {
+            return Ok(());
         };
         let body_bytes = decode_action_value(&stored_bytes).map_err(|e| {
             ServerError::Generic(format!("action '{action_name}': decode failed: {e}"))
         })?;
-        let body: ActionBody = postcard::from_bytes(body_bytes).map_err(|e| {
+        let _body: ActionBody = postcard::from_bytes(body_bytes).map_err(|e| {
             ServerError::Generic(format!(
                 "action '{action_name}': deserialization failed: {e}"
             ))
         })?;
-        let primary = body
-            .legs
-            .first()
-            .ok_or_else(|| ServerError::Generic(format!("action '{action_name}': has no legs")))?;
-        if !matches!(primary, ActionLeg::Delete { .. }) {
-            return Ok(DeleteValidationOutcome::Proceed);
-        }
-
-        let mut seen: BTreeSet<i64> = BTreeSet::new();
-        let mut probe_keys: Vec<&[u8]> = Vec::new();
-        for kv in &change.message.entries {
-            if let Ok(ParsedKey::Column { table, row_id, .. }) = parse_key(&kv.key) {
-                if table == primary_table && seen.insert(row_id) {
-                    probe_keys.push(kv.key.as_slice());
-                }
-            }
-        }
-        if probe_keys.is_empty() {
-            return Ok(DeleteValidationOutcome::Proceed);
-        }
-        for key in &probe_keys {
-            if self.db.get_value(key)?.is_some() {
-                return Ok(DeleteValidationOutcome::Proceed);
-            }
-        }
-        Ok(DeleteValidationOutcome::NoMatchingRows)
+        Ok(())
     }
 
     /// Staleness protection: check whether any changelog entry after
@@ -1656,19 +1581,18 @@ impl SpaceState {
         Ok(())
     }
 
-    /// Dispatch a change to the underlying op handler and return
+    /// Dispatch a change to the underlying op handler, apply it, and return
     /// the resulting pruned Merkle tree.
     ///
-    /// Returns `Ok(None)` only for `OpType::Delete` when
-    /// [`Self::server_validation_delete`] reports
-    /// [`DeleteValidationOutcome::NoMatchingRows`].  The caller must
-    /// then treat the change as a graceful no-op (no changelog entry,
-    /// no proof, `rows_affected = 0`).
+    /// Every accepted change — including one that touches zero rows (a delete
+    /// or delete-primary action whose predicate matched nothing) — is applied
+    /// and logged as an ordinary entry. A zero-row
+    /// change leaves the data root unchanged.
     async fn do_query_with_pruned_merkle_tree(
         &mut self,
         change: &Change,
         auth: &AuthContext,
-    ) -> Result<Option<AppliedChangeProof>, ServerError> {
+    ) -> Result<AppliedChangeProof, ServerError> {
         // 1-indexed id this change will receive once committed (== num_changes + 1).
         let current_change_id = self.changelog.num_changes() as usize + 1;
         let entry = &change.entry;
@@ -1712,11 +1636,12 @@ impl SpaceState {
                     }
                     OpType::Delete => {
                         self.check_concurrent_conflict(entry)?;
-                        match self.server_validation_delete(entry, auth)? {
-                            DeleteValidationOutcome::Proceed => {}
-                            DeleteValidationOutcome::NoMatchingRows => return Ok(None),
-                        }
 
+                        // A delete whose targeted rows are all absent is a
+                        // legitimate zero-row change: E&V emits no-op delete ops
+                        // built from the entry keys, the data root is left
+                        // unchanged, and the change is logged like any other so
+                        // the client can prove it incorporated.
                         let file_hashes = self.collect_file_hashes_for_delete(entry).await;
 
                         let pruned_merkle_tree = self
@@ -1732,7 +1657,7 @@ impl SpaceState {
                             }
                         }
 
-                        return Ok(Some(AppliedChangeProof { pruned_merkle_tree }));
+                        return Ok(AppliedChangeProof { pruned_merkle_tree });
                     }
                     _ => unreachable!(),
                 }
@@ -1742,10 +1667,7 @@ impl SpaceState {
             }
             OpType::Action => {
                 self.check_concurrent_conflict(entry)?;
-                match self.server_validation_action(entry)? {
-                    DeleteValidationOutcome::Proceed => {}
-                    DeleteValidationOutcome::NoMatchingRows => return Ok(None),
-                }
+                self.server_validation_action(entry)?;
             }
             OpType::CreateSpace => {
                 self.server_validation_create_space(change, auth)?;
@@ -1776,7 +1698,7 @@ impl SpaceState {
             .apply_change_with_pruned_tree(change, current_change_id)
             .await?;
 
-        Ok(Some(AppliedChangeProof { pruned_merkle_tree }))
+        Ok(AppliedChangeProof { pruned_merkle_tree })
     }
 
     fn validate_hashed_values(&self, hashed_values: &HashedValues) -> Result<(), ServerError> {
@@ -1879,6 +1801,26 @@ impl SpaceState {
             .filter(|(_, leg)| matches!(leg, ActionLeg::Delete { .. }))
             .map(|(table, _)| table.to_string())
             .collect())
+    }
+
+    /// Whether the action's *primary* leg is a `Delete`. The primary leg is the
+    /// first leg on the marker's primary table, so this is true exactly when
+    /// that table appears in [`action_delete_tables`]. A same-value update
+    /// action (or any non-delete primary leg) returns `false`. Any parse/lookup
+    /// failure is treated as `false` so callers fall back to the targeted-row
+    /// count rather than under-reporting.
+    fn action_primary_leg_is_delete(&self, change: &Change) -> bool {
+        let Some(marker_kv) = change.entry.message.entries.first() else {
+            return false;
+        };
+        let primary_table = match parse_key(&marker_kv.key) {
+            Ok(ParsedKey::ActionMarker { primary_table }) => primary_table,
+            _ => return false,
+        };
+        matches!(
+            self.action_delete_tables(change),
+            Ok(delete_tables) if delete_tables.contains(&primary_table)
+        )
     }
 
     fn require_hashed_values_for_change(
@@ -2140,32 +2082,12 @@ impl SpaceState {
         }
 
         let old_root = self.get_root_hash().await;
-        let applied = match self
+        let applied = self
             .do_query_with_pruned_merkle_tree(change, auth)
             .await
             .map_err(|e| {
                 ServerError::Generic(format!("do_query_with_pruned_merkle_tree failed: {e}"))
-            })? {
-            Some(proof) => proof,
-            None => {
-                // Graceful no-op (Delete with no matching rows).
-                // No tree mutation, no changelog entry, no proof.
-                log::info!(
-                    "space={} change is a no-op ({:?}); responding with rows_affected=0",
-                    self.space_id,
-                    entry.message.op_type,
-                );
-                return Ok(ChangeResponse {
-                    old_root,
-                    new_root: old_root,
-                    pruned_merkle_tree: Vec::new(),
-                    change_id: self.changelog.num_changes(),
-                    rows_affected: 0,
-                    accepted_at_server_time,
-                    hashed_values: HashedValues::new(),
-                });
-            }
-        };
+            })?;
         let pruned_merkle_tree = applied.pruned_merkle_tree;
         let new_root = self.get_root_hash().await;
         log::info!(
@@ -2184,8 +2106,7 @@ impl SpaceState {
         // Advance the per-user sigref chain for the signer. The change has
         // passed `check_sigref_continuity` against `expected_sig_ref`, so
         // installing `change_id` here makes the next change by this user
-        // have to point at this entry. Only updated for accepted (non-no-op)
-        // changes — no-op deletes return early above without appending.
+        // have to point at this entry.
         self.sigref_map.insert(entry.uid, change_id);
 
         let server_new_clc: [u8; 32] = self.changelog.current_root();
@@ -2198,12 +2119,28 @@ impl SpaceState {
             hex::encode(server_new_clc)
         );
 
+        // Report the true applied count. A delete — or an action whose primary
+        // leg is a Delete — whose targeted rows were all absent leaves the data
+        // root unchanged and affected zero rows, even though it is a real logged
+        // entry. Other op types keep their targeted-row count; in particular a
+        // non-delete action (e.g. an Update primary leg doing a same-value
+        // update) still reports the row it matched even when the root is
+        // unchanged.
+        let rows_affected = if new_root == old_root
+            && (entry.message.op_type == OpType::Delete
+                || (entry.message.op_type == OpType::Action
+                    && self.action_primary_leg_is_delete(change)))
+        {
+            0
+        } else {
+            rows_affected(entry)
+        };
         let response = ChangeResponse {
             old_root,
             new_root,
             pruned_merkle_tree,
             change_id,
-            rows_affected: rows_affected(entry),
+            rows_affected,
             accepted_at_server_time,
             hashed_values: response_hashed_values,
         };
