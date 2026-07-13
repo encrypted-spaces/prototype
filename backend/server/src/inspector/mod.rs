@@ -8,6 +8,7 @@
 //! See `INSPECTOR_PLAN.md` at the repo root for the full design.
 
 pub mod http;
+pub(crate) mod summarize;
 
 use once_cell::sync::OnceCell;
 use serde::Serialize;
