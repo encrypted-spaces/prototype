@@ -2619,7 +2619,7 @@ impl SpaceState {
         &mut self,
         from_change_id: u32,
         expected_change_ids: &[u32],
-        _auth: &AuthContext,
+        auth: &AuthContext,
     ) -> Result<FastForwardData, ServerError> {
         // TODO: we can use auth context to decide if this user can see certain changes.
         // E.g., if they are new and should only see a ZKP of past changes, we might have to trigger proof generation
@@ -2629,7 +2629,7 @@ impl SpaceState {
             space_id: self.space_id.to_string(),
             request_id: String::new(),
             op: "FastForward".to_string(),
-            uid: None,
+            uid: auth.uid,
         });
 
         // Self-check -- we're assuming for now that we store all the changes and responses on the server
