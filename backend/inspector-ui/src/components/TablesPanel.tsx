@@ -155,6 +155,21 @@ function DataRow({
     <tr>
       {schema.columns.map((c) => {
         const cell = row.columns.get(c.name);
+        // The `id` column is the row's primary key: it lives in the Merk key,
+        // not as a written column value, so a row never has an `id` cell.
+        // Render it from `rowId` rather than showing an empty "—".
+        if (c.name === "id") {
+          const recent =
+            cell != null && cursor - cell.last_event_idx <= FLASH_WINDOW;
+          const cls = ["cell", "cell-pk", recent ? "cell-recent" : ""]
+            .filter(Boolean)
+            .join(" ");
+          return (
+            <td key={c.name} className={cls}>
+              {rowId}
+            </td>
+          );
+        }
         if (!cell) {
           return <td key={c.name} className="cell empty-cell">—</td>;
         }
@@ -163,13 +178,12 @@ function DataRow({
           "cell",
           cell.encrypted ? "cell-encrypted" : "cell-plaintext",
           recent ? "cell-recent" : "",
-          c.name === "id" ? "cell-pk" : "",
         ]
           .filter(Boolean)
           .join(" ");
         return (
           <td key={c.name} className={cls} title={cell.preview}>
-            {c.name === "id" ? rowId : cell.preview}
+            {cell.preview}
           </td>
         );
       })}
