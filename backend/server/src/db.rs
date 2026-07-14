@@ -1,4 +1,9 @@
 use crate::app_config::{AppConfig, BootstrapDataSource, SpaceInitConfig};
+use crate::inspector::summarize::{
+    build_entry_summaries, build_schema_tables, describe_query, op_display_label,
+    serialize_merk_tree,
+};
+use crate::inspector::{self, Inspector, InspectorEvent, MembershipEvent, ProofKind};
 use crate::key_delivery::GroupKeyDeliverySlots;
 use base64::Engine as _;
 use encrypted_spaces_acl_types::{Action, ActionBody, ActionLeg};
@@ -159,6 +164,14 @@ pub struct SpaceState {
     verbose_logfile: Option<String>,
     /// Per-space store mapping SHA-256 hashes to full values for hash-backed columns.
     pub hash_store: HashMap<[u8; 32], Vec<u8>>,
+    /// Inspector telemetry sink, if enabled via
+    /// `ENCRYPTED_SPACES_INSPECTOR_LOG`.
+    inspector: Option<Arc<Inspector>>,
+    /// Table names known to the inspector. Seeded with internal table names at
+    /// init and updated whenever a change writes a schema key, so dynamically
+    /// created user tables (CreateSpace, etc.) appear in `SchemaSnapshot`
+    /// events. Sorted for stable snapshot ordering.
+    inspector_tables: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -535,6 +548,11 @@ impl SpaceState {
             sigref_map: BTreeMap::new(),
             verbose_logfile,
             hash_store: HashMap::new(),
+            inspector: Inspector::global(),
+            inspector_tables: internal_schemas::all_internal_schemas()
+                .iter()
+                .map(|s| s.name.clone())
+                .collect(),
         };
         let sid = new_server_state.space_id;
         if let Some(config) = &init_cfg {
@@ -589,6 +607,32 @@ impl SpaceState {
         // the first tracked change will see as its old_root
         new_server_state.tree_snapshot = new_server_state.db.snapshot();
 
+        // Seed the inspector's known-table set: internal tables come from the
+        // constructor, and application tables are read straight from the tree
+        // (their schemas live there — they aren't carried as signed change
+        // entries). The set is refreshed after a `CreateSpace` lands; see
+        // `handle_change`.
+        let app_tables = new_server_state.app_table_names();
+        new_server_state.inspector_tables.extend(app_tables);
+        let snapshot_tables =
+            build_schema_tables(&new_server_state.inspector_tables, &new_server_state.db);
+        new_server_state.emit_inspector(InspectorEvent::SchemaSnapshot {
+            ts_ms: inspector::now_ms(),
+            space_id: sid.to_string(),
+            tables: snapshot_tables,
+        });
+        if new_server_state.inspector.is_some() {
+            let snap = new_server_state.db.snapshot();
+            let (root, node_count) = serialize_merk_tree(snap.as_ref());
+            new_server_state.emit_inspector(InspectorEvent::MerkSnapshot {
+                ts_ms: inspector::now_ms(),
+                space_id: sid.to_string(),
+                change_id: 0,
+                node_count,
+                root,
+            });
+        }
+
         log::info!(
             "space={sid} init complete, root={}",
             hex::encode(new_server_state.db.root_hash())
@@ -599,6 +643,13 @@ impl SpaceState {
 
     pub async fn get_root_hash(&self) -> [u8; 32] {
         self.db.root_hash()
+    }
+
+    /// Emit an inspector event if telemetry is enabled. No-op otherwise.
+    fn emit_inspector(&self, event: InspectorEvent) {
+        if let Some(insp) = &self.inspector {
+            insp.emit(event);
+        }
     }
 
     fn clear_logfile(logfile: Option<&str>) {
@@ -2124,6 +2175,13 @@ impl SpaceState {
             ));
         }
         self.validate_hashed_values(&change.hashed_values)?;
+        self.emit_inspector(InspectorEvent::Request {
+            ts_ms: inspector::now_ms(),
+            space_id: self.space_id.to_string(),
+            request_id: String::new(),
+            op: op_display_label(change),
+            uid: Some(entry.uid as i64),
+        });
         self.verify_change_signature(change, &change.hashed_values)?;
         self.ensure_change_applies(entry)?;
         self.enforce_provisional_restrictions(entry)?;
@@ -2243,6 +2301,80 @@ impl SpaceState {
             accepted_at_server_time,
             hashed_values: response_hashed_values,
         };
+
+        let op_label = op_display_label(change);
+        let space_str = self.space_id.to_string();
+        let entries = build_entry_summaries(change, &self.db);
+
+        // Application table schemas are created by `CreateSpace` and written
+        // to the tree, not carried as signed change entries, so scanning
+        // `change` never reveals them. After a `CreateSpace` lands, refresh the
+        // known-table set from the tree and re-emit a SchemaSnapshot so the
+        // UI's Tables tab picks up the application's tables.
+        if self.inspector.is_some() && entry.message.op_type == OpType::CreateSpace {
+            let app_tables = self.app_table_names();
+            let added = app_tables
+                .iter()
+                .any(|t| !self.inspector_tables.contains(t));
+            if added {
+                self.inspector_tables.extend(app_tables);
+                let tables = build_schema_tables(&self.inspector_tables, &self.db);
+                self.emit_inspector(InspectorEvent::SchemaSnapshot {
+                    ts_ms: inspector::now_ms(),
+                    space_id: space_str.clone(),
+                    tables,
+                });
+            }
+        }
+
+        self.emit_inspector(InspectorEvent::MerkUpdate {
+            ts_ms: inspector::now_ms(),
+            space_id: space_str.clone(),
+            change_id: response.change_id,
+            op_type: op_label.to_string(),
+            old_root: hex::encode(response.old_root),
+            new_root: hex::encode(response.new_root),
+            rows_affected: response.rows_affected,
+            entries,
+        });
+        if self.inspector.is_some() {
+            let snapshot = self.db.snapshot();
+            let (root, node_count) = serialize_merk_tree(snapshot.as_ref());
+            self.emit_inspector(InspectorEvent::MerkSnapshot {
+                ts_ms: inspector::now_ms(),
+                space_id: space_str.clone(),
+                change_id: response.change_id,
+                node_count,
+                root,
+            });
+        }
+        self.emit_inspector(InspectorEvent::ChangelogAppend {
+            ts_ms: inspector::now_ms(),
+            space_id: space_str.clone(),
+            change_id: response.change_id,
+            op_type: op_label.to_string(),
+            clc_root: hex::encode(server_new_clc),
+            entry_size_bytes: entry.as_bytes().len(),
+        });
+        if entry.message.op_type == OpType::CreateSpace {
+            self.emit_inspector(InspectorEvent::Membership {
+                ts_ms: inspector::now_ms(),
+                space_id: space_str.clone(),
+                event: MembershipEvent::Add,
+                change_id: response.change_id,
+                uid: Some(entry.uid as i64),
+            });
+        }
+        self.emit_inspector(InspectorEvent::ProofEmitted {
+            ts_ms: inspector::now_ms(),
+            space_id: space_str,
+            proof_kind: ProofKind::Update,
+            proof_size_bytes: response.pruned_merkle_tree.len(),
+            covers_entries: Some(1),
+            gen_ms: None,
+            query: None,
+        });
+
         self.change_responses.push(response.clone());
 
         self.maybe_generate_ff_proof()?;
@@ -2396,6 +2528,14 @@ impl SpaceState {
         query: &Query,
         commitment: &[u8],
     ) -> Result<SelectProofResponse, SdkError> {
+        self.emit_inspector(InspectorEvent::Request {
+            ts_ms: inspector::now_ms(),
+            space_id: self.space_id.to_string(),
+            request_id: String::new(),
+            op: "Select".to_string(),
+            uid: None,
+        });
+
         if commitment.is_empty() {
             return Err(SdkError::ValidationError(
                 "select request must include a data commitment".into(),
@@ -2423,6 +2563,15 @@ impl SpaceState {
             .map_err(|e| SdkError::DatabaseError(format!("failed to generate proof: {e:?}")))?;
         let hashed_values = self.collect_hashed_values_for_select(query, &proof, &root)?;
 
+        self.emit_inspector(InspectorEvent::ProofEmitted {
+            ts_ms: inspector::now_ms(),
+            space_id: self.space_id.to_string(),
+            proof_kind: ProofKind::Select,
+            proof_size_bytes: proof.len(),
+            covers_entries: None,
+            gen_ms: None,
+            query: Some(describe_query(query)),
+        });
         Ok(SelectProofResponse {
             proof,
             hashed_values,
@@ -2470,10 +2619,18 @@ impl SpaceState {
         &mut self,
         from_change_id: u32,
         expected_change_ids: &[u32],
-        _auth: &AuthContext,
+        auth: &AuthContext,
     ) -> Result<FastForwardData, ServerError> {
         // TODO: we can use auth context to decide if this user can see certain changes.
         // E.g., if they are new and should only see a ZKP of past changes, we might have to trigger proof generation
+
+        self.emit_inspector(InspectorEvent::Request {
+            ts_ms: inspector::now_ms(),
+            space_id: self.space_id.to_string(),
+            request_id: String::new(),
+            op: "FastForward".to_string(),
+            uid: auth.uid,
+        });
 
         // Self-check -- we're assuming for now that we store all the changes and responses on the server
         assert!(self.changelog.changes.len() == self.change_responses.len());
@@ -2622,6 +2779,19 @@ impl SpaceState {
             );
         }
 
+        if let Some(ref ff_proof) = proof {
+            let covers = proven_up_to.saturating_sub(from_change_id as usize) as u32;
+            self.emit_inspector(InspectorEvent::ProofEmitted {
+                ts_ms: inspector::now_ms(),
+                space_id: self.space_id.to_string(),
+                proof_kind: ProofKind::FastForward,
+                proof_size_bytes: ff_proof.proof.len(),
+                covers_entries: Some(covers),
+                gen_ms: None,
+                query: None,
+            });
+        }
+
         Ok(FastForwardData {
             proof,
             changes,
@@ -2719,6 +2889,14 @@ impl SpaceState {
             change_response.change_id as usize,
         )
         .map_err(|e| ServerError::Generic(format!("extract row id failed: {e:?}")))?;
+
+        self.emit_inspector(InspectorEvent::Membership {
+            ts_ms: inspector::now_ms(),
+            space_id: self.space_id.to_string(),
+            event: MembershipEvent::Add,
+            change_id: change_response.change_id,
+            uid: Some(new_user_id),
+        });
 
         // 7. Write the invite envelope into the new user's GK delivery slot.
         //    Slot updates are best-effort key-delivery state; the canonical
@@ -2818,6 +2996,16 @@ impl SpaceState {
 
         // 5. Execute the change.
         let change_response = self.handle_change(delete_change, auth).await?;
+
+        for removed_uid in removed_user_ids_in_change(&delete_change.entry) {
+            self.emit_inspector(InspectorEvent::Membership {
+                ts_ms: inspector::now_ms(),
+                space_id: self.space_id.to_string(),
+                event: MembershipEvent::Remove,
+                change_id: change_response.change_id,
+                uid: Some(removed_uid),
+            });
+        }
 
         // 7. Clear the removed user's delivery slot.
         for row_id in removed_user_ids_in_change(&delete_change.entry) {

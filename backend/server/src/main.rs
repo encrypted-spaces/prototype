@@ -2,6 +2,7 @@ mod app_config;
 mod db;
 pub(crate) mod file_store;
 mod http;
+mod inspector;
 mod key_delivery;
 mod tls;
 mod websocket;

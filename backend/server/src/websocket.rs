@@ -1,5 +1,6 @@
 use crate::app_config::AppConfig;
 use crate::db::{self, op_name};
+use crate::inspector::{self, ConnectionEvent, Inspector, InspectorEvent};
 use crate::ShutdownRx;
 use encrypted_spaces_backend::access_control::AuthContext;
 use encrypted_spaces_backend::proto::{
@@ -455,6 +456,15 @@ pub async fn client_connected(
     let ws_stream = ws.await?;
     log::info!("space={space_id} ws: client connected uid={:?}", uid);
 
+    if let Some(insp) = Inspector::global() {
+        insp.emit(InspectorEvent::Connection {
+            ts_ms: inspector::now_ms(),
+            space_id: space_id.to_string(),
+            uid,
+            event: ConnectionEvent::Connect,
+        });
+    }
+
     let (write, read) = ws_stream.split();
     let (response_tx, response_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
@@ -487,6 +497,16 @@ pub async fn client_connected(
         log::error!("space={space_id} ws: write task join error err={e}");
     }
     log::info!("space={space_id} ws: client disconnected");
+
+    if let Some(insp) = Inspector::global() {
+        insp.emit(InspectorEvent::Connection {
+            ts_ms: inspector::now_ms(),
+            space_id: space_id.to_string(),
+            uid,
+            event: ConnectionEvent::Disconnect,
+        });
+    }
+
     Ok(())
 }
 

@@ -22,18 +22,23 @@ encrypted-spaces-changelog-core = { workspace = true }
 hex = { workspace = true }
 hyper = { workspace = true }
 hyper-tungstenite = { workspace = true }
+include_dir = "0.7"
 log = { workspace = true }
 merk = { workspace = true }
 once_cell = { workspace = true }
 prost = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 encrypted-spaces-backend = { workspace = true, features = ["merk"] }
 tokio = { workspace = true, features = ["signal", "net"] }
 tokio-rustls = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
 
 [features]
 # Passthrough features so the server can be built as:

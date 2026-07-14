@@ -18,6 +18,10 @@ pub async fn handle_request(
 ) -> Result<Response<Body>, Infallible> {
     let path = req.uri().path().to_string();
 
+    if crate::inspector::http::matches(&path) {
+        return crate::inspector::http::handle(req).await;
+    }
+
     if path.starts_with("/ws") && is_upgrade_request(&req) {
         // Extract auth context from query string (e.g. /ws?auth=<base64url_AuthContext>&space=<32_hex>)
         // TODO: For now, we "authenticate" as a user by passing the auth context as a query string.

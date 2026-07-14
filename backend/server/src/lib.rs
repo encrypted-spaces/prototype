@@ -5,4 +5,5 @@ pub use encrypted_spaces_backend::SpaceId;
 pub mod app_config;
 pub mod db;
 pub mod file_store;
+pub mod inspector;
 pub mod key_delivery;

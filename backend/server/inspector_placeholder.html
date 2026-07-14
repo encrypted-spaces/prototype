@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Encrypted Spaces Inspector — SPA not built</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      max-width: 720px;
+      margin: 60px auto;
+      padding: 0 24px;
+      color: #d8dee9;
+      background: #0e1116;
+      line-height: 1.55;
+    }
+    h1 { font-size: 22px; margin-bottom: 8px; }
+    p { color: #aab2c0; }
+    pre {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 14px 16px;
+      overflow: auto;
+      color: #d8dee9;
+    }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .hint { color: #ffb86c; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>Inspector SPA not built</h1>
+  <p>
+    The backend embeds the inspector single-page app at compile time, but the
+    frontend assets weren't present when this binary was built. Build them with:
+  </p>
+  <pre><code>cd backend/inspector-ui
+npm install
+npm run build</code></pre>
+  <p>
+    then rebuild and restart the backend:
+  </p>
+  <pre><code>cargo build -p encrypted-spaces-backend-server</code></pre>
+  <p class="hint">
+    Tip: don't <code>apt install node-typescript</code> — that package is older
+    than 5.0 and will reject this project's <code>tsconfig.json</code>. The
+    bundled TypeScript from <code>npm install</code> is the right one.
+  </p>
+</body>
+</html>

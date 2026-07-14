@@ -227,6 +227,29 @@ python3 demos/tauri/demo_launcher.py
 It should detect dependencies and provide instructions to install them. The primary ones are python, pip and venv; the script will install 
 the [Textual](https://github.com/Textualize/textual) python module, which provides the UI support.
 
+### Driving the backend inspector
+
+The inspector UI is a Vite/React SPA in [`backend/inspector-ui/`](../../backend/inspector-ui/README.md);
+its compiled bundle is embedded into the backend binary at compile time and
+served at `http://localhost:8080/_inspect/`. `demo_launcher.py` runs the
+required `npm install` + `npm run build` steps automatically before invoking
+cargo, so a normal launch sequence already produces a working inspector.
+For manual builds — or if you see an "Inspector SPA not built" placeholder
+page — follow the instructions in
+[`backend/inspector-ui/README.md`](../../backend/inspector-ui/README.md).
+
+When launched via `demo_launcher.py`, the inspector is always enabled — the
+launcher writes an NDJSON event trace to `demos/tauri/logs/inspector.ndjson`
+by default, and the SPA's **Live** mode at `http://localhost:8080/_inspect/`
+streams events in real time.
+
+To override the file path:
+
+```bash
+export ENCRYPTED_SPACES_INSPECTOR_LOG=/tmp/inspector.ndjson
+python3 demo_launcher.py
+```
+
 
 ## Demo Quickstart
 Once everything is setup, these essential commands can be run from the repository root.
