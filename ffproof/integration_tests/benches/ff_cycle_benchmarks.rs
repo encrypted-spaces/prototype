@@ -453,10 +453,18 @@ impl Transport for SharedStateTransport {
     }
 
     async fn fast_forward(&self, change_id: u32) -> BackendResult<FastForwardData> {
+        self.fast_forward_with_expected(change_id, &[]).await
+    }
+
+    async fn fast_forward_with_expected(
+        &self,
+        change_id: u32,
+        expected_change_ids: &[u32],
+    ) -> BackendResult<FastForwardData> {
         let auth_context = self.auth_context.lock().await;
         let mut state = self.state.lock().await;
         state
-            .handle_fast_forward(change_id, &[], &auth_context)
+            .handle_fast_forward(change_id, expected_change_ids, &auth_context)
             .map_err(|e| SdkError::DatabaseError(format!("fast_forward failed: {e}")))
     }
 

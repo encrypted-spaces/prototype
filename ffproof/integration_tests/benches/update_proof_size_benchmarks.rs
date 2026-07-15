@@ -370,6 +370,16 @@ impl Transport for RecordingTransport {
         self.inner.fast_forward(change_id).await
     }
 
+    async fn fast_forward_with_expected(
+        &self,
+        change_id: u32,
+        expected_change_ids: &[u32],
+    ) -> BackendResult<FastForwardData> {
+        self.inner
+            .fast_forward_with_expected(change_id, expected_change_ids)
+            .await
+    }
+
     async fn select(
         &self,
         query: Query,
