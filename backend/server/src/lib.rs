@@ -7,3 +7,4 @@ pub mod db;
 pub mod file_store;
 pub mod inspector;
 pub mod key_delivery;
+pub mod retained_snapshots;

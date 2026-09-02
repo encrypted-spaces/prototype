@@ -4,6 +4,7 @@ pub(crate) mod file_store;
 mod http;
 mod inspector;
 mod key_delivery;
+mod retained_snapshots;
 mod tls;
 mod websocket;
 

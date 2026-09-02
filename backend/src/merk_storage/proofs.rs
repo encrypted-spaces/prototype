@@ -197,6 +197,11 @@ impl MerkStorage {
             ));
         };
 
+        self.prove_store_read_at(read, &tree).await
+    }
+
+    /// Generate a store-read proof against an explicit retained checkpoint.
+    pub async fn prove_store_read_at(&self, read: &StoreReadOp, tree: &Tree) -> Result<Vec<u8>> {
         // Discover present keys in the base range (ascending) so we can apply
         // the same limit narrowing the verifier will re-derive from the proof.
         let (start, end) = store_op_range(&read.op)?;
@@ -210,7 +215,7 @@ impl MerkStorage {
         let narrowed = narrow_store_op(&read.op, read.descending, read.limit, &narrowing)?;
 
         let root = tree.root_hash();
-        let mut recorder = TraceRecorder::new(&tree);
+        let mut recorder = TraceRecorder::new(tree);
         record_select_read(&mut recorder, &narrowed)?;
         let trace_bytes = recorder
             .finalize_trace()
@@ -236,15 +241,26 @@ impl MerkStorage {
     ///
     /// Non-id predicates are validated to target an indexed column.
     pub async fn prove_query(&self, query: &Query) -> Result<Vec<u8>> {
+        let Some(tree) = self.checkpoint() else {
+            return Err(SdkError::DatabaseError(
+                "Tree is empty, cannot generate query proof".to_string(),
+            ));
+        };
+        self.prove_query_at(query, &tree).await
+    }
+
+    /// Generate a query proof against an explicit retained checkpoint.
+    pub async fn prove_query_at(&self, query: &Query, tree: &Tree) -> Result<Vec<u8>> {
         validate_predicate_cursor_supported(query)?;
         validate_self_join_alias(query)?;
 
         if needs_tracer_proof(query) {
-            return self.prove_query_tracer(query).await;
+            return self.prove_query_tracer(query, tree).await;
         }
 
         let merk_query = merk_query_for_query(query)?;
-        self.prove_merk(merk_query)
+        tree.prove(merk_query)
+            .map_err(|e| SdkError::DatabaseError(format!("Failed to generate proof: {e:?}")))
     }
 
     /// Generate a `TracerSelectProof` for queries that need targeted reads
@@ -256,9 +272,9 @@ impl MerkStorage {
     ///    - Joined table reads (non-contiguous FK lookups) — empty if no joins
     ///
     /// Returns serialized `TracerSelectProof`.
-    async fn prove_query_tracer(&self, query: &Query) -> Result<Vec<u8>> {
+    async fn prove_query_tracer(&self, query: &Query, tree: &Tree) -> Result<Vec<u8>> {
         // Step 1: Build read ops for the main table
-        let main_read_ops = self.build_main_table_read_ops(query)?;
+        let main_read_ops = self.build_main_table_read_ops(query, Some(tree))?;
 
         // Step 2: Build read ops for joined tables (if any)
         let join_read_ops = if let Some(join) = &query.join {
@@ -273,20 +289,15 @@ impl MerkStorage {
                 let mut q = query.clone();
                 q.join = None;
                 q.operation = crate::query::QueryOperation::Select(Vec::new());
-                self.query_rows_projecting_columns(&q, &[fk_col])?
+                self.query_rows_projecting_columns(&q, &[fk_col], Some(tree))?
             };
-            self.build_join_read_ops(query, &main_rows)?
+            self.build_join_read_ops(query, &main_rows, Some(tree))?
         } else {
             Vec::new()
         };
 
-        let Some(tree) = self.checkpoint() else {
-            return Err(SdkError::DatabaseError(
-                "Tree is empty, cannot generate trace proof".to_string(),
-            ));
-        };
         let root = tree.root_hash();
-        let mut recorder = TraceRecorder::new(&tree);
+        let mut recorder = TraceRecorder::new(tree);
         for op in main_read_ops.iter().chain(join_read_ops.iter()) {
             record_select_read(&mut recorder, op)?;
         }
@@ -310,6 +321,7 @@ impl MerkStorage {
         &self,
         query: &Query,
         main_rows: &[serde_json::Value],
+        checkpoint: Option<&Tree>,
     ) -> Result<Vec<ReadOp>> {
         let join = match &query.join {
             Some(j) => j,
@@ -367,7 +379,8 @@ impl MerkStorage {
                 cursor_id: None,
             };
 
-            let row_keys = self.index_row_keys_for_predicate(right_table, &join_pred)?;
+            let row_keys =
+                self.index_row_keys_for_predicate(right_table, &join_pred, checkpoint)?;
             for k in row_keys {
                 ops.push(ReadOp::Prefix(k));
             }
@@ -377,7 +390,11 @@ impl MerkStorage {
     }
 
     /// Convert the main table query strategy into `ReadOp`s for a TracerProof.
-    fn build_main_table_read_ops(&self, query: &Query) -> Result<Vec<ReadOp>> {
+    fn build_main_table_read_ops(
+        &self,
+        query: &Query,
+        checkpoint: Option<&Tree>,
+    ) -> Result<Vec<ReadOp>> {
         let table = &query.table;
 
         validate_limit_supported(query)?;
@@ -406,7 +423,7 @@ impl MerkStorage {
             let mut q = query.clone();
             q.join = None;
             q.operation = QueryOperation::Select(Vec::new());
-            let matching_rows = self.query_rows_projecting_columns(&q, &[])?;
+            let matching_rows = self.query_rows_projecting_columns(&q, &[], checkpoint)?;
 
             if needs_narrowing {
                 let keys = narrowing_keys_from_kept_rows(query, &matching_rows)?;

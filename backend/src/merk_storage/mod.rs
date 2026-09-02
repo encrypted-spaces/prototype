@@ -355,6 +355,7 @@ impl MerkStorage {
         &self,
         query: &Query,
         columns: &[String],
+        checkpoint: Option<&Tree>,
     ) -> Result<Vec<serde_json::Value>> {
         let strategy = determine_query_strategy(self, query)?;
         let mut required_columns: std::collections::BTreeSet<String> =
@@ -367,15 +368,18 @@ impl MerkStorage {
 
         let main_rows = match strategy {
             QueryStrategy::ById(id) => self
-                .get_row_by_id_projecting_columns(&query.table, id, &required_columns)?
+                .get_row_by_id_projecting_columns(&query.table, id, &required_columns, checkpoint)?
                 .into_iter()
                 .collect(),
             QueryStrategy::ByIds(ids) => {
                 let mut rows = Vec::new();
                 for id in ids {
-                    if let Some(row) =
-                        self.get_row_by_id_projecting_columns(&query.table, id, &required_columns)?
-                    {
+                    if let Some(row) = self.get_row_by_id_projecting_columns(
+                        &query.table,
+                        id,
+                        &required_columns,
+                        checkpoint,
+                    )? {
                         rows.push(row);
                     }
                 }
@@ -393,17 +397,19 @@ impl MerkStorage {
                 inclusive_start,
                 inclusive_end,
                 &required_columns,
+                checkpoint,
             )?,
             QueryStrategy::ByIndex { ref predicate, .. } => {
-                let row_keys = self.index_row_keys_for_predicate(&query.table, predicate)?;
+                let row_keys =
+                    self.index_row_keys_for_predicate(&query.table, predicate, checkpoint)?;
                 let mut all_entries = Vec::new();
                 for row_key in &row_keys {
-                    all_entries.extend(self.iter_prefix(row_key)?);
+                    all_entries.extend(self.collect_prefix_at(row_key, checkpoint)?);
                 }
                 group_columns_into_rows_projecting_columns(&all_entries, &required_columns)?
             }
             QueryStrategy::TableScan => {
-                self.scan_table_projecting_columns(&query.table, &required_columns)?
+                self.scan_table_projecting_columns(&query.table, &required_columns, checkpoint)?
             }
         };
 
@@ -421,9 +427,10 @@ impl MerkStorage {
         &self,
         table_name: &str,
         columns: &std::collections::BTreeSet<String>,
+        checkpoint: Option<&Tree>,
     ) -> Result<Vec<serde_json::Value>> {
         let prefix = keys::row_prefix(table_name);
-        let key_values = self.iter_prefix(&prefix)?;
+        let key_values = self.collect_prefix_at(&prefix, checkpoint)?;
         group_columns_into_rows_projecting_columns(&key_values, columns)
     }
 
@@ -462,15 +469,19 @@ impl MerkStorage {
         table_name: &str,
         row_id: i64,
         columns: &std::collections::BTreeSet<String>,
+        checkpoint: Option<&Tree>,
     ) -> Result<Option<serde_json::Value>> {
         let prefix = keys::row_key(table_name, row_id);
-        let column_entries = self.iter_prefix(&prefix)?;
+        let column_entries = self.collect_prefix_at(&prefix, checkpoint)?;
         if column_entries.is_empty() {
             return Ok(None);
         }
         reassemble_row_projecting_columns(row_id, &column_entries, columns).map(Some)
     }
 
+    // The retained-snapshot parameter takes this past clippy's argument limit;
+    // same precedent as `apply_state_update` in the SDK.
+    #[allow(clippy::too_many_arguments)]
     fn query_rows_by_id_range_projecting_columns(
         &self,
         table_name: &str,
@@ -479,6 +490,7 @@ impl MerkStorage {
         inclusive_start: bool,
         inclusive_end: bool,
         columns: &std::collections::BTreeSet<String>,
+        checkpoint: Option<&Tree>,
     ) -> Result<Vec<serde_json::Value>> {
         let start_key = match start {
             Some(row_id) if inclusive_start => keys::row_key(table_name, row_id),
@@ -494,7 +506,7 @@ impl MerkStorage {
             None => proofs::prefix_successor_required(&keys::row_prefix(table_name))?,
         };
 
-        let key_values = self.iter_range(&start_key, Some(&end_key))?;
+        let key_values = self.collect_range_at(&start_key, Some(&end_key), checkpoint)?;
         group_columns_into_rows_projecting_columns(&key_values, columns)
     }
 
@@ -509,17 +521,46 @@ impl MerkStorage {
         &self,
         table_name: &str,
         predicate: &Predicate,
+        checkpoint: Option<&Tree>,
     ) -> Result<Vec<Vec<u8>>> {
         let ranges = index_ranges_for_predicate(table_name, predicate)?;
         let mut row_keys = Vec::new();
         for (start, end) in ranges {
-            for (key, _) in self.iter_range(&start, Some(&end))? {
+            for (key, _) in self.collect_range_at(&start, Some(&end), checkpoint)? {
                 if let Ok(keys::ParsedKey::Index { row_id, .. }) = keys::parse_key(&key) {
                     row_keys.push(keys::row_key(table_name, row_id));
                 }
             }
         }
         Ok(row_keys)
+    }
+
+    fn collect_prefix_at(
+        &self,
+        prefix: &[u8],
+        checkpoint: Option<&Tree>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        match checkpoint {
+            Some(tree) => tree.collect_prefix(prefix),
+            None => self.tree().collect_prefix(prefix),
+        }
+        .map_err(|e| SdkError::DatabaseError(format!("Failed to read prefix: {e:?}")))
+    }
+
+    fn collect_range_at(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        checkpoint: Option<&Tree>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if end.is_some_and(|end| start >= end) {
+            return Ok(Vec::new());
+        }
+        match checkpoint {
+            Some(tree) => tree.collect_range(start, end),
+            None => self.tree().collect_range(start, end),
+        }
+        .map_err(|e| SdkError::DatabaseError(format!("Failed to read range: {e:?}")))
     }
 
     /// Build direct insert operations for writes that bypass the changelog.
@@ -1213,7 +1254,7 @@ impl RowReadSource for MerkStorage {
         table_name: &str,
         predicate: &Predicate,
     ) -> Result<Vec<Vec<u8>>> {
-        MerkStorage::index_row_keys_for_predicate(self, table_name, predicate)
+        MerkStorage::index_row_keys_for_predicate(self, table_name, predicate, None)
     }
 
     fn iter_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {

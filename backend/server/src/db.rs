@@ -4,6 +4,7 @@ use crate::inspector::summarize::{
 };
 use crate::inspector::{self, Inspector, InspectorEvent, MembershipEvent, ProofKind};
 use crate::key_delivery::GroupKeyDeliverySlots;
+use crate::retained_snapshots::{RetainedSnapshots, DEFAULT_RETENTION_WINDOW};
 use base64::Engine as _;
 use encrypted_spaces_acl_types::{Action, ActionBody, ActionLeg};
 use encrypted_spaces_backend::internal_schemas::RETENTION_TABLE_NAME;
@@ -20,7 +21,7 @@ use encrypted_spaces_backend::{
     app_schema::{SchemaBundle, SchemaTable},
     error::SdkError,
     internal_schemas,
-    merk_storage::{execute_query, proofs::StoreReadOp, stored_value, MerkStorage},
+    merk_storage::{execute_query, proofs::StoreReadOp, stored_value, MerkStorage, Tree},
     proto::{self, db_request, db_response, store_read_request::Selector, DbRequest, DbResponse},
     query::{ComparisonOperator, Predicate, Query, QueryOperation, QueryParam},
     schema::{ColumnType, Schema, MAX_STRING_COLUMN_BYTES},
@@ -144,7 +145,12 @@ pub struct SpaceState {
     pub ff_proof: Option<FFProof>,
     /// A copy of the tree at the time ff_proof was created. When we create the next proof,
     /// we need the tree and a list of operations we'll apply to it.
-    pub tree_snapshot: Option<encrypted_spaces_backend::merk_storage::Tree>,
+    pub tree_snapshot: Option<Tree>,
+    /// Bounded map of past FastForward-boundary snapshots, keyed by the
+    /// commitment each boundary produced. Lets a proved read be served
+    /// against a commitment that isn't the live head. See
+    /// [`crate::retained_snapshots`].
+    pub retained_snapshots: RetainedSnapshots,
     /// Batch size for FF proof generation - a new proof is generated every N changes
     pub ff_batch_size: usize,
     /// Per-recipient GK delivery slots (runtime state, not DB-persisted).
@@ -532,6 +538,7 @@ impl SpaceState {
             change_responses: vec![],
             ff_proof: None,
             tree_snapshot: None,
+            retained_snapshots: RetainedSnapshots::new(DEFAULT_RETENTION_WINDOW),
             ff_batch_size,
             key_delivery_slots: GroupKeyDeliverySlots::default(),
             space_id,
@@ -2402,12 +2409,20 @@ impl SpaceState {
                     self.space_id, num_changes, e
                 ))
             })?);
-            self.tree_snapshot = Some(self.db.checkpoint().ok_or_else(|| {
+            let new_boundary_snapshot = self.db.checkpoint().ok_or_else(|| {
                 ServerError::Generic(format!(
                     "space={} missing tree snapshot after FF proof update at change {}",
                     self.space_id, num_changes
                 ))
-            })?);
+            })?;
+            let new_boundary = self.changelog.proven_up_to as u32;
+            let new_boundary_commitment = self.db.root_hash();
+            self.retained_snapshots.insert(
+                new_boundary,
+                new_boundary_commitment,
+                new_boundary_snapshot.clone(),
+            );
+            self.tree_snapshot = Some(new_boundary_snapshot);
             log::info!(
                 "space={} FF proof updated, proven_up_to={}",
                 self.space_id,
@@ -2498,8 +2513,45 @@ impl SpaceState {
         hashes
     }
 
-    /// Verify the client's data commitment matches the server root, then generate
-    /// a query proof. Returns `SdkError::FastForwardRequired` on commitment mismatch.
+    /// Build the "client is too far behind" error for a stale-commitment
+    /// select or store read. Shared so a commitment that is neither the
+    /// live head nor retained — evicted, never retained, or simply bogus —
+    /// always gets the same response, with no special-casing between those
+    /// cases.
+    fn stale_commitment_error(commitment: &[u8], root: [u8; 32]) -> SdkError {
+        SdkError::FastForwardRequired {
+            reason: format!(
+                "client data commitment does not match server root \
+                 (client={}, server={})",
+                hex::encode(commitment),
+                hex::encode(root),
+            ),
+        }
+    }
+
+    /// Resolve `commitment` to a tree to prove against: the live tree if it
+    /// matches the live root, otherwise a lookup in the retained
+    /// FastForward-boundary snapshot map. Returns the resolved commitment
+    /// (for proof-adjacent bookkeeping that wants `[u8; 32]`) alongside
+    /// `None` for the live tree or `Some(snapshot)` for a retained boundary.
+    fn resolve_commitment(&self, commitment: &[u8]) -> Result<([u8; 32], Option<&Tree>), SdkError> {
+        let root = self.db.root_hash();
+        if commitment == root {
+            return Ok((root, None));
+        }
+        let commitment_array: [u8; 32] = commitment
+            .try_into()
+            .map_err(|_| Self::stale_commitment_error(commitment, root))?;
+        let snapshot = self
+            .retained_snapshots
+            .get(&commitment_array)
+            .ok_or_else(|| Self::stale_commitment_error(commitment, root))?;
+        Ok((commitment_array, Some(snapshot)))
+    }
+
+    /// Verify the client's data commitment is servable (the live head, or a
+    /// retained FastForward boundary), then generate a query proof. Returns
+    /// `SdkError::FastForwardRequired` if it's neither.
     pub async fn handle_select(
         &self,
         query: &Query,
@@ -2519,26 +2571,15 @@ impl SpaceState {
             ));
         }
 
-        let root = self.db.root_hash();
+        let (effective_root, snapshot) = self.resolve_commitment(commitment)?;
 
-        // TODO: Support querying against old snapshots
-        if commitment != root {
-            return Err(SdkError::FastForwardRequired {
-                reason: format!(
-                    "client data commitment does not match server root \
-                     (client={}, server={})",
-                    hex::encode(commitment),
-                    hex::encode(root),
-                ),
-            });
+        let proof = match snapshot {
+            Some(node) => self.db.prove_query_at(query, node).await,
+            None => self.db.prove_query(query).await,
         }
-
-        let proof = self
-            .db
-            .prove_query(query)
-            .await
-            .map_err(|e| SdkError::DatabaseError(format!("failed to generate proof: {e:?}")))?;
-        let hashed_values = self.collect_hashed_values_for_select(query, &proof, &root)?;
+        .map_err(|e| SdkError::DatabaseError(format!("failed to generate proof: {e:?}")))?;
+        let hashed_values =
+            self.collect_hashed_values_for_select(query, &proof, &effective_root)?;
 
         self.emit_inspector(InspectorEvent::ProofEmitted {
             ts_ms: inspector::now_ms(),
@@ -2555,12 +2596,12 @@ impl SpaceState {
         })
     }
 
-    /// Verify the client's data commitment matches the server root, then
-    /// generate a tracer store-read proof for `read`. Returns the proof bytes;
-    /// the client verifies them with `verify_store_tracer_proof`. Mirrors
-    /// [`SpaceState::handle_select`] — on commitment mismatch it returns
-    /// `SdkError::FastForwardRequired` rather than a proof the client can't
-    /// verify.
+    /// Verify the client's data commitment is servable (the live head, or a
+    /// retained FastForward boundary), then generate a tracer store-read
+    /// proof for `read`. Returns the proof bytes; the client verifies them
+    /// with `verify_store_tracer_proof`. Mirrors [`SpaceState::handle_select`]
+    /// — on an unservable commitment it returns `SdkError::FastForwardRequired`
+    /// rather than a proof the client can't verify.
     pub async fn handle_store_read(
         &self,
         read: &StoreReadOp,
@@ -2572,19 +2613,12 @@ impl SpaceState {
             ));
         }
 
-        let root = self.db.root_hash();
-        if commitment != root {
-            return Err(SdkError::FastForwardRequired {
-                reason: format!(
-                    "client data commitment does not match server root \
-                     (client={}, server={})",
-                    hex::encode(commitment),
-                    hex::encode(root),
-                ),
-            });
-        }
+        let (_effective_root, snapshot) = self.resolve_commitment(commitment)?;
 
-        self.db.prove_store_read(read).await
+        match snapshot {
+            Some(node) => self.db.prove_store_read_at(read, node).await,
+            None => self.db.prove_store_read(read).await,
+        }
     }
 
     ///
@@ -3766,6 +3800,24 @@ mod tests {
 
     // --- Async state tests ---
     // Use unique byte patterns per test to avoid SPACES map collisions when tests run in parallel.
+
+    #[tokio::test]
+    async fn retained_snapshot_window_is_independent_of_ff_batch_size() {
+        let state = SpaceState::init_server(
+            None,
+            Some(SpaceInitConfig {
+                space_id: SpaceId::random(),
+                artifact_path: None,
+                verbose_logfile: None,
+                bootstrap_data: BootstrapDataSource::None,
+            }),
+            Some(7),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.retained_snapshots.window(), DEFAULT_RETENTION_WINDOW);
+        assert_ne!(state.retained_snapshots.window(), 7);
+    }
 
     // --- Issue #212: expected-change-id bounding (fast-forward DoS guard) ---
 
@@ -5455,6 +5507,154 @@ mod tests {
         assert!(
             err_msg.contains("missing hashed value") || err_msg.contains("expected 32"),
             "error should mention missing hashed value, got: {err_msg}"
+        );
+    }
+
+    // --- Retained-snapshot proof serving ---
+
+    /// A space with a plaintext "widgets" table, so tests can insert and
+    /// select rows without touching hash-backed columns or the changelog —
+    /// these tests exercise retained-snapshot proof *serving*
+    /// (`handle_select` resolving a non-live commitment), not FastForward
+    /// proof *generation*, which is covered elsewhere.
+    async fn widgets_test_state() -> SpaceState {
+        use encrypted_spaces_backend::schema::{ColumnDefinition, ColumnType, Schema};
+
+        let schema = Schema {
+            name: "widgets".to_string(),
+            columns: vec![
+                ColumnDefinition {
+                    name: "id".to_string(),
+                    column_type: ColumnType::Integer,
+                    plaintext: true,
+                    indexed: false,
+                },
+                ColumnDefinition {
+                    name: "name".to_string(),
+                    column_type: ColumnType::String,
+                    plaintext: true,
+                    indexed: false,
+                },
+            ],
+            auto_increment: true,
+        };
+
+        SpaceState::init_server(
+            Some(&vec![schema]),
+            Some(SpaceInitConfig {
+                space_id: SpaceId::random(),
+                artifact_path: None,
+                verbose_logfile: None,
+                bootstrap_data: BootstrapDataSource::None,
+            }),
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn insert_widget(state: &SpaceState, name: &str) {
+        let auth = AuthContext::new(None, state.space_id);
+        state
+            .db
+            .insert(
+                Query::new(
+                    "widgets".to_string(),
+                    QueryOperation::Insert(vec![(
+                        "name".to_string(),
+                        QueryParam::Text(name.to_string()),
+                    )]),
+                ),
+                &auth,
+            )
+            .await
+            .unwrap();
+    }
+
+    fn widget_names(
+        verified: &encrypted_spaces_backend::merk_storage::proofs::VerifiedRows,
+    ) -> Vec<String> {
+        let mut names: Vec<String> = verified
+            .main_rows
+            .iter()
+            .filter_map(|row| row.get("name").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A read proven against a retained, non-live boundary must verify and
+    /// return exactly the rows that existed at that boundary, not whatever
+    /// the live tree holds: proving against a retained snapshot is
+    /// equivalent to proving against the live tree at the point that
+    /// snapshot was taken.
+    #[tokio::test]
+    async fn handle_select_against_retained_boundary_returns_that_boundarys_rows() {
+        let mut state = widgets_test_state().await;
+        insert_widget(&state, "a").await;
+
+        let boundary_commitment = state.get_root_hash().await;
+        let boundary_snapshot = state
+            .db
+            .checkpoint()
+            .expect("tree is non-empty after insert");
+        state
+            .retained_snapshots
+            .insert(1, boundary_commitment, boundary_snapshot);
+
+        insert_widget(&state, "b").await;
+        let live_commitment = state.get_root_hash().await;
+        assert_ne!(
+            live_commitment, boundary_commitment,
+            "second insert must move the live root away from the retained boundary"
+        );
+
+        let query = Query::new("widgets".to_string(), QueryOperation::Select(Vec::new()));
+
+        let live_response = state.handle_select(&query, &live_commitment).await.unwrap();
+        let live_verified = encrypted_spaces_backend::merk_storage::proofs::verify_query_proof(
+            &query,
+            &live_response.proof,
+            &live_commitment,
+        )
+        .unwrap();
+        assert_eq!(widget_names(&live_verified), vec!["a", "b"]);
+
+        let boundary_response = state
+            .handle_select(&query, &boundary_commitment)
+            .await
+            .unwrap();
+        let boundary_verified = encrypted_spaces_backend::merk_storage::proofs::verify_query_proof(
+            &query,
+            &boundary_response.proof,
+            &boundary_commitment,
+        )
+        .unwrap();
+        assert_eq!(
+            widget_names(&boundary_verified),
+            vec!["a"],
+            "a proof against the retained boundary must reflect state as of that boundary, \
+             not the live tree"
+        );
+    }
+
+    /// A commitment that is neither the live head nor a retained boundary —
+    /// evicted, never retained, or simply bogus — must always get the same
+    /// `FastForwardRequired` response. No special-casing, no panic, no hang.
+    #[tokio::test]
+    async fn handle_select_rejects_commitment_that_was_never_retained() {
+        let state = widgets_test_state().await;
+        insert_widget(&state, "a").await;
+
+        let bogus_commitment = [0xFFu8; 32];
+        let query = Query::new("widgets".to_string(), QueryOperation::Select(Vec::new()));
+        let err = state
+            .handle_select(&query, &bogus_commitment)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SdkError::FastForwardRequired { .. }),
+            "expected FastForwardRequired for an unretained commitment, got: {err:?}"
         );
     }
 }
