@@ -3,6 +3,9 @@ name = "encrypted-spaces-ffproof-bench"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+avl = ["encrypted-spaces-changelog-core/avl"]
+
 [package.metadata.risc0]
 methods = ["guest"]
 

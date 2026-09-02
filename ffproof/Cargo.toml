@@ -18,7 +18,6 @@ serde = {workspace = true}
 wasm-bindgen = {workspace = true}
 postcard = {workspace = true}
 merk = {workspace = true}
-ffproof-tracer = { path = "tracer" }
 ffproof-tracer-shared = { path = "tracer/shared" }
 ctor = { workspace = true }
 
@@ -48,6 +47,11 @@ tokio = { workspace = true }
 encrypted-spaces-changelog-test-utils = { path = "changelog_test_utils" }
 
 [features]
+avl = [
+    "encrypted-spaces-changelog-core/avl",
+    "ffproof-tracer-shared/avl",
+    "encrypted-spaces-ffproof-methods?/avl",
+]
 # Default is the lightweight verifier surface: callers who don't ask
 # for anything get `FFProof`, `verify_ff`, and `ensure_risc0_proof_mode`
 # without the heavy RISC-V guest binary compile.  Consumers that need

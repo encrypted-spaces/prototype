@@ -14,6 +14,11 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
+# The default GITHUB_TOKEN is handed to third-party setup actions (protoc);
+# restrict it to read-only.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -101,6 +106,15 @@ jobs:
         with:
           tool: cargo-nextest
 
+      # CI never builds the zkVM guest (RISC0_SKIP_BUILD=1 above, matching
+      # the pre-existing cost philosophy). Guest builds — including the
+      # host->guest `mrt` feature forwarding in ffproof/methods/build.rs —
+      # are validated manually:
+      #   RISC0_DEV_MODE=1 cargo test -p encrypted-spaces-ffproof --features prove test_simple_ff_roundtrip
+      #   RISC0_DEV_MODE=1 cargo test -p encrypted-spaces-ffproof --features prove,mrt test_simple_ff_roundtrip
+      # with RISC0_SKIP_BUILD unset. (`prove` gates the prover module; the
+      # dev-dep cycle through backend-server would currently also enable it,
+      # but the command shouldn't rely on that.)
       - name: Cargo nextest run (${{ matrix.group }})
         run: cargo nextest run ${{ matrix.packages }} --locked ${{ matrix.filter }}
 

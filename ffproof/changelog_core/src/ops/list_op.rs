@@ -5,7 +5,7 @@ use super::{
     OpContext, OpReader, OpVerifier, OpVerifyResult,
 };
 use crate::changelog::{ChangelogEntry, ChangelogError, OpType};
-use crate::{BatchOp, ReadOp, TraceStep};
+use crate::{ReadOp, WriteOp};
 use encrypted_spaces_storage_encoding::keys::{
     column_key, column_key_placeholder, decode_list_parent, list_head_key, list_parent_key,
     list_tail_key, parse_key, ParsedKey, LISTS_TABLE,
@@ -57,17 +57,17 @@ fn read_i64_column(
     decode_i64_column_value(bytes, op_name, &format!("_lists.{column} (row {row_id})"))
 }
 
-fn i64_put(key: Vec<u8>, value: i64) -> BatchOp {
-    BatchOp::Put {
+fn i64_put(key: Vec<u8>, value: i64) -> WriteOp {
+    WriteOp::Put {
         key,
         value: value.to_be_bytes().to_vec(),
     }
 }
 
-fn stored_i64_put(key: Vec<u8>, value: i64) -> Result<BatchOp, ChangelogError> {
+fn stored_i64_put(key: Vec<u8>, value: i64) -> Result<WriteOp, ChangelogError> {
     let bytes = value_to_bytes(&serde_json::json!(value))
         .map_err(|e| ChangelogError::Generic(format!("failed to serialize i64 {value}: {e}")))?;
-    Ok(BatchOp::Put { key, value: bytes })
+    Ok(WriteOp::Put { key, value: bytes })
 }
 
 fn read_list_number(
@@ -150,12 +150,12 @@ fn new_row_puts(
     prev_id: i64,
     next_id: i64,
     value: Vec<u8>,
-) -> Result<Vec<BatchOp>, ChangelogError> {
+) -> Result<Vec<WriteOp>, ChangelogError> {
     Ok(vec![
         stored_i64_put(column_key(LISTS, new_id, "list_number"), list_number)?,
         stored_i64_put(column_key(LISTS, new_id, "next_id"), next_id)?,
         stored_i64_put(column_key(LISTS, new_id, "prev_id"), prev_id)?,
-        BatchOp::Put {
+        WriteOp::Put {
             key: column_key(LISTS, new_id, "value"),
             value,
         },
@@ -168,7 +168,7 @@ fn list_number_index_put(
     op_name: &str,
     reader: &mut dyn OpReader,
     ctx: &OpContext,
-) -> Result<Vec<BatchOp>, ChangelogError> {
+) -> Result<Vec<WriteOp>, ChangelogError> {
     let indexed = read_schema_indexes(LISTS, reader, ctx)?;
     if !indexed.contains("list_number") {
         return Err(ChangelogError::Generic(format!(
@@ -296,7 +296,7 @@ impl OpVerifier for ListAppendOp {
 
         let value = placeholder_value(entry, "list_append")?;
 
-        let mut batch_ops: Vec<BatchOp> = Vec::new();
+        let mut batch_ops: Vec<WriteOp> = Vec::new();
 
         if tail == 0 {
             // Empty list: new row becomes both head and tail.
@@ -323,7 +323,7 @@ impl OpVerifier for ListAppendOp {
         ));
 
         Ok(OpVerifyResult {
-            write_steps: vec![TraceStep::Write(batch_ops)],
+            write_steps: batch_ops,
         })
     }
 }
@@ -367,7 +367,7 @@ impl OpVerifier for ListInsertOp {
 
         let new_id = read_next_id(LISTS, "list_insert", reader)?;
 
-        let mut batch_ops: Vec<BatchOp> = Vec::new();
+        let mut batch_ops: Vec<WriteOp> = Vec::new();
 
         if predecessor_id == 0 {
             // Prepend (sentinel).
@@ -435,7 +435,7 @@ impl OpVerifier for ListInsertOp {
         ));
 
         Ok(OpVerifyResult {
-            write_steps: vec![TraceStep::Write(batch_ops)],
+            write_steps: batch_ops,
         })
     }
 }
@@ -486,13 +486,13 @@ impl OpVerifier for ListUpdateOp {
             ctx,
         )?;
 
-        let batch_ops = vec![BatchOp::Put {
+        let batch_ops = vec![WriteOp::Put {
             key: column_key(LISTS, target_id, "value"),
             value: kv.value.clone(),
         }];
 
         Ok(OpVerifyResult {
-            write_steps: vec![TraceStep::Write(batch_ops)],
+            write_steps: batch_ops,
         })
     }
 }
@@ -588,17 +588,17 @@ impl OpVerifier for ListDeleteOp {
         let prev = read_i64_column(reader, target_id, "prev_id", "list_delete")?;
         let next = read_i64_column(reader, target_id, "next_id", "list_delete")?;
 
-        let mut batch_ops: Vec<BatchOp> = vec![
-            BatchOp::Delete {
+        let mut batch_ops: Vec<WriteOp> = vec![
+            WriteOp::Delete {
                 key: column_key(LISTS, target_id, "list_number"),
             },
-            BatchOp::Delete {
+            WriteOp::Delete {
                 key: column_key(LISTS, target_id, "next_id"),
             },
-            BatchOp::Delete {
+            WriteOp::Delete {
                 key: column_key(LISTS, target_id, "prev_id"),
             },
-            BatchOp::Delete {
+            WriteOp::Delete {
                 key: column_key(LISTS, target_id, "value"),
             },
         ];
@@ -643,7 +643,7 @@ impl OpVerifier for ListDeleteOp {
         )?);
 
         Ok(OpVerifyResult {
-            write_steps: vec![TraceStep::Write(batch_ops)],
+            write_steps: batch_ops,
         })
     }
 }
@@ -851,9 +851,7 @@ mod tests {
         let mut reader = VerifierReader::new(&reads);
         let result =
             ListAppendOp::extract_and_validate(&entry, &mut reader, &no_acl_ctx()).unwrap();
-        let TraceStep::Write(ops) = &result.write_steps[0] else {
-            panic!("expected Write step");
-        };
+        let ops = &result.write_steps;
         // 4 column puts + head + tail + index + counter bump = 8
         assert_eq!(ops.len(), 8, "got {} ops: {ops:?}", ops.len());
     }
@@ -877,9 +875,7 @@ mod tests {
         let mut reader = VerifierReader::new(&reads);
         let result =
             ListAppendOp::extract_and_validate(&entry, &mut reader, &no_acl_ctx()).unwrap();
-        let TraceStep::Write(ops) = &result.write_steps[0] else {
-            panic!("expected Write step");
-        };
+        let ops = &result.write_steps;
         // 4 column puts + link old tail next_id + tail update + index + counter = 8
         assert_eq!(ops.len(), 8, "got {} ops: {ops:?}", ops.len());
     }
@@ -904,9 +900,7 @@ mod tests {
         let mut reader = VerifierReader::new(&reads);
         let result =
             ListInsertOp::extract_and_validate(&entry, &mut reader, &no_acl_ctx()).unwrap();
-        let TraceStep::Write(ops) = &result.write_steps[0] else {
-            panic!("expected Write step");
-        };
+        let ops = &result.write_steps;
         assert_eq!(ops.len(), 8);
     }
 
@@ -929,9 +923,7 @@ mod tests {
         let mut reader = VerifierReader::new(&reads);
         let result =
             ListInsertOp::extract_and_validate(&entry, &mut reader, &no_acl_ctx()).unwrap();
-        let TraceStep::Write(ops) = &result.write_steps[0] else {
-            panic!("expected Write step");
-        };
+        let ops = &result.write_steps;
         assert_eq!(ops.len(), 8);
     }
 
@@ -956,9 +948,7 @@ mod tests {
         let mut reader = VerifierReader::new(&reads);
         let result =
             ListInsertOp::extract_and_validate(&entry, &mut reader, &no_acl_ctx()).unwrap();
-        let TraceStep::Write(ops) = &result.write_steps[0] else {
-            panic!("expected Write step");
-        };
+        let ops = &result.write_steps;
         assert_eq!(ops.len(), 8);
     }
 
@@ -982,9 +972,7 @@ mod tests {
         let mut reader = VerifierReader::new(&reads);
         let result =
             ListInsertOp::extract_and_validate(&entry, &mut reader, &no_acl_ctx()).unwrap();
-        let TraceStep::Write(ops) = &result.write_steps[0] else {
-            panic!("expected Write step");
-        };
+        let ops = &result.write_steps;
         assert_eq!(ops.len(), 8);
     }
 
@@ -1031,12 +1019,10 @@ mod tests {
         let mut reader = VerifierReader::new(&reads);
         let result =
             ListUpdateOp::extract_and_validate(&entry, &mut reader, &no_acl_ctx()).unwrap();
-        let TraceStep::Write(ops) = &result.write_steps[0] else {
-            panic!("expected Write step");
-        };
+        let ops = &result.write_steps;
         assert_eq!(ops.len(), 1);
         match &ops[0] {
-            BatchOp::Put { key, value } => {
+            WriteOp::Put { key, value } => {
                 assert_eq!(key, &column_key(LISTS, target, "value"));
                 assert_eq!(value, &vec![77u8; 32]);
             }
@@ -1083,9 +1069,7 @@ mod tests {
         let mut reader = VerifierReader::new(&reads);
         let result =
             ListDeleteOp::extract_and_validate(&entry, &mut reader, &no_acl_ctx()).unwrap();
-        let TraceStep::Write(ops) = &result.write_steps[0] else {
-            panic!("expected Write step");
-        };
+        let ops = &result.write_steps;
         // 4 deletes + relink prev.next_id + relink next.prev_id + index delete = 7
         assert_eq!(ops.len(), 7, "got {} ops: {ops:?}", ops.len());
     }
@@ -1111,9 +1095,7 @@ mod tests {
         let mut reader = VerifierReader::new(&reads);
         let result =
             ListDeleteOp::extract_and_validate(&entry, &mut reader, &no_acl_ctx()).unwrap();
-        let TraceStep::Write(ops) = &result.write_steps[0] else {
-            panic!("expected Write step");
-        };
+        let ops = &result.write_steps;
         assert_eq!(ops.len(), 7, "got {} ops: {ops:?}", ops.len());
     }
 
@@ -1138,9 +1120,7 @@ mod tests {
         let mut reader = VerifierReader::new(&reads);
         let result =
             ListDeleteOp::extract_and_validate(&entry, &mut reader, &no_acl_ctx()).unwrap();
-        let TraceStep::Write(ops) = &result.write_steps[0] else {
-            panic!("expected Write step");
-        };
+        let ops = &result.write_steps;
         assert_eq!(ops.len(), 7, "got {} ops: {ops:?}", ops.len());
     }
 
@@ -1164,9 +1144,7 @@ mod tests {
         let mut reader = VerifierReader::new(&reads);
         let result =
             ListDeleteOp::extract_and_validate(&entry, &mut reader, &no_acl_ctx()).unwrap();
-        let TraceStep::Write(ops) = &result.write_steps[0] else {
-            panic!("expected Write step");
-        };
+        let ops = &result.write_steps;
         assert_eq!(ops.len(), 7, "got {} ops: {ops:?}", ops.len());
     }
 

@@ -7,21 +7,19 @@ import { OperationsLog } from "./components/OperationsLog";
 import { PlaybackControls } from "./components/PlaybackControls";
 import { JsonDrawer } from "./components/JsonDrawer";
 import { TablesPanel } from "./components/TablesPanel";
-import { MerkTreePanel } from "./components/MerkTreePanel";
 import { MmrPanel } from "./components/MmrPanel";
 import { MembershipPanel } from "./components/MembershipPanel";
 import { ProofPanel } from "./components/ProofPanel";
 import { ExplainBanner } from "./components/Explain";
 import { deriveStateAt } from "./store/reducer";
 import { deriveTablesAt } from "./store/tables";
-import { deriveTreeAt } from "./store/tree";
 import { deriveMmrAt } from "./store/mmr";
 import { deriveMembershipAt } from "./store/membership";
 import { usePlayback } from "./store/playback";
 import type { InspectorEvent } from "./types/events";
 import "./app.css";
 
-type RightTab = "tables" | "tree" | "mmr" | "members" | "proofs" | "json";
+type RightTab = "tables" | "mmr" | "members" | "proofs" | "json";
 type SourceMode = "file" | "live";
 type ViewMode = "operations" | "raw";
 
@@ -46,10 +44,6 @@ export default function App() {
   );
   const tables = useMemo(
     () => deriveTablesAt(events, playback.cursor),
-    [events, playback.cursor],
-  );
-  const tree = useMemo(
-    () => deriveTreeAt(events, playback.cursor),
     [events, playback.cursor],
   );
   const mmr = useMemo(
@@ -190,12 +184,6 @@ export default function App() {
               Tables
             </button>
             <button
-              className={`right-tab ${rightTab === "tree" ? "active" : ""}`}
-              onClick={() => setRightTab("tree")}
-            >
-              Merk tree
-            </button>
-            <button
               className={`right-tab ${rightTab === "mmr" ? "active" : ""}`}
               onClick={() => setRightTab("mmr")}
             >
@@ -226,12 +214,6 @@ export default function App() {
               <div className="panel-with-explain">
                 {explainMode && <ExplainBanner topic="tables" />}
                 <TablesPanel state={tables} cursor={playback.cursor} />
-              </div>
-            )}
-            {rightTab === "tree" && (
-              <div className="panel-with-explain">
-                {explainMode && <ExplainBanner topic="tree" />}
-                <MerkTreePanel state={tree} />
               </div>
             )}
             {rightTab === "mmr" && (

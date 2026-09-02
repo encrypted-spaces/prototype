@@ -1,5 +1,5 @@
 // Operations view: collapses the raw event stream into one card per
-// `Request`, with the contributing MerkUpdate / MerkSnapshot /
+// `Request`, with the contributing MerkUpdate /
 // ChangelogAppend / Membership / ProofEmitted events attached as children.
 // Standalone events (Connection, SchemaSnapshot before any Request) render
 // as inline separators so the timeline stays coherent.
@@ -181,8 +181,6 @@ function childSummary(ev: InspectorEvent): string {
       const cols = ev.entries.filter((e) => e.key_kind === "column").length;
       return `change=${ev.change_id} ${ev.op_type} ${truncHex(ev.old_root)}→${truncHex(ev.new_root)} (${cols} col${cols === 1 ? "" : "s"}, ${ev.rows_affected} row${ev.rows_affected === 1 ? "" : "s"})`;
     }
-    case "MerkSnapshot":
-      return `change=${ev.change_id} · ${ev.node_count} node${ev.node_count === 1 ? "" : "s"}`;
     case "ChangelogAppend":
       return `change=${ev.change_id} clc=${truncHex(ev.clc_root)} (${ev.entry_size_bytes}B)`;
     case "Membership":

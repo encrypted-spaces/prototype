@@ -58,7 +58,7 @@ fn main() {
     env::read_slice(&mut range_bytes);
     let verify_range: FastForwardRange = postcard::from_bytes(&range_bytes).unwrap();
 
-    // Read the compact pruned tree witness.
+    // Read the merk trace witness.
     let pruned_tree_byte_len: usize = env::read();
     let mut pruned_tree_bytes = vec![0u8; pruned_tree_byte_len];
     env::read_slice(&mut pruned_tree_bytes);

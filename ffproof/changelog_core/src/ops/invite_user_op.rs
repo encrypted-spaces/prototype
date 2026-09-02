@@ -5,7 +5,7 @@ use super::{
     read_schema_columns, validate_user_access, OpReader, OpVerifier, OpVerifyResult,
 };
 use crate::changelog::{ChangelogEntry, ChangelogError, OpType};
-use crate::{BatchOp, TraceStep};
+use crate::WriteOp;
 /// InviteUser operation verifier.
 ///
 /// # User-ID allocation
@@ -62,7 +62,7 @@ impl OpVerifier for InviteUserOp {
         let user_column_keys =
             derive_column_keys_with_row_id(&user_entries, user_row_id, "invite_user")?;
 
-        let mut batch_ops: Vec<BatchOp> =
+        let mut batch_ops: Vec<WriteOp> =
             Vec::with_capacity(user_column_keys.len() + retention_entries.len());
         for (col_key, kv) in user_column_keys.iter().zip(user_entries.iter()) {
             batch_ops.push(kv.to_batch_op(col_key));
@@ -131,10 +131,8 @@ impl OpVerifier for InviteUserOp {
             )?;
         }
 
-        batch_ops.sort_by(|a, b| a.key().cmp(b.key()));
-
         Ok(OpVerifyResult {
-            write_steps: vec![TraceStep::Write(batch_ops)],
+            write_steps: batch_ops,
         })
     }
 }

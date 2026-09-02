@@ -41,6 +41,10 @@ uuid = { workspace = true }
 tempfile = "3"
 
 [features]
+avl = [
+    "encrypted-spaces-backend/avl",
+    "encrypted-spaces-ffproof/avl",
+]
 # Passthrough features so the server can be built as:
 #   cargo build -p encrypted-spaces-backend-server --features real-proofs,cuda
 real-proofs = ["encrypted-spaces-ffproof/real-proofs"]

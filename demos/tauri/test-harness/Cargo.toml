@@ -14,6 +14,10 @@ path = "src/lib.rs"
 name = "demo-harness"
 path = "src/bin/harness.rs"
 
+[features]
+# Run the harness on the MRT merk backend (see the demo crate's `mrt`).
+avl = ["encrypted-spaces-demo/avl", "encrypted-spaces-sdk/avl"]
+
 [dependencies]
 encrypted-spaces-acl-types = { workspace = true }
 encrypted-spaces-demo = { path = "../src-tauri" }

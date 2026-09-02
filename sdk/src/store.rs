@@ -5,6 +5,20 @@
 //! overwrite, or delete any key. Keys are opaque plaintext bytes; values
 //! are opaque bytes, encrypted client-side unless the store was declared
 //! `encrypted=#false`.
+//!
+//! Limits (enforced by the storage layer at write time, not pre-checked
+//! here): the caps are the merk library's — `merk::MAX_KEY_LEN` (4096
+//! bytes) bounds the full encoded entry key (store name + user key plus
+//! tuple-encoding overhead) and `merk::MAX_VALUE_LEN` (65535 bytes) bounds
+//! the stored value; for encrypted stores the cap applies to the
+//! ciphertext, so the plaintext bound is slightly lower. On the radix-tree
+//! backend (the default; the `avl` feature selects the AVL tree instead) one
+//! extra merk rule applies: a key that equals
+//! another stored key plus a `0x00` byte and more (`k` alongside `k\0…`)
+//! is rejected, because the tuple encoding keeps every other key pair
+//! prefix-free but a NUL continuation defeats it. A violating `put` fails
+//! atomically with a descriptive `DatabaseError` naming the limit or key;
+//! nothing is committed, on either backend.
 
 use std::sync::Arc;
 

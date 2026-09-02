@@ -56,16 +56,6 @@ pub enum InspectorEvent {
         rows_affected: u64,
         entries: Vec<EntrySummary>,
     },
-    /// Structural snapshot of the AVL Merkle tree at this change. Emitted
-    /// right after the corresponding `MerkUpdate` so a client can diff
-    /// successive snapshots to find changed/added/removed nodes.
-    MerkSnapshot {
-        ts_ms: u64,
-        space_id: String,
-        change_id: u32,
-        node_count: u32,
-        root: Option<MerkTreeNode>,
-    },
     ChangelogAppend {
         ts_ms: u64,
         space_id: String,
@@ -135,28 +125,6 @@ pub struct ColumnInfo {
     pub indexed: bool,
 }
 
-/// Single AVL+Merkle tree node, serialized recursively. The full tree fits
-/// inline because demo recordings stay small (~50–100 leaves); larger
-/// workloads would warrant a subtree-only encoding.
-#[derive(Clone, Debug, Serialize)]
-pub struct MerkTreeNode {
-    /// Raw key bytes hex-encoded — used as a stable identity across
-    /// snapshots so the UI can diff trees.
-    pub key_hex: String,
-    /// Short human-readable parsed key (e.g. "messages/1/content") or a
-    /// `<schema:...>` / `<idx:...>` fallback when the key isn't a column.
-    pub label: String,
-    /// One of "column" | "row" | "index" | "schema" | "other".
-    pub kind: String,
-    /// First 16 hex chars of the node hash (sufficient to visually identify
-    /// changed nodes; full hash is recoverable from the recording's raw
-    /// merkle proofs if needed).
-    pub hash: String,
-    pub value_size: usize,
-    pub left: Option<Box<MerkTreeNode>>,
-    pub right: Option<Box<MerkTreeNode>>,
-}
-
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "key_kind", rename_all = "snake_case")]
 pub enum EntrySummary {
@@ -196,9 +164,9 @@ pub struct Inspector {
     broadcast_tx: broadcast::Sender<InspectorEvent>,
     /// Every event emitted this run, in order. The broadcast channel only
     /// carries events sent after a subscriber connects, so a Live WS client
-    /// that opens mid-session would miss the `SchemaSnapshot` / `MerkSnapshot`
-    /// emitted at space creation. Replaying this backlog on connect lets it
-    /// render state established before it connected.
+    /// that opens mid-session would miss the `SchemaSnapshot` emitted at
+    /// space creation. Replaying this backlog on connect lets it render
+    /// state established before it connected.
     history: Arc<Mutex<Vec<InspectorEvent>>>,
 }
 
@@ -287,8 +255,8 @@ impl Inspector {
 
     /// Snapshot of every event emitted so far this run. A new Live WS client
     /// replays this backlog before tailing `subscribe()`, so it renders state
-    /// (schema, Merk tree, membership) that was established before it
-    /// connected. Take this *after* subscribing so no event falls in the gap.
+    /// (schema, membership) that was established before it connected. Take
+    /// this *after* subscribing so no event falls in the gap.
     pub fn history_snapshot(&self) -> Vec<InspectorEvent> {
         self.history.lock().map(|h| h.clone()).unwrap_or_default()
     }

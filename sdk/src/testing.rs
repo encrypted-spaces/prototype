@@ -38,8 +38,19 @@ use crate::{ApplicationSchema, DataCommitment, Schema};
 /// backend.  Guards against silent drift: changes to the internal
 /// schema bundle will fail `Space::new`'s sanity expectation and the
 /// dedicated test in `lib.rs`, prompting an intentional update.
+// Re-baselined with the merk experimental-mrt port: writes now apply per-op
+// in issue order (the old merk applied each change as one sorted batch, and
+// AVL shape is application-order sensitive), so the fresh-space root moved
+// even though the hash functions are unchanged. The two backends hash
+// entirely differently, so each carries its own constant (MRT by default,
+// AVL under the `avl` feature); the guard test in `lib.rs` checks whichever
+// backend is active.
+#[cfg(feature = "avl")]
 const INITIAL_INTERNAL_DATA_COMMITMENT_HEX: &str =
-    "ee8d222228e87c4e768cca7f601b9f2f2af1ee4fa3594af0592d2b022d5aa103";
+    "7ac1d1e97fd6ae104739d533037e7c6bf7914f56cb0f1ee8e9f6e1e9d8ac0ec3";
+#[cfg(not(feature = "avl"))]
+const INITIAL_INTERNAL_DATA_COMMITMENT_HEX: &str =
+    "0fca009d67be408dce1619fa1b4849a12467fd66c2326b09110dc92521b0cb26";
 
 /// Decoded form of [`INITIAL_INTERNAL_DATA_COMMITMENT_HEX`], used as
 /// the starting commitment for in-tree tests and the `Space::new`

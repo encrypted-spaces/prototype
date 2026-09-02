@@ -134,10 +134,10 @@ impl MerkStorage {
         }
 
         // Get root hash
-        db_json["root_hash"] = json!(hex::encode(self.merk.root_hash()));
+        db_json["root_hash"] = json!(hex::encode(self.root_hash()));
 
         // Discover all tables by scanning schema keys
-        // Schema keys have the format: tuple("S", table_name)
+        // Schema keys have the format: tuple("S", table_name, ...)
         let schema_prefix =
             super::tuple::encode_tuple(&[super::tuple::TupleElement::String("S".to_string())]);
 

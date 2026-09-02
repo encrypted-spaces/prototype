@@ -7,7 +7,6 @@ interface Props {
     | "wire"
     | "operations"
     | "tables"
-    | "tree"
     | "mmr"
     | "members"
     | "proofs";
@@ -35,13 +34,6 @@ const TEXT: Record<Props["topic"], { title: string; body: string }> = {
       "Green columns are plaintext — indexable, queryable, visible to the " +
       "server. Locked columns are ciphertext: only members with the current " +
       "key epoch can decrypt them. The server holds opaque bytes.",
-  },
-  tree: {
-    title: "Current encrypted state",
-    body:
-      "Every key/value the server holds, organised as a Merkle tree. Each " +
-      "change updates a small subtree; the new root commits to the entire " +
-      "current state so clients can verify it cheaply.",
   },
   mmr: {
     title: "Append-only history",

@@ -1,7 +1,6 @@
 use crate::app_config::{AppConfig, BootstrapDataSource, SpaceInitConfig};
 use crate::inspector::summarize::{
     build_entry_summaries, build_schema_tables, describe_query, op_display_label,
-    serialize_merk_tree,
 };
 use crate::inspector::{self, Inspector, InspectorEvent, MembershipEvent, ProofKind};
 use crate::key_delivery::GroupKeyDeliverySlots;
@@ -145,7 +144,7 @@ pub struct SpaceState {
     pub ff_proof: Option<FFProof>,
     /// A copy of the tree at the time ff_proof was created. When we create the next proof,
     /// we need the tree and a list of operations we'll apply to it.
-    pub tree_snapshot: Option<merk::Node>,
+    pub tree_snapshot: Option<encrypted_spaces_backend::merk_storage::Tree>,
     /// Batch size for FF proof generation - a new proof is generated every N changes
     pub ff_batch_size: usize,
     /// Per-recipient GK delivery slots (runtime state, not DB-persisted).
@@ -605,7 +604,7 @@ impl SpaceState {
 
         // Take tree snapshot AFTER demo inserts so it matches the state
         // the first tracked change will see as its old_root
-        new_server_state.tree_snapshot = new_server_state.db.snapshot();
+        new_server_state.tree_snapshot = new_server_state.db.checkpoint();
 
         // Seed the inspector's known-table set: internal tables come from the
         // constructor, and application tables are read straight from the tree
@@ -621,17 +620,6 @@ impl SpaceState {
             space_id: sid.to_string(),
             tables: snapshot_tables,
         });
-        if new_server_state.inspector.is_some() {
-            let snap = new_server_state.db.snapshot();
-            let (root, node_count) = serialize_merk_tree(snap.as_ref());
-            new_server_state.emit_inspector(InspectorEvent::MerkSnapshot {
-                ts_ms: inspector::now_ms(),
-                space_id: sid.to_string(),
-                change_id: 0,
-                node_count,
-                root,
-            });
-        }
 
         log::info!(
             "space={sid} init complete, root={}",
@@ -2235,7 +2223,7 @@ impl SpaceState {
         //  inserts (setup/schema/access rules) happened since init.
         let num_changes = self.changelog.num_changes() as usize;
         if num_changes == self.changelog.proven_up_to {
-            self.tree_snapshot = self.db.snapshot();
+            self.tree_snapshot = self.db.checkpoint();
         }
 
         let old_root = self.get_root_hash().await;
@@ -2337,17 +2325,6 @@ impl SpaceState {
             rows_affected: response.rows_affected,
             entries,
         });
-        if self.inspector.is_some() {
-            let snapshot = self.db.snapshot();
-            let (root, node_count) = serialize_merk_tree(snapshot.as_ref());
-            self.emit_inspector(InspectorEvent::MerkSnapshot {
-                ts_ms: inspector::now_ms(),
-                space_id: space_str.clone(),
-                change_id: response.change_id,
-                node_count,
-                root,
-            });
-        }
         self.emit_inspector(InspectorEvent::ChangelogAppend {
             ts_ms: inspector::now_ms(),
             space_id: space_str.clone(),
@@ -2425,7 +2402,7 @@ impl SpaceState {
                     self.space_id, num_changes, e
                 ))
             })?);
-            self.tree_snapshot = Some(self.db.snapshot().ok_or_else(|| {
+            self.tree_snapshot = Some(self.db.checkpoint().ok_or_else(|| {
                 ServerError::Generic(format!(
                     "space={} missing tree snapshot after FF proof update at change {}",
                     self.space_id, num_changes
@@ -5004,8 +4981,7 @@ mod tests {
 
         state
             .db
-            .merk
-            .apply_batch(&[(
+            .apply_batch_ops(vec![(
                 column_key("notes", 1, "content"),
                 merk::Op::Put(hash.to_vec()),
             )])
@@ -5030,8 +5006,7 @@ mod tests {
 
         state
             .db
-            .merk
-            .apply_batch(&[(
+            .apply_batch_ops(vec![(
                 column_key("notes", 1, "content"),
                 merk::Op::Put(hash.to_vec()),
             )])

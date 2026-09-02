@@ -65,8 +65,6 @@ function summarize(ev: InspectorEvent): string {
   switch (ev.kind) {
     case "SchemaSnapshot":
       return `${ev.tables.length} tables, ${ev.tables.reduce((n, t) => n + t.columns.length, 0)} columns total`;
-    case "MerkSnapshot":
-      return `change=${ev.change_id} · ${ev.node_count} node${ev.node_count === 1 ? "" : "s"}`;
     case "Connection":
       return `${ev.event} uid=${ev.uid ?? "-"}`;
     case "Request":

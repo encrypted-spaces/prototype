@@ -6,6 +6,13 @@ authors.workspace = true
 edition.workspace = true
 
 [features]
+avl = [
+    "merk",
+    "encrypted-spaces-backend/avl",
+    "encrypted-spaces-backend-server?/avl",
+    "encrypted-spaces-changelog-core/avl",
+    "encrypted-spaces-ffproof/avl",
+]
 default = []
 merk = ["encrypted-spaces-backend/merk"]
 local-transport = ["merk", "dep:encrypted-spaces-backend-server"]
@@ -55,7 +62,6 @@ uuid = { workspace = true }
 env_logger = { workspace = true }
 tokio = { workspace = true, features = ["rt","rt-multi-thread","macros","sync","time"] }
 criterion = { workspace = true, features = ["async_tokio"] }
-expect-test = "1"
 tempfile = "3"
 proptest = { workspace = true }
 

@@ -10,6 +10,9 @@
 #methods = ["guest"]
 
 
+[features]
+avl = []
+
 [package]
 name = "encrypted-spaces-ffproof-methods"
 version.workspace = true

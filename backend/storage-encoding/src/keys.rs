@@ -9,7 +9,7 @@
 //!
 //! | Key Type | Tuple Format |
 //! |----------|--------------|
-//! | Schema   | `("S", table)` |
+//! | Schema   | `("S", table, "schema")` |
 //! | Row      | `("R", table, row_id)` |
 //! | Index    | `("I", table, column, value, row_id)` |
 //!
@@ -172,11 +172,38 @@ pub fn schema_prefix() -> Vec<u8> {
     encode_tuple(&[TAG_SCHEMA.into()])
 }
 
+/// Reserved sub-element under `[S, table]` that holds the table's own schema
+/// blob.
+///
+/// The bare `[S, table]` tuple is an ancestor of every other per-table schema
+/// key (`columns`, `next_id`, `id_mode`, `acl`, `action`, …), so storing a value
+/// directly at `[S, table]` would make it a byte-prefix of those keys — which the
+/// radix/MRT backend rejects (no stored key may be a prefix of another). Holding
+/// the schema blob under this reserved child slot keeps every internal stored
+/// key a non-nesting leaf — prefix-free with **no key marker**, and AVL/MRT
+/// use identical keys.
+///
+/// `"schema"` is a **reserved** sub-tag, distinct from every other per-table
+/// sub-key (`columns`, `indexes`, `next_id`, `id_mode`, `acl`, `only_via_actions`,
+/// `action`, `store`, …). FoundationDB string encoding is null-terminated, so
+/// distinct sub-tags can never be byte-prefixes of one another — keeping the
+/// internal (fixed-shape) stored-key set prefix-free. User-supplied bytes can
+/// still create prefix pairs through an embedded NUL in a key's final element
+/// (see `nul_in_final_element_defeats_prefix_freeness`); that is an accepted
+/// MRT-lane limitation, rejected by merk at write time. `parse_schema_elements`
+/// maps `[S, table, "schema"]` back to `ParsedKey::Schema` through its
+/// unknown-sub-tag fall-through. Do not reuse `"schema"` as a sub-key for any
+/// other purpose.
+const SCHEMA_SELF: &str = "schema";
+
 /// Build a key for storing table schema.
 ///
-/// Format: `tuple("S", table)`
+/// Format: `tuple("S", table, "schema")` — the schema blob lives in the reserved
+/// [`SCHEMA_SELF`] child slot, not at the bare `[S, table]` prefix, so it never
+/// becomes a prefix of the other per-table schema keys (keeps the internal
+/// stored-key set prefix-free for the radix/MRT backend; see [`SCHEMA_SELF`]).
 pub fn schema_key(table: &str) -> Vec<u8> {
-    encode_tuple(&[TAG_SCHEMA.into(), table.into()])
+    encode_tuple(&[TAG_SCHEMA.into(), table.into(), SCHEMA_SELF.into()])
 }
 
 /// Build a key for storing the compact column-names list for a table.
@@ -1532,5 +1559,138 @@ mod tests {
             }
             other => panic!("expected OnlyViaActions, got {other:?}"),
         }
+    }
+
+    /// The radix/MRT backend rejects any write whose key is a byte-prefix of
+    /// another stored key, so the set of keys we actually store must be
+    /// pairwise prefix-free. This corpus covers every stored-key shape
+    /// (schema blob under the reserved `"schema"` slot, per-table schema
+    /// sub-keys, `_lists` bookkeeping, ACL / action / store-schema keys,
+    /// column keys, index keys, store entries) across overlapping-looking
+    /// table/store/column/op names.
+    ///
+    /// Deliberately absent: names or store keys with embedded `0x00` bytes —
+    /// see `nul_in_final_element_defeats_prefix_freeness` below.
+    #[test]
+    fn stored_key_corpus_is_prefix_free() {
+        let mut corpus: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut add = |label: String, key: Vec<u8>| corpus.push((label, key));
+
+        for table in ["t", "tt", "t2", LISTS_TABLE, USERS_TABLE] {
+            add(format!("schema_key({table})"), schema_key(table));
+            add(
+                format!("schema_columns_key({table})"),
+                schema_columns_key(table),
+            );
+            add(
+                format!("schema_indexes_key({table})"),
+                schema_indexes_key(table),
+            );
+            add(
+                format!("schema_list_columns_key({table})"),
+                schema_list_columns_key(table),
+            );
+            add(
+                format!("schema_next_id_key({table})"),
+                schema_next_id_key(table),
+            );
+            add(
+                format!("schema_id_mode_key({table})"),
+                schema_id_mode_key(table),
+            );
+            for op in ["insert", "update", "delete", "select"] {
+                add(
+                    format!("acl_rule_key({table},{op})"),
+                    acl_rule_key(table, op),
+                );
+                add(
+                    format!("acl_only_via_actions_key({table},{op})"),
+                    acl_only_via_actions_key(table, op),
+                );
+            }
+            for name in ["a", "ab", "add_item"] {
+                add(
+                    format!("action_storage_key({table},{name})"),
+                    action_storage_key(table, name),
+                );
+            }
+            for row_id in [0i64, 1, 255, 256] {
+                for column in ["c", "cc", "value"] {
+                    add(
+                        format!("column_key({table},{row_id},{column})"),
+                        column_key(table, row_id, column),
+                    );
+                }
+            }
+            for column in ["c", "cc"] {
+                for value in ["v", "vv"] {
+                    add(
+                        format!("index_key({table},{column},{value})"),
+                        index_key(table, column, TupleElement::String(value.into()), 1).unwrap(),
+                    );
+                }
+            }
+        }
+        add(
+            "schema_next_list_number_key".into(),
+            schema_next_list_number_key(),
+        );
+        for n in [1i64, 2, 255] {
+            add(format!("list_head_key({n})"), list_head_key(n));
+            add(format!("list_tail_key({n})"), list_tail_key(n));
+            add(format!("list_parent_key({n})"), list_parent_key(n));
+        }
+        for store in ["t", "prefs", "p"] {
+            add(
+                format!("store_schema_key({store})"),
+                store_schema_key(store),
+            );
+            for key in [b"k".as_slice(), b"kk", b"k2"] {
+                add(
+                    format!("store_entry_key({store},{key:?})"),
+                    store_entry_key(store, key),
+                );
+            }
+        }
+
+        for (i, (label_a, a)) in corpus.iter().enumerate() {
+            for (label_b, b) in corpus.iter().skip(i + 1) {
+                assert!(
+                    !b.starts_with(a) && !a.starts_with(b),
+                    "stored keys must be prefix-free, but {label_a} and {label_b} \
+                     are prefix-related:\n  {a:02x?}\n  {b:02x?}"
+                );
+            }
+        }
+    }
+
+    /// Known MRT-lane constraint (not enforced here): tuple encoding escapes
+    /// `0x00` as `0x00 0xFF` and terminates string/bytes elements with `0x00`,
+    /// so `enc(k)` is a strict byte-prefix of `enc(k ‖ 0x00 ‖ s)`. When such an
+    /// element is the FINAL element of a stored key (store entry keys, column
+    /// names, action/op names), two stored keys can be prefix-related and the
+    /// radix/MRT backend will reject the write at runtime. Non-final elements
+    /// are safe: the next element's type code (`0x01`, int codes) never
+    /// matches the `0xFF` escape continuation.
+    ///
+    /// This test documents the hazard. By decision, no boundary validation is
+    /// added: merk's atomic, self-describing write-time rejection is the
+    /// contract, and the limitation is documented at the `Store` API
+    /// (`sdk/src/store.rs` module docs).
+    #[test]
+    fn nul_in_final_element_defeats_prefix_freeness() {
+        // Final-position element: prefix relation exists.
+        let short = store_entry_key("s", b"k");
+        let long = store_entry_key("s", b"k\x00more");
+        assert!(long.starts_with(&short));
+
+        let col_short = column_key("t", 1, "c");
+        let col_long = column_key("t", 1, "c\x00d");
+        assert!(col_long.starts_with(&col_short));
+
+        // Non-final element (table name followed by a sub-tag): safe.
+        let t_short = schema_key("a");
+        let t_long = schema_key("a\x00b");
+        assert!(!t_long.starts_with(&t_short));
     }
 }

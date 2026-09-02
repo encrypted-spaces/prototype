@@ -20,6 +20,11 @@ on:
       - '.github/workflows/*.yml'
       - '.github/actions/**'
 
+# The default GITHUB_TOKEN is handed to third-party setup actions (protoc);
+# restrict it to read-only.
+permissions:
+  contents: read
+
 concurrency:
   group: lint-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

@@ -1931,12 +1931,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dissimilar"
-version = "1.0.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aeda16ab4059c5fd2a83f2b9c9e9c981327b18aa8e3b313f7e6563799d4f093e"
-
-[[package]]
 name = "dlopen2"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2252,7 +2246,6 @@ version = "0.0.1"
 dependencies = [
  "encrypted-spaces-acl-types",
  "encrypted-spaces-storage-encoding",
- "ffproof-tracer",
  "ffproof-tracer-shared",
  "hex",
  "instant",
@@ -2410,7 +2403,6 @@ dependencies = [
  "encrypted-spaces-changelog-test-utils",
  "encrypted-spaces-client-methods",
  "encrypted-spaces-ffproof-methods",
- "ffproof-tracer",
  "ffproof-tracer-shared",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
@@ -2501,7 +2493,6 @@ dependencies = [
  "encrypted-spaces-sdk",
  "encrypted-spaces-storage-encoding",
  "env_logger",
- "expect-test",
  "futures-util",
  "hex",
  "hyper 0.14.32",
@@ -2676,16 +2667,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "expect-test"
-version = "1.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63af43ff4431e848fb47472a920f14fa71c24de13255a5692e93d4e90302acb0"
-dependencies = [
- "dissimilar",
- "once_cell",
-]
-
-[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2757,35 +2738,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "ffproof-tracer"
-version = "0.0.1"
-dependencies = [
- "clap 4.6.1",
- "ffproof-tracer-methods",
- "ffproof-tracer-shared",
- "hex",
- "merk",
- "postcard",
- "rand 0.9.4",
- "risc0-zkvm",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "ffproof-tracer-methods"
-version = "0.0.1"
-dependencies = [
- "risc0-build",
-]
-
-[[package]]
 name = "ffproof-tracer-shared"
 version = "0.1.0"
 dependencies = [
- "hex",
  "merk",
- "postcard",
  "serde",
 ]
 
@@ -4760,9 +4716,10 @@ dependencies = [
 [[package]]
 name = "merk"
 version = "2.0.0"
-source = "git+https://github.com/encrypted-spaces/merk.git#78f3a8066e12c0b715b4854508a24fd16a808762"
+source = "git+ssh://git@github.com/encrypted-spaces/merk-private.git?branch=experimental-mrt#58c710cf95595c8984d5ca976f267f7fec964464"
 dependencies = [
  "ed",
+ "serde",
  "sha2 0.10.8",
  "thiserror 1.0.69",
 ]

@@ -4,18 +4,19 @@ use super::*;
 use {
     crate::query::{ComparisonOperator, QueryParam},
     encrypted_spaces_changelog_core::{
-        changelog::{Change, ChangelogEntry, ChangelogError},
-        collect_range, create_trace, create_trace_full,
-        ops::{OpContext, OpReader, OpVerifyResult, ProverReader},
-        BatchOp, InputStep, ProvenRead,
+        changelog::{Change, ChangelogError},
+        ops::OpContext,
+        HandleReader, TraceWriter, WriteOp,
     },
     encrypted_spaces_storage_encoding::keys::parse_key,
+    ffproof_tracer_shared::TraceRecorder,
+    merk::Backend as _,
     std::collections::BTreeSet,
 };
 #[cfg(any(feature = "merk", feature = "merk_verify"))]
 use {
     encrypted_spaces_changelog_core::{
-        prefix_successor, verify_trace, ReadOp, TraceStep, TracerProof,
+        prefix_successor, ProvenRead, ReadOp, TraceReader, TraceReplayer,
     },
     merk::proofs::Query as MerkQuery,
     std::collections::HashMap,
@@ -35,176 +36,117 @@ fn map_changelog_error_for_eav(err: ChangelogError) -> SdkError {
     }
 }
 
-#[cfg(feature = "merk")]
-fn dispatch_extract_and_validate(
-    change: &ChangelogEntry,
-    reader: &mut dyn OpReader,
-    ctx: &OpContext,
-) -> std::result::Result<OpVerifyResult, ChangelogError> {
-    encrypted_spaces_changelog_core::ops::dispatch_extract_and_validate(change, reader, ctx)
-}
-
-/// Build a closure that resolves `ReadOp`s against the supplied tree.
-///
-/// Reads run against `tree` directly.  Pruned nodes propagate as
-/// `ChangelogError::Generic` because the in-memory tree should not contain
-/// pruned nodes for these reads.
-#[cfg(feature = "merk")]
-fn tree_read_resolver(
-    tree: &merk::Node,
-) -> impl FnMut(&ReadOp) -> std::result::Result<ProvenRead, ChangelogError> + '_ {
-    move |op: &ReadOp| -> std::result::Result<ProvenRead, ChangelogError> {
-        let results = match op {
-            ReadOp::Key(key) => {
-                match tree
-                    .get_value(key)
-                    .map_err(|e| ChangelogError::Generic(format!("Tree read failed: {e:?}")))?
-                {
-                    merk::GetResult::Found(value) => vec![(key.clone(), value)],
-                    merk::GetResult::NotFound => vec![],
-                    merk::GetResult::Pruned => {
-                        return Err(ChangelogError::Generic(
-                            "Pruned node encountered".to_string(),
-                        ))
-                    }
-                }
-            }
-            ReadOp::Prefix(prefix) => {
-                let end = prefix_successor(prefix);
-                collect_range(tree, prefix, end.as_deref())
-            }
-            ReadOp::Range { start, end } => collect_range(tree, start, Some(end.as_slice())),
-        };
-        Ok(ProvenRead {
-            op: op.clone(),
-            results,
-        })
-    }
-}
-
-/// Run extract-and-validate (E&V) against `tree`, returning the Merk reads,
-/// and stored-byte batch of writes it produced.
-///
-/// This is the read-and-write counterpart to `collect_reads_for_op`.  Use
-/// it from per-op handlers that intend to apply the writes; use the
-/// read-only variant when only the reads are needed (e.g. proof-only
-/// reconstruction paths).
-///
+/// Run extract-and-validate (E&V) against `tree`, returning the op's writes
+/// and the finalized trace bytes that authenticated those reads/writes.
 #[cfg(feature = "merk")]
 fn extract_validate_and_materialize(
-    tree: &merk::Node,
+    tree: &ffproof_tracer_shared::Tree,
     change: &Change,
     current_change_id: usize,
-) -> Result<(Vec<ReadOp>, Vec<BatchOp>)> {
+) -> Result<(Vec<WriteOp>, Vec<u8>)> {
     let ctx = OpContext::for_change_id(current_change_id);
-    let mut reader = ProverReader::new(tree_read_resolver(tree));
-    let result = dispatch_extract_and_validate(&change.entry, &mut reader, &ctx)
-        .map_err(map_changelog_error_for_eav)?;
-    let mut batch_ops: Vec<BatchOp> = Vec::new();
-    for step in result.write_steps {
-        match step {
-            TraceStep::Write(ops) => batch_ops.extend(ops),
-            TraceStep::Read(_) => {
-                return Err(SdkError::DatabaseError(
-                    "extract_and_validate emitted a Read in write_steps".to_string(),
-                ))
-            }
-        }
-    }
-    Ok((reader.logged_reads, batch_ops))
+    let mut recorder = TraceRecorder::new(tree);
+    let writes = {
+        let mut reader = HandleReader(&mut recorder);
+        encrypted_spaces_changelog_core::ops::dispatch_extract_and_validate(
+            &change.entry,
+            &mut reader,
+            &ctx,
+        )
+        .map_err(map_changelog_error_for_eav)?
+        .write_steps
+    };
+    recorder
+        .apply(&writes)
+        .map_err(|e| SdkError::DatabaseError(format!("trace apply failed: {e:?}")))?;
+    let trace_bytes = recorder
+        .finalize_trace()
+        .map_err(|e| SdkError::DatabaseError(format!("finalize_trace failed: {e:?}")))?;
+    Ok((writes, trace_bytes))
 }
 
+/// Drive one `ReadOp` through a traced handle (recorder on the prove side),
+/// discarding the results — the point is what the trace records.
 #[cfg(feature = "merk")]
-fn collect_reads_for_op(
-    tree: &merk::Node,
-    change: &ChangelogEntry,
-    current_change_id: usize,
-) -> Result<Vec<ReadOp>> {
-    let ctx = OpContext::for_change_id(current_change_id);
-    let mut reader = ProverReader::new(tree_read_resolver(tree));
-    dispatch_extract_and_validate(change, &mut reader, &ctx)
-        .map_err(map_changelog_error_for_eav)?;
-    Ok(reader.logged_reads)
+fn record_select_read(handle: &mut dyn TraceReader, op: &ReadOp) -> Result<()> {
+    match op {
+        ReadOp::Key(key) => {
+            handle
+                .get(key)
+                .map_err(|e| SdkError::DatabaseError(format!("trace read failed: {e}")))?;
+        }
+        ReadOp::Prefix(prefix) => {
+            handle
+                .get_prefix(prefix)
+                .map_err(|e| SdkError::DatabaseError(format!("trace read failed: {e}")))?;
+        }
+        ReadOp::Range { start, end } => {
+            handle
+                .get_range(start, end)
+                .map_err(|e| SdkError::DatabaseError(format!("trace read failed: {e}")))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "merk")]
 impl MerkStorage {
-    /// Collect the proven reads needed by an op's shared verifier against the
-    /// current main tree, without mutating storage.
-    pub fn collect_pruned_merkle_tree_reads(
-        &self,
-        change: &ChangelogEntry,
-        current_change_id: usize,
-    ) -> Result<Vec<ReadOp>> {
-        let Some(tree) = self.merk.snapshot() else {
-            return Err(SdkError::DatabaseError(
-                "Main tree is empty, cannot collect pruned tree witness reads".to_string(),
-            ));
-        };
-        collect_reads_for_op(&tree, change, current_change_id)
-    }
-
     /// Apply a signed `change` through the shared extract-and-validate path,
-    /// mutate storage, and return the serialized pruned Merkle tree.
+    /// mutate storage, and return the trace witness bytes.
     ///
     /// The server keeps validation at the request boundary. This method is the
-    /// single storage write path: run E&V against a snapshot, keep stored
-    /// bytes as written by the entry, build a trace from the same snapshot,
-    /// apply the batch, then emit only the pruned tree bytes needed by
-    /// `ChangeLog::verify_proof_and_validate`.
+    /// single storage write path: run E&V against a recorder over a
+    /// checkpoint, apply the returned writes to the recorder, round-trip the
+    /// finalized witness through a `TraceReplayer` (so the server never hands
+    /// out a witness it could not itself verify), apply the same writes to a
+    /// candidate built from the checkpoint, and atomically publish the
+    /// candidate — the swap fails (state untouched) if a concurrent writer
+    /// moved the live root after the checkpoint, so an interleaved loser
+    /// never half-applies.
     pub async fn apply_change_with_pruned_tree(
         &self,
         change: &Change,
         current_change_id: usize,
     ) -> Result<Vec<u8>> {
-        let Some(tree) = self.merk.snapshot() else {
+        let Some(tree) = self.checkpoint() else {
             return Err(SdkError::DatabaseError(
                 "Main tree is empty, cannot run extract_and_validate".to_string(),
             ));
         };
-        let eav_root = tree.hash();
-        let (reads, batch_ops) =
+        let start_root = tree.root_hash();
+        let (writes, trace_bytes) =
             extract_validate_and_materialize(&tree, change, current_change_id)?;
-        if batch_ops.is_empty() {
+        if writes.is_empty() {
             return Err(SdkError::DatabaseError(
                 "extract_and_validate produced no write operations".to_string(),
             ));
         }
 
-        let mut steps: Vec<InputStep> = reads
-            .iter()
-            .cloned()
-            .map(|r| InputStep::Read(vec![r]))
-            .collect();
-        steps.push(InputStep::Write(batch_ops.clone()));
-        let trace_proof = create_trace(&tree, &steps);
+        let mut trace_check = TraceReplayer::new_verified(&trace_bytes, start_root)
+            .map_err(|e| SdkError::DatabaseError(format!("trace decode failed: {e:?}")))?;
+        trace_check
+            .apply(&writes)
+            .map_err(|e| SdkError::DatabaseError(format!("trace replay failed: {e:?}")))?;
+        let expected_end_root = trace_check
+            .root_hash()
+            .map_err(|e| SdkError::DatabaseError(format!("trace root_hash failed: {e:?}")))?;
 
-        // Reject snapshot drift before mutating storage.
-        if trace_proof.expected_start_root != eav_root {
+        // Build the committed state off-lock from the same checkpoint the
+        // witness was recorded against, and cross-check it against the
+        // replayer before anything touches live state.
+        let mut candidate = tree;
+        candidate.apply_write_ops(&writes).map_err(|e| {
+            SdkError::DatabaseError(format!("apply_change candidate write failed: {e:?}"))
+        })?;
+        if candidate.root_hash() != expected_end_root {
             return Err(SdkError::DatabaseError(
-                "Trace proof start root does not match E&V tree root; \
-                 concurrent writer detected"
-                    .to_string(),
+                "Candidate root does not match expected end root from trace proof".to_string(),
             ));
         }
 
-        // BatchOp -> (key, Op). Post-materialization the batch only contains Put/Delete.
-        let merk_ops: Vec<Operation> = batch_ops
-            .iter()
-            .map(|op| op.to_merk_batch_entry())
-            .collect();
-        self.apply_batch(merk_ops)?;
+        self.commit_candidate(start_root, candidate)?;
 
-        let root_after = self.root_hash();
-        if root_after != trace_proof.expected_end_root {
-            return Err(SdkError::DatabaseError(
-                "Root after apply does not match expected end root from trace proof".to_string(),
-            ));
-        }
-
-        let proof = postcard::to_allocvec(&trace_proof.pruned_tree)
-            .map_err(|e| SdkError::SerializationError(format!("Failed to serialize proof: {e}")))?;
-        Ok(proof)
+        Ok(trace_bytes)
     }
 
     /// Generate a Merkle proof for the specified keys.
@@ -221,13 +163,7 @@ impl MerkStorage {
             query.insert_key(key.clone());
         }
 
-        // Generate the proof using prove() which returns encoded bytes
-        let proof = self
-            .merk
-            .prove(query)
-            .map_err(|e| SdkError::DatabaseError(format!("Failed to generate proof: {e:?}")))?;
-
-        Ok(proof)
+        self.prove_merk(query)
     }
 
     /// Generate a Merkle proof for a range of keys with a given prefix.
@@ -237,13 +173,14 @@ impl MerkStorage {
         let mut query = MerkQuery::new();
         query.insert_range(prefix_scan_range(prefix));
 
-        // Generate the proof using prove() which returns encoded bytes
-        let proof = self
-            .merk
-            .prove(query)
-            .map_err(|e| SdkError::DatabaseError(format!("Failed to generate proof: {e:?}")))?;
+        self.prove_merk(query)
+    }
 
-        Ok(proof)
+    /// Generate a Merk query proof against the live tree.
+    fn prove_merk(&self, query: MerkQuery) -> Result<Vec<u8>> {
+        self.tree()
+            .prove(query)
+            .map_err(|e| SdkError::DatabaseError(format!("Failed to generate proof: {e:?}")))
     }
 
     /// Generate a tracer proof for a namespaced key-value store read.
@@ -254,7 +191,7 @@ impl MerkStorage {
     /// verifier reconstructs the same narrowing from the authenticated entries
     /// (see [`verify_store_tracer_proof`]).
     pub async fn prove_store_read(&self, read: &StoreReadOp) -> Result<Vec<u8>> {
-        let Some(tree) = self.merk.snapshot() else {
+        let Some(tree) = self.checkpoint() else {
             return Err(SdkError::DatabaseError(
                 "Tree is empty, cannot generate store read proof".to_string(),
             ));
@@ -263,16 +200,28 @@ impl MerkStorage {
         // Discover present keys in the base range (ascending) so we can apply
         // the same limit narrowing the verifier will re-derive from the proof.
         let (start, end) = store_op_range(&read.op)?;
-        let present: Vec<Vec<u8>> = collect_range(&tree, &start, Some(&end))
+        let present: Vec<Vec<u8>> = tree
+            .collect_range(&start, Some(&end))
+            .map_err(|e| SdkError::DatabaseError(format!("store range read failed: {e:?}")))?
             .into_iter()
             .map(|(k, _)| k)
             .collect();
         let narrowing = store_narrowing_keys(&present, read.descending, read.limit);
         let narrowed = narrow_store_op(&read.op, read.descending, read.limit, &narrowing)?;
 
-        let steps = vec![InputStep::Read(vec![narrowed])];
-        let tracer_proof = create_trace_full(&tree, &steps);
-        postcard::to_allocvec(&StoreReadProof { tracer_proof }).map_err(|e| {
+        let root = tree.root_hash();
+        let mut recorder = TraceRecorder::new(&tree);
+        record_select_read(&mut recorder, &narrowed)?;
+        let trace_bytes = recorder
+            .finalize_trace()
+            .map_err(|e| SdkError::DatabaseError(format!("finalize_trace failed: {e:?}")))?;
+
+        postcard::to_allocvec(&StoreReadProof {
+            trace_bytes,
+            read: narrowed,
+            root,
+        })
+        .map_err(|e| {
             SdkError::SerializationError(format!("Failed to serialize StoreReadProof: {e}"))
         })
     }
@@ -281,8 +230,9 @@ impl MerkStorage {
     ///
     /// Routes to one of two proof strategies:
     /// - **Standard Merk proof** for id-based predicates or no predicate (table scan).
-    /// - **TracerProof** for indexed column predicates and/or joins, which
-    ///   uses targeted index key ranges instead of full table scans.
+    /// - **TracerSelectProof** (a reads-only merk trace) for indexed column
+    ///   predicates and/or joins, which uses targeted index key ranges
+    ///   instead of full table scans.
     ///
     /// Non-id predicates are validated to target an indexed column.
     pub async fn prove_query(&self, query: &Query) -> Result<Vec<u8>> {
@@ -294,21 +244,16 @@ impl MerkStorage {
         }
 
         let merk_query = merk_query_for_query(query)?;
-        let proof = self
-            .merk
-            .prove(merk_query)
-            .map_err(|e| SdkError::DatabaseError(format!("Failed to generate proof: {e:?}")))?;
-
-        Ok(proof)
+        self.prove_merk(merk_query)
     }
 
-    /// Generate a `TracerProof` for queries that need targeted reads
+    /// Generate a `TracerSelectProof` for queries that need targeted reads
     /// (indexed WHERE clauses and/or joins).
     ///
     /// 1. Unproven reads to discover which rows to prove
-    /// 2. Build a TracerProof with read steps:
-    ///    - Step 1: Main table reads (index scan + row lookups, or range scan)
-    ///    - Step 2: Joined table reads (non-contiguous FK lookups) — empty if no joins
+    /// 2. Record a reads-only trace covering:
+    ///    - Main table reads (index scan + row lookups, or range scan)
+    ///    - Joined table reads (non-contiguous FK lookups) — empty if no joins
     ///
     /// Returns serialized `TracerSelectProof`.
     async fn prove_query_tracer(&self, query: &Query) -> Result<Vec<u8>> {
@@ -335,19 +280,26 @@ impl MerkStorage {
             Vec::new()
         };
 
-        let steps = vec![
-            InputStep::Read(main_read_ops),
-            InputStep::Read(join_read_ops),
-        ];
-
-        let Some(tree) = self.merk.snapshot() else {
+        let Some(tree) = self.checkpoint() else {
             return Err(SdkError::DatabaseError(
                 "Tree is empty, cannot generate trace proof".to_string(),
             ));
         };
-        let tracer_proof = create_trace_full(&tree, &steps);
+        let root = tree.root_hash();
+        let mut recorder = TraceRecorder::new(&tree);
+        for op in main_read_ops.iter().chain(join_read_ops.iter()) {
+            record_select_read(&mut recorder, op)?;
+        }
+        let trace_bytes = recorder
+            .finalize_trace()
+            .map_err(|e| SdkError::DatabaseError(format!("finalize_trace failed: {e:?}")))?;
 
-        let proof = TracerSelectProof { tracer_proof };
+        let proof = TracerSelectProof {
+            trace_bytes,
+            main_reads: main_read_ops,
+            join_reads: join_read_ops,
+            root,
+        };
         postcard::to_allocvec(&proof).map_err(|e| {
             SdkError::SerializationError(format!("Failed to serialize TracerSelectProof: {e}"))
         })
@@ -617,7 +569,10 @@ fn verify_merk_query(
     query: MerkQuery,
     expected_hash: [u8; 32],
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    merk::proofs::query::verify_query(bytes, &query, expected_hash)
+    // Proof bytes are backend-specific: verify with the selected backend's
+    // verifier (MRT by default, AVL under `--features avl`) so both sides of
+    // the query-proof seam always agree.
+    ffproof_tracer_shared::backend::verify_query(bytes, &query, expected_hash)
         .map_err(|e| SdkError::DatabaseError(format!("Proof verification failed: {e:?}")))
 }
 
@@ -695,14 +650,26 @@ fn narrow_store_op(
     Ok(ReadOp::Range { start, end })
 }
 
-/// Tracer-based proof for a namespaced key-value store read. Wraps a single
-/// `TracerProof` with one `InputStep::Read` whose (possibly limit-narrowed)
-/// `ReadOp` authenticates the complete set of present keys in the proven
-/// range — so a limited read proves and transfers only the keys it returns.
+/// Tracer-based proof for a namespaced key-value store read: a reads-only
+/// trace authenticated against `root`, plus the single (possibly
+/// limit-narrowed) `ReadOp` the verifier replays. The replayed read
+/// authenticates the complete set of present keys in the proven range — so a
+/// limited read proves and transfers only the keys it returns.
+///
+/// The old `TracerProof` carried an enumerable step transcript, letting the
+/// verifier assert "reads only, start_root == end_root". merk's trace witness
+/// is opaque bytes, so those checks are unrepresentable — and unnecessary:
+/// `TraceReplayer::new_verified` authenticates the witness against the
+/// commitment before any read, and the verifier itself drives only reads
+/// (nothing ever calls `apply`), so results can never come from a transient
+/// mutated state. Defense-in-depth: after replaying the declared reads the
+/// verifier asserts the replayer's root still equals `root`.
 #[cfg(any(feature = "merk", feature = "merk_verify"))]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StoreReadProof {
-    tracer_proof: TracerProof,
+    trace_bytes: Vec<u8>,
+    read: ReadOp,
+    root: [u8; 32],
 }
 
 /// Verify a key-value store read proof and return the authenticated rows.
@@ -723,57 +690,44 @@ pub fn verify_store_tracer_proof(
     let store_proof: StoreReadProof = postcard::from_bytes(proof).map_err(|e| {
         SdkError::SerializationError(format!("Failed to deserialize StoreReadProof: {e}"))
     })?;
-    let tracer = &store_proof.tracer_proof;
 
-    if tracer.expected_start_root != *commitment {
+    if store_proof.root != *commitment {
         return Err(SdkError::ValidationError(
             "Store read proof root does not match commitment".into(),
         ));
     }
-    // Read-only: net change is zero and no write steps sneak in.
-    if tracer.expected_start_root != tracer.expected_end_root {
+    // Decode + authenticate the witness against the commitment; every read
+    // below is answered from that authenticated state (see the
+    // [`StoreReadProof`] doc for why no reads-only transcript check exists).
+    let mut replayer = TraceReplayer::new_verified(&store_proof.trace_bytes, store_proof.root)
+        .map_err(|_| SdkError::ValidationError("Store proof decode / root mismatch".into()))?;
+
+    // Authenticated entries, ascending (range-replay order).
+    let entries = resolve_select_read(&mut replayer, &store_proof.read)?.results;
+
+    // Defense-in-depth: a reads-only replay must leave the root unchanged.
+    let end_root = replayer
+        .root_hash()
+        .map_err(|e| SdkError::ValidationError(format!("store proof root_hash failed: {e}")))?;
+    if end_root != store_proof.root {
         return Err(SdkError::ValidationError(
-            "Read-only store proof must have start_root == end_root".into(),
-        ));
-    }
-    if tracer
-        .steps
-        .iter()
-        .any(|step| matches!(step, TraceStep::Write(_)))
-    {
-        return Err(SdkError::ValidationError(
-            "Read-only store proof must not contain write steps".into(),
+            "Store read proof mutated the replayed tree".into(),
         ));
     }
 
-    let read_results = verify_trace(tracer).map_err(|_| {
-        SdkError::ValidationError("Store read TracerProof verification failed".into())
-    })?;
-    let Some(step) = read_results.first() else {
-        return Err(SdkError::ValidationError(
-            "Store read proof missing its read step".into(),
-        ));
-    };
-
-    // Authenticated entries, ascending (proof/BST order).
-    let entries: Vec<(Vec<u8>, Vec<u8>)> = step
-        .iter()
-        .flat_map(|pr| pr.results.iter().cloned())
-        .collect();
     let present_asc: Vec<Vec<u8>> = entries.iter().map(|(k, _)| k.clone()).collect();
 
     // Reconstruct the server's narrowing from the authenticated entries and
     // require the proven ReadOp to match exactly.
     let narrowing = store_narrowing_keys(&present_asc, read.descending, read.limit);
     let expected = narrow_store_op(&read.op, read.descending, read.limit, &narrowing)?;
-    let actual: Vec<&ReadOp> = step.iter().map(|pr| &pr.op).collect();
-    verify_read_ops(&[expected], &actual, "store read proof")?;
+    verify_read_ops(&[expected], &[&store_proof.read], "store read proof")?;
 
     Ok(VerifiedRows {
         main_rows: Vec::new(),
         rows_by_table: HashMap::new(),
         kv_pairs: entries,
-        read_ops: actual.into_iter().cloned().collect(),
+        read_ops: vec![store_proof.read],
     })
 }
 
@@ -844,16 +798,19 @@ pub struct VerifiedRows {
 /// Tracer-based proof for SELECT queries that need targeted reads
 /// (indexed WHERE clauses, joins, or both).
 ///
-/// Wraps a single `TracerProof` with two `InputStep::Read` steps:
-///   1. Main table reads (index scan + row lookups, ID range, or table scan)
-///   2. Joined table reads (non-contiguous FK lookups) — empty if no joins
-///
-/// The server does unproven reads first to discover which rows to prove,
-/// then builds a single proof covering all required data.
+/// Carries a reads-only trace authenticated against `root` plus the two
+/// ordered read-op lists the verifier replays: main table reads first, then
+/// joined table reads. The server does unproven reads first to discover which
+/// rows to prove, then records a single trace covering all required data.
+/// See [`StoreReadProof`] for why no reads-only transcript check exists and
+/// what replaces it.
 #[cfg(any(feature = "merk", feature = "merk_verify"))]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct TracerSelectProof {
-    tracer_proof: TracerProof,
+    trace_bytes: Vec<u8>,
+    main_reads: Vec<ReadOp>,
+    join_reads: Vec<ReadOp>,
+    root: [u8; 32],
 }
 
 /// Extract column names from a join on_condition, stripping table prefixes.
@@ -1362,6 +1319,27 @@ fn validate_predicate_cursor_supported(query: &Query) -> Result<()> {
 }
 
 #[cfg(any(feature = "merk", feature = "merk_verify"))]
+fn resolve_select_read(replayer: &mut TraceReplayer, op: &ReadOp) -> Result<ProvenRead> {
+    let results = match op {
+        ReadOp::Key(key) => replayer
+            .get(key)
+            .map_err(|e| SdkError::ValidationError(format!("select read failed: {e}")))?
+            .map(|value| vec![(key.clone(), value)])
+            .unwrap_or_default(),
+        ReadOp::Prefix(prefix) => replayer
+            .get_prefix(prefix)
+            .map_err(|e| SdkError::ValidationError(format!("select read failed: {e}")))?,
+        ReadOp::Range { start, end } => replayer
+            .get_range(start, end)
+            .map_err(|e| SdkError::ValidationError(format!("select read failed: {e}")))?,
+    };
+    Ok(ProvenRead {
+        op: op.clone(),
+        results,
+    })
+}
+
+#[cfg(any(feature = "merk", feature = "merk_verify"))]
 fn extract_tracer_select_entries_for_response_material(
     proof: &[u8],
     commitment: &[u8],
@@ -1373,36 +1351,22 @@ fn extract_tracer_select_entries_for_response_material(
     let select_proof: TracerSelectProof = postcard::from_bytes(proof).map_err(|e| {
         SdkError::SerializationError(format!("Failed to deserialize TracerSelectProof: {e}"))
     })?;
-    let tracer = &select_proof.tracer_proof;
 
-    if tracer.expected_start_root != expected_root {
+    if select_proof.root != expected_root {
         return Err(SdkError::ValidationError(
             "Select proof root does not match commitment".into(),
         ));
     }
-    if tracer.expected_start_root != tracer.expected_end_root {
-        return Err(SdkError::ValidationError(
-            "Read-only select proof must have start_root == end_root".into(),
-        ));
-    }
-    if tracer
-        .steps
-        .iter()
-        .any(|step| matches!(step, TraceStep::Write(_)))
-    {
-        return Err(SdkError::ValidationError(
-            "Read-only select proof must not contain write steps".into(),
-        ));
-    }
-
-    let all_read_results = verify_trace(tracer)
-        .map_err(|_| SdkError::ValidationError("Select TracerProof verification failed".into()))?;
+    let mut replayer = TraceReplayer::new_verified(&select_proof.trace_bytes, select_proof.root)
+        .map_err(|_| SdkError::ValidationError("Select proof decode / root mismatch".into()))?;
 
     let mut entries = Vec::new();
-    for read_step in all_read_results {
-        for proven_read in read_step {
-            entries.extend(proven_read.results);
-        }
+    for op in select_proof
+        .main_reads
+        .iter()
+        .chain(select_proof.join_reads.iter())
+    {
+        entries.extend(resolve_select_read(&mut replayer, op)?.results);
     }
     Ok(entries)
 }
@@ -1427,10 +1391,10 @@ fn verify_read_ops(expected: &[ReadOp], actual: &[&ReadOp], context: &str) -> Re
     Ok(())
 }
 
-/// Verify a `TracerSelectProof` (single TracerProof with 2 read steps).
+/// Verify a `TracerSelectProof` (reads-only trace plus two read-op lists).
 ///
-/// Step 1 results → main table rows (may include index entries which are filtered out).
-/// Step 2 results → joined table rows (empty if no joins).
+/// Main-read results → main table rows (may include index entries which are
+/// filtered out). Join-read results → joined table rows (empty if no joins).
 #[cfg(any(feature = "merk", feature = "merk_verify"))]
 fn verify_tracer_select_proof(
     query: &Query,
@@ -1449,48 +1413,36 @@ fn verify_tracer_select_proof(
         SdkError::SerializationError(format!("Failed to deserialize TracerSelectProof: {e}"))
     })?;
 
-    let tracer = &select_proof.tracer_proof;
-
-    // Root must match commitment
-    if tracer.expected_start_root != expected_root {
+    // Root must match commitment. Decode + authenticate the witness against
+    // it; every read below is answered from that authenticated state (see
+    // [`StoreReadProof`] for why no reads-only transcript check exists).
+    if select_proof.root != expected_root {
         return Err(SdkError::ValidationError(
             "Select proof root does not match commitment".into(),
         ));
     }
-    // Read-only: start == end
-    if tracer.expected_start_root != tracer.expected_end_root {
-        return Err(SdkError::ValidationError(
-            "Read-only select proof must have start_root == end_root".into(),
-        ));
-    }
-    // Reject any Write steps. A matching start/end root only proves the net
-    // change is zero — a malicious server could still inject Put/Delete steps
-    // that mutate the tree before a Read and undo them after, returning
-    // results from a transient state that was never committed.
-    if tracer
-        .steps
+    let mut replayer = TraceReplayer::new_verified(&select_proof.trace_bytes, select_proof.root)
+        .map_err(|_| SdkError::ValidationError("Select proof decode / root mismatch".into()))?;
+
+    let main_results: Vec<ProvenRead> = select_proof
+        .main_reads
         .iter()
-        .any(|step| matches!(step, TraceStep::Write(_)))
-    {
+        .map(|op| resolve_select_read(&mut replayer, op))
+        .collect::<Result<_>>()?;
+    let join_results: Vec<ProvenRead> = select_proof
+        .join_reads
+        .iter()
+        .map(|op| resolve_select_read(&mut replayer, op))
+        .collect::<Result<_>>()?;
+
+    // Defense-in-depth: a reads-only replay must leave the root unchanged.
+    let end_root = replayer
+        .root_hash()
+        .map_err(|e| SdkError::ValidationError(format!("select proof root_hash failed: {e}")))?;
+    if end_root != select_proof.root {
         return Err(SdkError::ValidationError(
-            "Read-only select proof must not contain write steps".into(),
+            "Select proof mutated the replayed tree".into(),
         ));
-    }
-
-    let all_read_results = match verify_trace(tracer) {
-        Ok(results) => results,
-        Err(_) => {
-            return Err(SdkError::ValidationError(
-                "Select TracerProof verification failed".into(),
-            ))
-        }
-    };
-
-    if all_read_results.len() < 2 {
-        return Err(SdkError::ValidationError(format!(
-            "Expected 2 read steps (main + joins), got {}",
-            all_read_results.len(),
-        )));
     }
 
     validate_limit_supported(query)?;
@@ -1498,7 +1450,7 @@ fn verify_tracer_select_proof(
 
     // Step 1: Verify main table ReadOps match the query predicate
     let mut main_all_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    for proven_read in &all_read_results[0] {
+    for proven_read in &main_results {
         main_all_entries.extend(proven_read.results.iter().cloned());
     }
 
@@ -1523,7 +1475,7 @@ fn verify_tracer_select_proof(
         expected_ops[0] = narrow_first_op(&expected_ops[0], query, &keys)?;
     }
 
-    let actual_ops: Vec<&ReadOp> = all_read_results[0].iter().map(|pr| &pr.op).collect();
+    let actual_ops: Vec<&ReadOp> = main_results.iter().map(|pr| &pr.op).collect();
     verify_read_ops(&expected_ops, &actual_ops, "SELECT proof")?;
 
     let mut rows_by_table = group_entries_for_verifier(&main_all_entries, hash_context)?;
@@ -1531,7 +1483,7 @@ fn verify_tracer_select_proof(
 
     // Step 2: Verify join ReadOps match foreign-key values from main rows
     let mut join_all_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    for proven_read in &all_read_results[1] {
+    for proven_read in &join_results {
         join_all_entries.extend(proven_read.results.iter().cloned());
     }
 
@@ -1582,7 +1534,7 @@ fn verify_tracer_select_proof(
             }
         }
 
-        let actual_ops: Vec<&ReadOp> = all_read_results[1].iter().map(|pr| &pr.op).collect();
+        let actual_ops: Vec<&ReadOp> = join_results.iter().map(|pr| &pr.op).collect();
         verify_read_ops(&expected_ops, &actual_ops, "Join")?;
     }
 
@@ -1594,8 +1546,8 @@ fn verify_tracer_select_proof(
     let mut kv_pairs = main_all_entries;
     kv_pairs.extend(join_all_entries);
     let kv_pairs = resolve_hashed_kv_pairs(&kv_pairs, hash_context)?;
-    let mut read_ops: Vec<ReadOp> = all_read_results[0].iter().map(|pr| pr.op.clone()).collect();
-    read_ops.extend(all_read_results[1].iter().map(|pr| pr.op.clone()));
+    let mut read_ops: Vec<ReadOp> = main_results.iter().map(|pr| pr.op.clone()).collect();
+    read_ops.extend(join_results.iter().map(|pr| pr.op.clone()));
 
     Ok(VerifiedRows {
         main_rows,
@@ -1852,7 +1804,7 @@ mod tests {
         .unwrap();
         assert!(
             writes.iter().any(|op| matches!(op,
-                BatchOp::Put { key, .. }
+                WriteOp::Put { key, .. }
                 if matches!(
                     parse_key(key),
                     Ok(ParsedKey::Column { row_id: 1, .. })
@@ -1897,13 +1849,13 @@ mod tests {
         let id = insert_writes
             .iter()
             .find_map(|op| match op {
-                BatchOp::Put { key, .. } => match parse_key(key) {
+                WriteOp::Put { key, .. } => match parse_key(key) {
                     Ok(ParsedKey::Column { table, row_id, .. }) if table == schema.name => {
                         Some(row_id)
                     }
                     _ => None,
                 },
-                BatchOp::Delete { .. } => None,
+                _ => None,
             })
             .expect("insert writes should contain a new row id");
 
@@ -4604,12 +4556,14 @@ mod tests {
         assert!(result.is_err(), "Should fail with wrong root");
     }
 
-    /// A SELECT proof must not contain Write steps. Without this check, a
-    /// malicious server can wrap reads with Write/undo-Write pairs that leave
-    /// start_root == end_root but return data from a transient state never
-    /// committed to the tree.
+    /// Any tampering with a SELECT proof's trace bytes must fail the
+    /// decode / root authentication in `TraceReplayer::new_verified`. (The
+    /// old structural threat this test targeted — a server wrapping reads in
+    /// Write/undo-Write pairs to serve a transient state — is unrepresentable
+    /// now: the verifier drives only reads against the authenticated witness;
+    /// see the `StoreReadProof` doc.)
     #[tokio::test]
-    async fn test_select_proof_rejects_write_steps() {
+    async fn test_select_proof_rejects_tampered_trace() {
         let storage = MerkStorage::in_memory_with_internal_tables().await.unwrap();
         storage.create_table(&indexed_schema()).await.unwrap();
 
@@ -4620,21 +4574,20 @@ mod tests {
         let proof = storage.prove_query(&query).await.unwrap();
         verify_query_proof(&query, &proof, &root).expect("baseline proof should verify");
 
+        // The witness is opaque authenticated bytes: any tamper must fail the
+        // decode / root authentication in `TraceReplayer::new_verified` (the
+        // old structural "no write steps" check is unrepresentable — and
+        // unnecessary, see the `StoreReadProof` doc).
         let mut select_proof: TracerSelectProof = postcard::from_bytes(&proof).unwrap();
-        select_proof
-            .tracer_proof
-            .steps
-            .push(TraceStep::Write(vec![BatchOp::Delete {
-                key: b"nonexistent".to_vec(),
-            }]));
+        let mid = select_proof.trace_bytes.len() / 2;
+        select_proof.trace_bytes[mid] ^= 0x01;
         let tampered = postcard::to_allocvec(&select_proof).unwrap();
 
         let result = verify_query_proof(&query, &tampered, &root);
         match result {
-            Err(SdkError::ValidationError(msg)) if msg.contains("must not contain write steps") => {
-            }
-            Err(e) => panic!("Expected write-step rejection, got error: {e:?}"),
-            Ok(_) => panic!("Expected write-step rejection, but verification succeeded"),
+            Err(SdkError::ValidationError(_)) | Err(SdkError::SerializationError(_)) => {}
+            Err(e) => panic!("Expected tamper rejection, got error: {e:?}"),
+            Ok(_) => panic!("Expected tamper rejection, but verification succeeded"),
         }
     }
 

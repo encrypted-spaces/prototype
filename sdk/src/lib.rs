@@ -563,7 +563,6 @@ mod tests {
     use encrypted_spaces_changelog_core::changelog::{initial_clc_state, Change, FastForwardData};
     use encrypted_spaces_ffproof::EXTEND_FF_ID;
     use encrypted_spaces_key_manager::DefaultSignature;
-    use expect_test::expect;
     use serde::{Deserialize, Serialize};
     use std::sync::Once;
 
@@ -617,18 +616,22 @@ mod tests {
 
     /// Guards the hardcoded fresh-space root used by `Space::new()`.
     ///
-    /// Changes to the internal schema can legitimately change that root.
-    /// `expect!` makes those changes easy to spot because the failure shows the new hex value.
-    /// If the change is intentional, run the test with `UPDATE_EXPECT=1` and then copy the same
-    /// value into `INITIAL_INTERNAL_DATA_COMMITMENT_HEX` in `testing.rs`.
+    /// Changes to the internal schema can legitimately change that root. The
+    /// assertion message prints the freshly computed hex; if the change is
+    /// intentional, copy that value into
+    /// `INITIAL_INTERNAL_DATA_COMMITMENT_HEX` (the active backend's constant)
+    /// in `testing.rs`.
     #[tokio::test]
     async fn initial_internal_data_commitment_matches_fresh_transport_root() -> Result<()> {
         let transport = LocalTransport::in_memory().await?;
         let actual = transport.get_root_hash().await?;
-        let actual_hex = hex::encode(actual);
-        expect!["ee8d222228e87c4e768cca7f601b9f2f2af1ee4fa3594af0592d2b022d5aa103"]
-            .assert_eq(&actual_hex);
-        assert_eq!(crate::testing::initial_internal_data_commitment(), actual);
+        assert_eq!(
+            crate::testing::initial_internal_data_commitment(),
+            actual,
+            "fresh-space internal-schema root drifted; update \
+             INITIAL_INTERNAL_DATA_COMMITMENT_HEX (active backend) in testing.rs to {}",
+            hex::encode(actual),
+        );
         Ok(())
     }
 

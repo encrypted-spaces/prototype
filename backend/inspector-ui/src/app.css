@@ -10,7 +10,6 @@
   --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
 
   --tag-schemasnapshot: #ff5555;
-  --tag-merksnapshot: #6bf;
   --tag-connection: #ffb86c;
   --tag-request: #8be9fd;
   --tag-merkupdate: #50fa7b;
@@ -212,7 +211,6 @@ html, body, #root {
   color: #ccc;
 }
 .tag-SchemaSnapshot  { color: var(--tag-schemasnapshot);  box-shadow: inset 0 0 0 1px var(--tag-schemasnapshot); }
-.tag-MerkSnapshot    { color: var(--tag-merksnapshot);    box-shadow: inset 0 0 0 1px var(--tag-merksnapshot); }
 .tag-Connection      { color: var(--tag-connection);      box-shadow: inset 0 0 0 1px var(--tag-connection); }
 .tag-Request         { color: var(--tag-request);         box-shadow: inset 0 0 0 1px var(--tag-request); }
 .tag-MerkUpdate      { color: var(--tag-merkupdate);      box-shadow: inset 0 0 0 1px var(--tag-merkupdate); }
@@ -433,130 +431,6 @@ html, body, #root {
 
 /* ---------------------------------------------------------- merk tree */
 
-.merk-tree {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-  min-height: 0;
-  width: 100%;
-}
-
-.merk-tree.empty {
-  align-items: center;
-  justify-content: center;
-  color: var(--fg-dim);
-  padding: 40px;
-}
-
-.merk-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border);
-  font-size: 11px;
-}
-.merk-toolbar .legend .dot.legend-added   { background: var(--tag-merkupdate); }
-.merk-toolbar .legend .dot.legend-changed { background: var(--accent); }
-
-.merk-scroll {
-  flex: 1;
-  overflow: hidden;
-  background: var(--bg);
-  position: relative;
-}
-
-.merk-svg {
-  display: block;
-}
-
-.merk-svg-pannable {
-  cursor: grab;
-  user-select: none;
-}
-.merk-svg-pannable:active {
-  cursor: grabbing;
-}
-
-.merk-reset {
-  background: var(--bg-row);
-  color: var(--fg-dim);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 2px 8px;
-  cursor: pointer;
-  font-size: 11px;
-  margin-left: auto;
-}
-.merk-reset:hover { color: var(--fg); }
-
-.merk-node {
-  cursor: pointer;
-  transition: transform 450ms cubic-bezier(0.4, 0.0, 0.2, 1);
-}
-.merk-node-rect {
-  fill: var(--bg-row);
-  stroke: var(--border);
-  stroke-width: 1.5;
-  transition: fill 600ms ease-out, stroke 200ms ease, stroke-width 200ms ease;
-}
-.merk-node.hover .merk-node-rect {
-  stroke: var(--accent);
-  stroke-width: 2;
-}
-
-.merk-edge {
-  fill: none;
-  stroke: #38404f;
-  stroke-width: 1.5;
-  transition: d 450ms cubic-bezier(0.4, 0.0, 0.2, 1);
-}
-
-.merk-node-label {
-  font-family: var(--mono);
-  font-size: 11px;
-  text-anchor: middle;
-  fill: var(--fg);
-  pointer-events: none;
-}
-.merk-node-hash {
-  font-family: var(--mono);
-  font-size: 9px;
-  text-anchor: middle;
-  fill: var(--fg-dim);
-  pointer-events: none;
-}
-
-.merk-node.kind-column .merk-node-rect { stroke: var(--tag-merkupdate); }
-.merk-node.kind-row    .merk-node-rect { stroke: var(--tag-changelogappend); }
-.merk-node.kind-index  .merk-node-rect { stroke: var(--tag-request); }
-.merk-node.kind-schema .merk-node-rect { stroke: var(--tag-schemasnapshot); }
-.merk-node.kind-other  .merk-node-rect { stroke: var(--fg-dim); }
-
-.merk-node.change-added .merk-node-rect {
-  fill: rgba(80, 250, 123, 0.18);
-  stroke: var(--tag-merkupdate);
-  stroke-width: 2;
-}
-.merk-node.change-changed .merk-node-rect {
-  fill: rgba(88, 166, 255, 0.20);
-  stroke: var(--accent);
-  stroke-width: 2;
-}
-
-.merk-details {
-  padding: 10px 14px;
-  background: var(--bg-elev);
-  border-top: 1px solid var(--border);
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  column-gap: 16px;
-  row-gap: 4px;
-  font-size: 12px;
-}
-.merk-details > div {
-  display: contents;
-}
 .detail-label {
   text-transform: uppercase;
   font-size: 10px;

@@ -24,6 +24,13 @@ runs:
 
     - name: Install Protoc
       uses: arduino/setup-protoc@v3
+      with:
+        # Authenticated releases-API lookup: anonymous requests share a
+        # per-IP quota across everyone on the hosted runner's IP and fail
+        # stochastically with rate-limit errors. This is the job's
+        # short-lived installation token, restricted to contents: read at
+        # the workflow level.
+        repo-token: ${{ github.token }}
 
     - name: Setup SSH for encrypted-spaces/merk-private
       if: inputs.ssh-private-key != ''

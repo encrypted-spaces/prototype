@@ -14,11 +14,12 @@ pub use encrypted_spaces_storage_encoding::keys::{
 // Re-export merk hash test for zkVM verification
 pub use merk::zkvm_hash_tests;
 
-// Optional: trace proof helpers
-pub use ffproof_tracer::trace_prove::{create_trace, create_trace_full};
-pub use ffproof_tracer_shared::{
-    apply_batch, collect_range, decode_pruned_compact_to_merk, encode_pruned_compact,
-    prefix_successor, pruned_to_merk, verify_trace, BatchOp, InputStep, ProvenRead,
-    PrunedMerkleTree, PrunedMerkleTreeStats, PrunedWitnessDecodeError, ReadOp, ReadResults,
-    TraceStep, TracerProof, VerifyTraceError,
-};
+pub use ffproof_tracer_shared::{prefix_successor, ProvenRead, ReadOp, ReadResults};
+// merk's traced-handle seam types used by the verify path (`changelog`) and the
+// ops' write vocabulary. `WriteOp` replaces the old `BatchOp` on the live op/seam path;
+// `TraceReplayer` + `TraceReader`/`TraceWriter` drive verification.
+pub use ffproof_tracer_shared::{TraceReader, TraceReplayer, TraceWriter, WriteOp};
+
+/// The single `OpReader` adapter over a merk traced handle, shared by the
+/// prove (`prover.rs`), verify (`changelog.rs`), and storage (`proofs.rs`) seams.
+pub use changelog::HandleReader;

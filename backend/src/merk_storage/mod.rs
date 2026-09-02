@@ -41,6 +41,10 @@ pub use keys::{
 };
 #[cfg(feature = "merk")]
 pub use merk::Op;
+// The backend-selected tree type (a checkpoint is a `Tree` clone) and the
+// ordered write vocabulary, re-exported for the server.
+#[cfg(feature = "merk")]
+pub use ffproof_tracer_shared::{Tree, WriteOp};
 use serde_json::Value;
 use std::{cmp::Ordering, collections::HashMap};
 
@@ -51,9 +55,9 @@ use {
         app_schema::SchemaStore,
         storage::Storage,
     },
-    merk::{InMemoryMerk, Node},
+    merk::Backend,
     serde::Deserialize,
-    std::sync::Arc,
+    std::sync::{Arc, RwLock},
 };
 
 #[cfg(feature = "merk")]
@@ -71,23 +75,38 @@ pub const ID_FIELD: &str = "id";
 /// Merk-based storage using a single global tree.
 ///
 /// The current backend serializes requests per space, so this uses Merk's
-/// in-memory tree directly and applies each sorted batch to the live tree.
+/// in-memory tree directly and applies each batch to the live tree in
+/// emission order.
+///
+/// The tree is a plain value type (writes take `&mut`); the `RwLock` provides
+/// the shared-handle ergonomics the old internally-locked `InMemoryMerk` had.
+/// Guards are scoped to a single method call and never held across an
+/// `.await`.
 #[derive(Clone)]
 #[cfg(feature = "merk")]
 pub struct MerkStorage {
-    /// The Merk tree wrapped in Arc for shared ownership.
-    pub merk: Arc<InMemoryMerk>,
+    /// The Merk tree behind a lock for shared ownership. Private: all access
+    /// goes through the methods below so lock scope stays per-call.
+    merk: Arc<RwLock<Tree>>,
 }
 
 #[cfg(feature = "merk")]
 impl MerkStorage {
     /// Create a new in-memory MerkStorage.
     pub fn new() -> Self {
-        let merk = InMemoryMerk::new();
-
         Self {
-            merk: Arc::new(merk),
+            merk: Arc::new(RwLock::new(Tree::default())),
         }
+    }
+
+    /// Read-lock the tree. Poisoning is unrecoverable state corruption; panic.
+    fn tree(&self) -> std::sync::RwLockReadGuard<'_, Tree> {
+        self.merk.read().expect("merk tree lock poisoned")
+    }
+
+    /// Write-lock the tree. Poisoning is unrecoverable state corruption; panic.
+    fn tree_mut(&self) -> std::sync::RwLockWriteGuard<'_, Tree> {
+        self.merk.write().expect("merk tree lock poisoned")
     }
 
     /// Create an in-memory MerkStorage with internal tables (e.g. `_access_control`)
@@ -101,49 +120,46 @@ impl MerkStorage {
         Ok(storage)
     }
 
-    /// Clone the current Merk root node. Returns `None` if the tree is empty.
-    pub fn snapshot(&self) -> Option<Node> {
-        self.merk.snapshot()
+    /// Checkpoint the current Merk state: a cheap (O(1) copy-on-write),
+    /// immutable copy of the tree as of now, unaffected by later writes.
+    /// Returns `None` if the tree is empty.
+    pub fn checkpoint(&self) -> Option<Tree> {
+        let tree = self.tree();
+        if tree.is_empty() {
+            None
+        } else {
+            Some(tree.clone())
+        }
     }
 
     /// Get the current root hash of the Merk tree.
     pub fn root_hash(&self) -> [u8; 32] {
-        self.merk.root_hash()
+        self.tree().root_hash()
     }
 
     /// Get a value by key.
     pub fn get_value(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self.merk.get(key))
+        self.tree()
+            .get(key)
+            .map_err(|e| SdkError::DatabaseError(format!("Failed to read key: {e:?}")))
     }
 
     /// Iterate over a key range using the current in-memory tree.
     fn iter_range(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let Some(tree) = self.merk.snapshot() else {
-            return Ok(Vec::new());
-        };
-
         if let Some(end) = end {
             if start >= end {
                 return Ok(Vec::new());
             }
-
-            Ok(tree
-                .iter_from(start)
-                .take_while(|(key, _)| key.as_slice() < end)
-                .collect())
-        } else {
-            Ok(tree.iter_from(start).collect())
         }
+        self.tree()
+            .collect_range(start, end)
+            .map_err(|e| SdkError::DatabaseError(format!("Failed to read range: {e:?}")))
     }
 
     fn iter_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        match self.merk.snapshot() {
-            Some(tree) => Ok(tree
-                .iter_from(prefix)
-                .take_while(|(key, _)| key.starts_with(prefix))
-                .collect()),
-            None => Ok(Vec::new()),
-        }
+        self.tree()
+            .collect_prefix(prefix)
+            .map_err(|e| SdkError::DatabaseError(format!("Failed to read prefix: {e:?}")))
     }
 
     pub fn iter_prefix_entries(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -154,28 +170,54 @@ impl MerkStorage {
         self.apply_batch(ops)
     }
 
+    /// Lower a `(key, merk::Op)` pair into the ordered `WriteOp` vocabulary.
+    fn operation_to_write_op((key, op): Operation) -> WriteOp {
+        match op {
+            Op::Put(value) => WriteOp::Put { key, value },
+            Op::Delete => WriteOp::Delete { key },
+            Op::DeleteRange(end) => WriteOp::DeleteRange { start: key, end },
+        }
+    }
+
     /// Execute a batch of operations against the in-memory tree.
-    fn apply_batch(&self, mut ops: Vec<Operation>) -> Result<()> {
+    ///
+    /// Ops apply in emission order (merk never sorts or dedups; a later write
+    /// to the same key simply wins), atomically: either the whole batch
+    /// commits or the tree is unchanged.
+    fn apply_batch(&self, ops: Vec<Operation>) -> Result<()> {
         if ops.is_empty() {
             return Ok(());
         }
+        let write_ops: Vec<WriteOp> = ops.into_iter().map(Self::operation_to_write_op).collect();
+        self.apply_write_ops(&write_ops)
+    }
 
-        ops.sort_by(|a, b| a.0.cmp(&b.0));
+    /// Apply pre-lowered `WriteOp`s to the live tree, in order, atomically.
+    pub fn apply_write_ops(&self, ops: &[WriteOp]) -> Result<()> {
+        self.tree_mut()
+            .apply_write_ops(ops)
+            .map_err(|e| SdkError::DatabaseError(format!("Failed to apply batch: {e:?}")))
+    }
 
-        // Dedup: last-write-wins for duplicate keys
-        let mut seen = std::collections::HashSet::new();
-        let mut batch = Vec::new();
-        for op in ops.into_iter().rev() {
-            if seen.insert(op.0.clone()) {
-                batch.push(op);
-            }
+    /// Atomically replace the live tree with `candidate`, but only if the
+    /// live root still equals `expected_live_root`.
+    ///
+    /// This is the commit half of a validate-then-commit sequence: the caller
+    /// builds and verifies `candidate` from a checkpoint without holding the
+    /// lock, then this swap either publishes it (O(1) — the tree is a
+    /// persistent value) or, if another writer got in between, fails with the
+    /// live state **untouched** so the caller can safely retry from a fresh
+    /// checkpoint.
+    pub fn commit_candidate(&self, expected_live_root: [u8; 32], candidate: Tree) -> Result<()> {
+        let mut tree = self.tree_mut();
+        if tree.root_hash() != expected_live_root {
+            return Err(SdkError::DatabaseError(
+                "commit_candidate: live tree changed since the checkpoint; \
+                 concurrent writer detected (state unchanged)"
+                    .to_string(),
+            ));
         }
-        batch.reverse();
-
-        self.merk
-            .apply_batch(&batch)
-            .map_err(|e| SdkError::DatabaseError(format!("Failed to apply batch: {e:?}")))?;
-
+        *tree = candidate;
         Ok(())
     }
     /// Get schema for a table.
@@ -2474,5 +2516,53 @@ mod tests {
             results.is_empty(),
             "id > 1 on test_table must not leak rows from later table prefixes: {results:?}"
         );
+    }
+
+    /// `commit_candidate` is the atomic commit half of validate-then-commit:
+    /// when a concurrent writer moved the live root after the caller's
+    /// checkpoint, the losing commit must fail with the live state untouched
+    /// — never half-apply (the write path used to mutate first and detect the
+    /// mismatch after).
+    #[tokio::test]
+    async fn test_commit_candidate_rejects_stale_root_untouched() {
+        let storage = MerkStorage::in_memory_with_internal_tables().await.unwrap();
+        let start_root = storage.root_hash();
+
+        // Two writers build candidates from the same checkpoint.
+        let base = storage.checkpoint().expect("non-empty tree");
+        let mut winner = base.clone();
+        winner
+            .apply_write_ops(&[WriteOp::Put {
+                key: b"winner-key".to_vec(),
+                value: b"winner".to_vec(),
+            }])
+            .unwrap();
+        let winner_root = winner.root_hash();
+        let mut loser = base.clone();
+        loser
+            .apply_write_ops(&[WriteOp::Put {
+                key: b"loser-key".to_vec(),
+                value: b"loser".to_vec(),
+            }])
+            .unwrap();
+
+        // Winner commits; a cloned handle sees the new root.
+        let clone = storage.clone();
+        storage.commit_candidate(start_root, winner).unwrap();
+        assert_eq!(clone.root_hash(), winner_root);
+
+        // Loser's expected root is stale: the commit must fail and change
+        // nothing — the winner's write survives, the loser's never lands.
+        let err = clone.commit_candidate(start_root, loser).unwrap_err();
+        assert!(
+            err.to_string().contains("concurrent writer"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(storage.root_hash(), winner_root);
+        assert_eq!(
+            storage.get_value(b"winner-key").unwrap().as_deref(),
+            Some(b"winner".as_slice())
+        );
+        assert_eq!(storage.get_value(b"loser-key").unwrap(), None);
     }
 }

@@ -5,7 +5,7 @@ use super::{
     OpVerifyResult,
 };
 use crate::changelog::{ChangelogEntry, ChangelogError};
-use crate::{BatchOp, ReadOp, TraceStep};
+use crate::{ReadOp, WriteOp};
 /// CreateSpace operation verifier.
 pub struct CreateSpaceOp;
 
@@ -57,7 +57,7 @@ impl OpVerifier for CreateSpaceOp {
         let user_column_keys =
             derive_column_keys_with_row_id(&user_entries, user_row_id, "create_space")?;
 
-        let mut batch_ops: Vec<BatchOp> =
+        let mut batch_ops: Vec<WriteOp> =
             Vec::with_capacity(user_column_keys.len() + retention_entries.len());
         for (col_key, kv) in user_column_keys.iter().zip(user_entries.iter()) {
             batch_ops.push(kv.to_batch_op(col_key));
@@ -127,10 +127,8 @@ impl OpVerifier for CreateSpaceOp {
             )?;
         }
 
-        batch_ops.sort_by(|a, b| a.key().cmp(b.key()));
-
         Ok(OpVerifyResult {
-            write_steps: vec![TraceStep::Write(batch_ops)],
+            write_steps: batch_ops,
         })
     }
 }

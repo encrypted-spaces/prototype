@@ -11,7 +11,6 @@ members = [
     "ffproof",
     "ffproof/changelog_core",
     "ffproof/changelog_test_utils",
-    "ffproof/tracer",
     "ffproof/methods_bench",
     "key_manager",
     "retention",
@@ -55,7 +54,7 @@ hyper-tungstenite = { version = "0.5" }
 native-tls = { version = "0.2" }
 instant = { version = "0.1.13" }
 log = { version = "0.4" }
-merk = { git = "https://github.com/encrypted-spaces/merk.git" }
+merk = { git = "ssh://git@github.com/encrypted-spaces/merk-private.git", branch = "experimental-mrt" }
 once_cell = { version = "1.19" }
 prost = { version = "0.14.1" }
 proptest = { version = "1.6", default-features = false, features = ["std"] }

@@ -3,7 +3,7 @@ use super::{
     OpContext, OpReader, OpVerifier, OpVerifyResult,
 };
 use crate::changelog::{ChangelogEntry, ChangelogError, OpType};
-use crate::{BatchOp, TraceStep};
+use crate::WriteOp;
 use encrypted_spaces_storage_encoding::keys::{parse_key, ParsedKey};
 
 /// Write (insert or overwrite) entries into a declared key-value store.
@@ -88,19 +88,17 @@ impl OpVerifier for StorePutOp {
     ) -> Result<OpVerifyResult, ChangelogError> {
         validate_store_write(entry, OpType::StorePut, "store_put", reader, ctx)?;
 
-        let ops: Vec<BatchOp> = entry
+        let ops: Vec<WriteOp> = entry
             .message
             .entries
             .iter()
-            .map(|kv| BatchOp::Put {
+            .map(|kv| WriteOp::Put {
                 key: kv.key.clone(),
                 value: kv.value.clone(),
             })
             .collect();
 
-        Ok(OpVerifyResult {
-            write_steps: vec![TraceStep::Write(ops)],
-        })
+        Ok(OpVerifyResult { write_steps: ops })
     }
 }
 
@@ -112,18 +110,16 @@ impl OpVerifier for StoreDeleteOp {
     ) -> Result<OpVerifyResult, ChangelogError> {
         validate_store_write(entry, OpType::StoreDelete, "store_delete", reader, ctx)?;
 
-        let ops: Vec<BatchOp> = entry
+        let ops: Vec<WriteOp> = entry
             .message
             .entries
             .iter()
-            .map(|kv| BatchOp::Delete {
+            .map(|kv| WriteOp::Delete {
                 key: kv.key.clone(),
             })
             .collect();
 
-        Ok(OpVerifyResult {
-            write_steps: vec![TraceStep::Write(ops)],
-        })
+        Ok(OpVerifyResult { write_steps: ops })
     }
 }
 
@@ -208,13 +204,11 @@ mod tests {
         let result = StorePutOp::extract_and_validate(&entry, &mut reader, &ctx()).unwrap();
         reader.assert_all_consumed().unwrap();
 
-        let TraceStep::Write(ops) = &result.write_steps[0] else {
-            panic!("expected a Write step");
-        };
+        let ops = &result.write_steps;
         assert_eq!(ops.len(), 2);
-        assert!(matches!(&ops[0], BatchOp::Put { key, value }
+        assert!(matches!(&ops[0], WriteOp::Put { key, value }
             if *key == store_entry_key("prefs", b"a") && value == b"1"));
-        assert!(matches!(&ops[1], BatchOp::Put { key, value }
+        assert!(matches!(&ops[1], WriteOp::Put { key, value }
             if *key == store_entry_key("prefs", b"b") && value == b"2"));
     }
 
@@ -225,11 +219,9 @@ mod tests {
         let mut reader = VerifierReader::new(&reads);
         let result = StoreDeleteOp::extract_and_validate(&entry, &mut reader, &ctx()).unwrap();
 
-        let TraceStep::Write(ops) = &result.write_steps[0] else {
-            panic!("expected a Write step");
-        };
+        let ops = &result.write_steps;
         assert_eq!(ops.len(), 1);
-        assert!(matches!(&ops[0], BatchOp::Delete { key }
+        assert!(matches!(&ops[0], WriteOp::Delete { key }
             if *key == store_entry_key("prefs", b"a")));
     }
 

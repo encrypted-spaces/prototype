@@ -802,7 +802,7 @@ impl AclServer {
         state.changelog = ChangeLog::new(&root);
 
         // Refresh tree snapshot after ACL blob was re-written
-        state.tree_snapshot = state.db.snapshot();
+        state.tree_snapshot = state.db.checkpoint();
 
         let initial_dc = state.get_root_hash().await;
 
@@ -1006,26 +1006,6 @@ async fn test_per_change_verifier_authenticates_acl_blob() {
 
 async fn test_per_change_verifier_authenticates_acl_blob_inner() {
     use encrypted_spaces_changelog_core::changelog::ChangeLog;
-    use encrypted_spaces_changelog_core::{acl_rule_key, PrunedMerkleTree};
-
-    fn tamper_acl_blob_value(node: &mut PrunedMerkleTree, acl_key: &[u8]) -> bool {
-        match node {
-            PrunedMerkleTree::Empty | PrunedMerkleTree::Pruned { .. } => false,
-            PrunedMerkleTree::Full {
-                key,
-                value,
-                left,
-                right,
-            } => {
-                if key.as_slice() == acl_key {
-                    value.push(0);
-                    true
-                } else {
-                    tamper_acl_blob_value(left, acl_key) || tamper_acl_blob_value(right, acl_key)
-                }
-            }
-        }
-    }
 
     let server = AclServer::new().await;
 
@@ -1077,17 +1057,15 @@ async fn test_per_change_verifier_authenticates_acl_blob_inner() {
     )
     .expect("authorized insert proof should verify");
 
-    // Sanity-check that the pruned tree witness contains the ACL rule as a full
-    // node, then prove that mutating it breaks the old-root commitment.
-    let mut tampered_pruned: PrunedMerkleTree =
-        postcard::from_bytes(&response.pruned_merkle_tree).expect("proof deserializes");
-    let acl_key = acl_rule_key("products", "write");
-    assert!(
-        tamper_acl_blob_value(&mut tampered_pruned, &acl_key),
-        "pruned tree witness should contain the ACL rule key"
-    );
-    let tampered_bytes =
-        postcard::to_allocvec(&tampered_pruned).expect("serialize tampered pruned tree proof");
+    // The witness is merk's opaque trace bytes, authenticated against
+    // `old_root` by `TraceReplayer::new_verified` (the ACL rule blob the
+    // verifier reads is part of that authenticated trace). Corrupting the
+    // trace breaks the start-root commitment, so the verifier must reject it.
+    let mut tampered_bytes = response.pruned_merkle_tree.clone();
+    assert!(!tampered_bytes.is_empty(), "witness must be non-empty");
+    for b in tampered_bytes.iter_mut() {
+        *b ^= 0xFF;
+    }
     let err = ChangeLog::verify_proof_and_validate(
         &change.entry,
         &tampered_bytes,
@@ -1095,14 +1073,13 @@ async fn test_per_change_verifier_authenticates_acl_blob_inner() {
         &response.new_root,
         current_change_id,
     )
-    .expect_err("proof with tampered ACL rule must be rejected");
-    let msg = err.to_string();
+    .expect_err("a tampered trace witness must be rejected");
     assert!(
-        msg.contains("start root mismatch") || msg.contains("ACL rule"),
-        "unexpected error for tampered ACL rule: {msg}"
+        err.to_string().contains("verify_proof"),
+        "unexpected error for tampered witness: {err}"
     );
 
-    let garbage_bytes = b"not a pruned merkle tree".to_vec();
+    let garbage_bytes = b"not a merk trace witness".to_vec();
     let err = ChangeLog::verify_proof_and_validate(
         &change.entry,
         &garbage_bytes,
@@ -1110,11 +1087,10 @@ async fn test_per_change_verifier_authenticates_acl_blob_inner() {
         &response.new_root,
         current_change_id,
     )
-    .expect_err("garbage pruned tree proof must be rejected");
-    let msg = err.to_string();
+    .expect_err("a garbage trace witness must be rejected");
     assert!(
-        msg.contains("pruned tree proof deserialize failed"),
-        "unexpected error for garbage pruned tree proof: {msg}"
+        err.to_string().contains("verify_proof"),
+        "unexpected error for garbage witness: {err}"
     );
 }
 
@@ -1133,7 +1109,6 @@ async fn test_proof_contains_reads() {
 
 async fn test_proof_contains_reads_inner() {
     use encrypted_spaces_changelog_core::changelog::ChangeLog;
-    use encrypted_spaces_changelog_core::PrunedMerkleTree;
 
     println!("=== Proof Contains Reads Test ===");
     let server = Server::new().await;
@@ -1171,33 +1146,15 @@ async fn test_proof_contains_reads_inner() {
 
     let response = server.handle_change(&change, &auth1).await.unwrap();
 
-    // Deserialize the pruned merkle tree and verify it contains data
-    let pruned_node: PrunedMerkleTree =
-        postcard::from_bytes(&response.pruned_merkle_tree).expect("pruned tree deserializes");
-    let node_count = match &pruned_node {
-        PrunedMerkleTree::Empty => 0usize,
-        _ => {
-            fn count_nodes(node: &PrunedMerkleTree) -> usize {
-                match node {
-                    PrunedMerkleTree::Empty => 0,
-                    PrunedMerkleTree::Pruned { .. } => 1,
-                    PrunedMerkleTree::Full { left, right, .. } => {
-                        1 + count_nodes(left) + count_nodes(right)
-                    }
-                }
-            }
-            count_nodes(&pruned_node)
-        }
-    };
-
+    // The witness is opaque trace bytes now; a change whose verifier reads
+    // user/schema/ACL data cannot have an empty witness.
     println!(
-        "Pruned tree: {} nodes, proof size: {} bytes",
-        node_count,
+        "Trace witness size: {} bytes",
         response.pruned_merkle_tree.len()
     );
     assert!(
-        node_count > 0,
-        "Pruned merkle tree should contain nodes (reads embed user, schema, ACL data)"
+        !response.pruned_merkle_tree.is_empty(),
+        "Trace witness should be non-empty (reads embed user, schema, ACL data)"
     );
 
     // Verify the proof validates via the changelog verifier
@@ -1210,11 +1167,7 @@ async fn test_proof_contains_reads_inner() {
     )
     .expect("pruned tree proof should validate");
     assert!(!writes.is_empty(), "Proof should produce write operations");
-    println!(
-        "✓ Pruned tree validates: {} write ops, {} nodes",
-        writes.len(),
-        node_count
-    );
+    println!("✓ Trace witness validates: {} write ops", writes.len());
 
     // Also verify through the SDK path
     client1

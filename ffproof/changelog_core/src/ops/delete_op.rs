@@ -5,7 +5,7 @@ use super::{
     OpContext, OpReader, OpVerifier, OpVerifyResult,
 };
 use crate::changelog::{ChangelogEntry, ChangelogError, OpType};
-use crate::{BatchOp, ReadOp, TraceStep};
+use crate::{ReadOp, WriteOp};
 use encrypted_spaces_storage_encoding::keys::{column_key, parse_key, ParsedKey};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -85,9 +85,9 @@ impl OpVerifier for DeleteOp {
         }
 
         // Build column delete ops
-        let mut delete_ops: Vec<BatchOp> = column_keys
+        let mut delete_ops: Vec<WriteOp> = column_keys
             .iter()
-            .map(|key| BatchOp::Delete { key: key.clone() })
+            .map(|key| WriteOp::Delete { key: key.clone() })
             .collect();
 
         // Read indexed columns and construct index Delete ops
@@ -110,7 +110,7 @@ impl OpVerifier for DeleteOp {
         }
 
         Ok(OpVerifyResult {
-            write_steps: vec![TraceStep::Write(delete_ops)],
+            write_steps: delete_ops,
         })
     }
 }
@@ -324,14 +324,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(result.write_steps.len(), 1);
-        match &result.write_steps[0] {
-            TraceStep::Write(ops) => {
-                assert_eq!(ops.len(), 1);
-                assert!(matches!(&ops[0], BatchOp::Delete { key } if *key == col_key));
-            }
-            other => panic!("Expected Write step, got: {other:?}"),
-        }
+        let ops = &result.write_steps;
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(&ops[0], WriteOp::Delete { key } if *key == col_key));
     }
 
     #[test]
@@ -437,14 +432,10 @@ mod tests {
             },
         )
         .unwrap();
-        match &result.write_steps[0] {
-            TraceStep::Write(ops) => {
-                assert_eq!(ops.len(), 2);
-                assert!(matches!(&ops[0], BatchOp::Delete { key } if *key == key1));
-                assert!(matches!(&ops[1], BatchOp::Delete { key } if *key == key2));
-            }
-            other => panic!("Expected Write step, got: {other:?}"),
-        }
+        let ops = &result.write_steps;
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(&ops[0], WriteOp::Delete { key } if *key == key1));
+        assert!(matches!(&ops[1], WriteOp::Delete { key } if *key == key2));
     }
 
     #[test]

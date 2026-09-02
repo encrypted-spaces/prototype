@@ -7,7 +7,7 @@ use super::{
     AclCheck, OpContext, OpReader, OpVerifier, OpVerifyResult, ParsedColumnEntry,
 };
 use crate::changelog::{ChangelogEntry, ChangelogError, OpType};
-use crate::{BatchOp, ReadOp, TraceStep};
+use crate::{ReadOp, WriteOp};
 use encrypted_spaces_storage_encoding::keys::{
     column_key, encode_list_parent, list_head_key, list_parent_key, list_tail_key,
     schema_next_list_number_key,
@@ -163,7 +163,7 @@ impl OpVerifier for InsertOp {
         // Put with the allocated list_number instead of the signed placeholder.
         // Track (col_name, list_number) so the list-metadata loop below can
         // emit the per-list head/tail/parent writes in one place.
-        let mut batch_ops: Vec<BatchOp> = Vec::new();
+        let mut batch_ops: Vec<WriteOp> = Vec::new();
         let mut allocated_lists: Vec<(String, i64)> = Vec::new();
         for (parsed, col_key) in parsed_entries.iter().zip(column_keys.iter()) {
             let col_name = parsed.column.as_ref();
@@ -184,7 +184,7 @@ impl OpVerifier for InsertOp {
                              list_number {list_number}: {e}"
                         ))
                     })?;
-                batch_ops.push(BatchOp::Put {
+                batch_ops.push(WriteOp::Put {
                     key: col_key.clone(),
                     value: stored_bytes,
                 });
@@ -236,20 +236,20 @@ impl OpVerifier for InsertOp {
                      at base={list_number_base}+{num_lists}"
                 ))
             })?;
-            batch_ops.push(BatchOp::Put {
+            batch_ops.push(WriteOp::Put {
                 key: schema_next_list_number_key(),
                 value: new_counter.to_be_bytes().to_vec(),
             });
             for (col_name, ln) in &allocated_lists {
-                batch_ops.push(BatchOp::Put {
+                batch_ops.push(WriteOp::Put {
                     key: list_head_key(*ln),
                     value: 0i64.to_be_bytes().to_vec(),
                 });
-                batch_ops.push(BatchOp::Put {
+                batch_ops.push(WriteOp::Put {
                     key: list_tail_key(*ln),
                     value: 0i64.to_be_bytes().to_vec(),
                 });
-                batch_ops.push(BatchOp::Put {
+                batch_ops.push(WriteOp::Put {
                     key: list_parent_key(*ln),
                     value: encode_list_parent(table, row_id, col_name),
                 });
@@ -257,7 +257,7 @@ impl OpVerifier for InsertOp {
         }
 
         Ok(OpVerifyResult {
-            write_steps: vec![TraceStep::Write(batch_ops)],
+            write_steps: batch_ops,
         })
     }
 }
@@ -278,7 +278,7 @@ fn inline_values_by_parsed_column<'e, 'a>(
 }
 
 fn append_insert_index_puts_parsed_skip(
-    batch_ops: &mut Vec<BatchOp>,
+    batch_ops: &mut Vec<WriteOp>,
     target: (&str, i64),
     entries: &[ParsedColumnEntry<'_>],
     op_name: &str,
@@ -514,34 +514,29 @@ mod tests {
         let result =
             InsertOp::extract_and_validate(&entry, &mut reader, &super::OpContext::default())
                 .unwrap();
-        assert_eq!(result.write_steps.len(), 1);
-        match &result.write_steps[0] {
-            TraceStep::Write(ops) => {
-                // 2 column Put + 1 counter bump Put
-                assert_eq!(ops.len(), 3);
-                match &ops[0] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &proof_key_a);
-                        assert_eq!(value, &value1);
-                    }
-                    other => panic!("Expected Put, got: {other:?}"),
-                }
-                match &ops[1] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &proof_key_b);
-                        assert_eq!(value, &value2);
-                    }
-                    other => panic!("Expected Put, got: {other:?}"),
-                }
-                match &ops[2] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &make_schema_next_id_key("t"));
-                        assert_eq!(value, &6i64.to_be_bytes().to_vec());
-                    }
-                    other => panic!("Expected counter Put, got: {other:?}"),
-                }
+        let ops = &result.write_steps;
+        // 2 column Put + 1 counter bump Put
+        assert_eq!(ops.len(), 3);
+        match &ops[0] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &proof_key_a);
+                assert_eq!(value, &value1);
             }
-            other => panic!("Expected Write step, got: {other:?}"),
+            other => panic!("Expected Put, got: {other:?}"),
+        }
+        match &ops[1] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &proof_key_b);
+                assert_eq!(value, &value2);
+            }
+            other => panic!("Expected Put, got: {other:?}"),
+        }
+        match &ops[2] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &make_schema_next_id_key("t"));
+                assert_eq!(value, &6i64.to_be_bytes().to_vec());
+            }
+            other => panic!("Expected counter Put, got: {other:?}"),
         }
     }
 
@@ -629,10 +624,10 @@ mod tests {
         );
     }
 
-    /// Verify that short Value entries produce BatchOp::Put.
+    /// Verify that short Value entries produce WriteOp::Put.
     #[test]
     fn test_insert_op_emits_put_for_short_values() {
-        use crate::BatchOp;
+        use crate::WriteOp;
         // Two columns with short raw values (< 32 bytes)
         let entry_a = column_key_placeholder("t", "age");
         let entry_b = column_key_placeholder("t", "name");
@@ -671,35 +666,31 @@ mod tests {
             InsertOp::extract_and_validate(&entry, &mut reader, &super::OpContext::default())
                 .unwrap();
 
-        match &result.write_steps[0] {
-            TraceStep::Write(ops) => {
-                // 2 column Puts + 1 counter bump Put (schema_next_id_key)
-                assert_eq!(ops.len(), 3);
-                // Both column puts should be Put since values are short
-                match &ops[0] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &proof_a);
-                        assert_eq!(value, &age_value);
-                    }
-                    other => panic!("Expected Put for short value, got: {other:?}"),
-                }
-                match &ops[1] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &proof_b);
-                        assert_eq!(value, &name_value);
-                    }
-                    other => panic!("Expected Put for short value, got: {other:?}"),
-                }
-                // Counter bump: row_id 5 → next_id 6
-                match &ops[2] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &make_schema_next_id_key("t"));
-                        assert_eq!(value, &6i64.to_be_bytes().to_vec());
-                    }
-                    other => panic!("Expected counter Put, got: {other:?}"),
-                }
+        let ops = &result.write_steps;
+        // 2 column Puts + 1 counter bump Put (schema_next_id_key)
+        assert_eq!(ops.len(), 3);
+        // Both column puts should be Put since values are short
+        match &ops[0] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &proof_a);
+                assert_eq!(value, &age_value);
             }
-            other => panic!("Expected Write step, got: {other:?}"),
+            other => panic!("Expected Put for short value, got: {other:?}"),
+        }
+        match &ops[1] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &proof_b);
+                assert_eq!(value, &name_value);
+            }
+            other => panic!("Expected Put for short value, got: {other:?}"),
+        }
+        // Counter bump: row_id 5 → next_id 6
+        match &ops[2] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &make_schema_next_id_key("t"));
+                assert_eq!(value, &6i64.to_be_bytes().to_vec());
+            }
+            other => panic!("Expected counter Put, got: {other:?}"),
         }
     }
 
@@ -764,29 +755,25 @@ mod tests {
             InsertOp::extract_and_validate(&entry, &mut reader, &super::OpContext::default())
                 .unwrap();
 
-        match &result.write_steps[0] {
-            TraceStep::Write(ops) => {
-                // 2 columns + 1 index (age) + 1 counter bump
-                assert_eq!(ops.len(), 4);
-                assert!(
-                    matches!(&ops[0], BatchOp::Put { key, value } if key == &proof_a && value == &age_value)
-                );
-                assert!(
-                    matches!(&ops[1], BatchOp::Put { key, value } if key == &proof_b && value == &long_name_value)
-                );
+        let ops = &result.write_steps;
+        // 2 columns + 1 index (age) + 1 counter bump
+        assert_eq!(ops.len(), 4);
+        assert!(
+            matches!(&ops[0], WriteOp::Put { key, value } if key == &proof_a && value == &age_value)
+        );
+        assert!(
+            matches!(&ops[1], WriteOp::Put { key, value } if key == &proof_b && value == &long_name_value)
+        );
 
-                let expected_index_key = index_key("t", "age", 25i64, 5).unwrap();
-                assert!(
-                    matches!(&ops[2], BatchOp::Put { key, value } if key == &expected_index_key && value == &5i64.to_be_bytes().to_vec())
-                );
+        let expected_index_key = index_key("t", "age", 25i64, 5).unwrap();
+        assert!(
+            matches!(&ops[2], WriteOp::Put { key, value } if key == &expected_index_key && value == &5i64.to_be_bytes().to_vec())
+        );
 
-                // Counter bump: row_id 5 → next_id 6
-                assert!(
-                    matches!(&ops[3], BatchOp::Put { key, value } if key == &make_schema_next_id_key("t") && value == &6i64.to_be_bytes().to_vec())
-                );
-            }
-            other => panic!("Expected Write step, got: {other:?}"),
-        }
+        // Counter bump: row_id 5 → next_id 6
+        assert!(
+            matches!(&ops[3], WriteOp::Put { key, value } if key == &make_schema_next_id_key("t") && value == &6i64.to_be_bytes().to_vec())
+        );
     }
 
     #[test]
@@ -1205,18 +1192,14 @@ mod tests {
             InsertOp::extract_and_validate(&entry, &mut reader, &super::OpContext::default())
                 .expect("explicit-mode insert at i64::MAX should succeed");
 
-        match &result.write_steps[0] {
-            TraceStep::Write(ops) => {
-                // One column Put; no counter Put at schema_next_id_key.
-                for op in ops {
-                    assert_ne!(
-                        op.key(),
-                        make_schema_next_id_key("t").as_slice(),
-                        "explicit-mode insert must not bump next_id"
-                    );
-                }
-            }
-            other => panic!("Expected Write step, got: {other:?}"),
+        let ops = &result.write_steps;
+        // One column Put; no counter Put at schema_next_id_key.
+        for op in ops {
+            assert_ne!(
+                crate::ops::write_op_key(op),
+                make_schema_next_id_key("t").as_slice(),
+                "explicit-mode insert must not bump next_id"
+            );
         }
     }
 
@@ -1414,83 +1397,79 @@ mod tests {
             InsertOp::extract_and_validate(&entry, &mut reader, &super::OpContext::default())
                 .unwrap();
 
-        match &result.write_steps[0] {
-            TraceStep::Write(ops) => {
-                // Expected ops:
-                // 0: Put items column with list_number=1 (derived)
-                // 1: Put title column (normal)
-                // 2: counter bump (schema_next_id_key → 6)
-                // 3: list_number counter bump (→ 2)
-                // 4: list_head_key(1) = 0
-                // 5: list_tail_key(1) = 0
-                // 6: list_parent_key(1) = encode_list_parent("t", 5, "items")
-                assert_eq!(ops.len(), 7, "ops: {ops:?}");
+        let ops = &result.write_steps;
+        // Expected ops:
+        // 0: Put items column with list_number=1 (derived)
+        // 1: Put title column (normal)
+        // 2: counter bump (schema_next_id_key → 6)
+        // 3: list_number counter bump (→ 2)
+        // 4: list_head_key(1) = 0
+        // 5: list_tail_key(1) = 0
+        // 6: list_parent_key(1) = encode_list_parent("t", 5, "items")
+        assert_eq!(ops.len(), 7, "ops: {ops:?}");
 
-                // List column gets stored list_number=1
-                let expected_list_stored = value_to_bytes(&serde_json::json!(1)).unwrap();
-                match &ops[0] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &proof_items);
-                        assert_eq!(value, &expected_list_stored);
-                    }
-                    other => panic!("Expected Put for list column, got: {other:?}"),
-                }
-
-                // Normal column
-                match &ops[1] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &proof_title);
-                        assert_eq!(value, &title_value);
-                    }
-                    other => panic!("Expected Put for title, got: {other:?}"),
-                }
-
-                // Row ID counter bump
-                match &ops[2] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &make_schema_next_id_key("t"));
-                        assert_eq!(value, &6i64.to_be_bytes().to_vec());
-                    }
-                    other => panic!("Expected counter Put, got: {other:?}"),
-                }
-
-                // List number counter bump (1 + 1 = 2)
-                match &ops[3] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &make_schema_next_list_number_key());
-                        assert_eq!(value, &2i64.to_be_bytes().to_vec());
-                    }
-                    other => panic!("Expected list counter Put, got: {other:?}"),
-                }
-
-                // list_head_key(1) = 0
-                match &ops[4] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &make_list_head_key(1));
-                        assert_eq!(value, &0i64.to_be_bytes().to_vec());
-                    }
-                    other => panic!("Expected head Put, got: {other:?}"),
-                }
-
-                // list_tail_key(1) = 0
-                match &ops[5] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &make_list_tail_key(1));
-                        assert_eq!(value, &0i64.to_be_bytes().to_vec());
-                    }
-                    other => panic!("Expected tail Put, got: {other:?}"),
-                }
-
-                // list_parent_key(1) = encode_list_parent("t", 5, "items")
-                match &ops[6] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &make_list_parent_key(1));
-                        assert_eq!(value, &make_encode_list_parent("t", 5, "items"));
-                    }
-                    other => panic!("Expected parent Put, got: {other:?}"),
-                }
+        // List column gets stored list_number=1
+        let expected_list_stored = value_to_bytes(&serde_json::json!(1)).unwrap();
+        match &ops[0] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &proof_items);
+                assert_eq!(value, &expected_list_stored);
             }
-            other => panic!("Expected Write step, got: {other:?}"),
+            other => panic!("Expected Put for list column, got: {other:?}"),
+        }
+
+        // Normal column
+        match &ops[1] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &proof_title);
+                assert_eq!(value, &title_value);
+            }
+            other => panic!("Expected Put for title, got: {other:?}"),
+        }
+
+        // Row ID counter bump
+        match &ops[2] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &make_schema_next_id_key("t"));
+                assert_eq!(value, &6i64.to_be_bytes().to_vec());
+            }
+            other => panic!("Expected counter Put, got: {other:?}"),
+        }
+
+        // List number counter bump (1 + 1 = 2)
+        match &ops[3] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &make_schema_next_list_number_key());
+                assert_eq!(value, &2i64.to_be_bytes().to_vec());
+            }
+            other => panic!("Expected list counter Put, got: {other:?}"),
+        }
+
+        // list_head_key(1) = 0
+        match &ops[4] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &make_list_head_key(1));
+                assert_eq!(value, &0i64.to_be_bytes().to_vec());
+            }
+            other => panic!("Expected head Put, got: {other:?}"),
+        }
+
+        // list_tail_key(1) = 0
+        match &ops[5] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &make_list_tail_key(1));
+                assert_eq!(value, &0i64.to_be_bytes().to_vec());
+            }
+            other => panic!("Expected tail Put, got: {other:?}"),
+        }
+
+        // list_parent_key(1) = encode_list_parent("t", 5, "items")
+        match &ops[6] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &make_list_parent_key(1));
+                assert_eq!(value, &make_encode_list_parent("t", 5, "items"));
+            }
+            other => panic!("Expected parent Put, got: {other:?}"),
         }
     }
 
@@ -1578,103 +1557,99 @@ mod tests {
             InsertOp::extract_and_validate(&entry, &mut reader, &super::OpContext::default())
                 .unwrap();
 
-        match &result.write_steps[0] {
-            TraceStep::Write(ops) => {
-                // 3 columns + 1 row counter + 1 list counter + 2*(head + tail + parent) = 11
-                assert_eq!(ops.len(), 11, "ops: {ops:?}");
+        let ops = &result.write_steps;
+        // 3 columns + 1 row counter + 1 list counter + 2*(head + tail + parent) = 11
+        assert_eq!(ops.len(), 11, "ops: {ops:?}");
 
-                let stored_5 = value_to_bytes(&serde_json::json!(5)).unwrap();
-                let stored_6 = value_to_bytes(&serde_json::json!(6)).unwrap();
+        let stored_5 = value_to_bytes(&serde_json::json!(5)).unwrap();
+        let stored_6 = value_to_bytes(&serde_json::json!(6)).unwrap();
 
-                // "notes" gets list_number=5 (first alphabetically)
-                match &ops[0] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &proof_notes);
-                        assert_eq!(value, &stored_5);
-                    }
-                    other => panic!("Expected Put for notes, got: {other:?}"),
-                }
-                // "tasks" gets list_number=6 (second alphabetically)
-                match &ops[1] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &proof_tasks);
-                        assert_eq!(value, &stored_6);
-                    }
-                    other => panic!("Expected Put for tasks, got: {other:?}"),
-                }
-                // "title" is normal
-                match &ops[2] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &proof_title);
-                        assert_eq!(value, &title_value);
-                    }
-                    other => panic!("Expected Put for title, got: {other:?}"),
-                }
-
-                // Row ID counter bump → 6
-                match &ops[3] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &make_schema_next_id_key("t"));
-                        assert_eq!(value, &6i64.to_be_bytes().to_vec());
-                    }
-                    other => panic!("Expected row counter Put, got: {other:?}"),
-                }
-
-                // List number counter: 5 + 2 = 7
-                match &ops[4] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &make_schema_next_list_number_key());
-                        assert_eq!(value, &7i64.to_be_bytes().to_vec());
-                    }
-                    other => panic!("Expected list counter Put, got: {other:?}"),
-                }
-
-                // For each allocated list (in alphabetical order: notes=5, tasks=6):
-                // head, tail, parent
-                match &ops[5] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &make_list_head_key(5));
-                        assert_eq!(value, &0i64.to_be_bytes().to_vec());
-                    }
-                    other => panic!("Expected head(5) Put, got: {other:?}"),
-                }
-                match &ops[6] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &make_list_tail_key(5));
-                        assert_eq!(value, &0i64.to_be_bytes().to_vec());
-                    }
-                    other => panic!("Expected tail(5) Put, got: {other:?}"),
-                }
-                match &ops[7] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &make_list_parent_key(5));
-                        assert_eq!(value, &make_encode_list_parent("t", 5, "notes"));
-                    }
-                    other => panic!("Expected parent(5) Put, got: {other:?}"),
-                }
-                match &ops[8] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &make_list_head_key(6));
-                        assert_eq!(value, &0i64.to_be_bytes().to_vec());
-                    }
-                    other => panic!("Expected head(6) Put, got: {other:?}"),
-                }
-                match &ops[9] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &make_list_tail_key(6));
-                        assert_eq!(value, &0i64.to_be_bytes().to_vec());
-                    }
-                    other => panic!("Expected tail(6) Put, got: {other:?}"),
-                }
-                match &ops[10] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &make_list_parent_key(6));
-                        assert_eq!(value, &make_encode_list_parent("t", 5, "tasks"));
-                    }
-                    other => panic!("Expected parent(6) Put, got: {other:?}"),
-                }
+        // "notes" gets list_number=5 (first alphabetically)
+        match &ops[0] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &proof_notes);
+                assert_eq!(value, &stored_5);
             }
-            other => panic!("Expected Write step, got: {other:?}"),
+            other => panic!("Expected Put for notes, got: {other:?}"),
+        }
+        // "tasks" gets list_number=6 (second alphabetically)
+        match &ops[1] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &proof_tasks);
+                assert_eq!(value, &stored_6);
+            }
+            other => panic!("Expected Put for tasks, got: {other:?}"),
+        }
+        // "title" is normal
+        match &ops[2] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &proof_title);
+                assert_eq!(value, &title_value);
+            }
+            other => panic!("Expected Put for title, got: {other:?}"),
+        }
+
+        // Row ID counter bump → 6
+        match &ops[3] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &make_schema_next_id_key("t"));
+                assert_eq!(value, &6i64.to_be_bytes().to_vec());
+            }
+            other => panic!("Expected row counter Put, got: {other:?}"),
+        }
+
+        // List number counter: 5 + 2 = 7
+        match &ops[4] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &make_schema_next_list_number_key());
+                assert_eq!(value, &7i64.to_be_bytes().to_vec());
+            }
+            other => panic!("Expected list counter Put, got: {other:?}"),
+        }
+
+        // For each allocated list (in alphabetical order: notes=5, tasks=6):
+        // head, tail, parent
+        match &ops[5] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &make_list_head_key(5));
+                assert_eq!(value, &0i64.to_be_bytes().to_vec());
+            }
+            other => panic!("Expected head(5) Put, got: {other:?}"),
+        }
+        match &ops[6] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &make_list_tail_key(5));
+                assert_eq!(value, &0i64.to_be_bytes().to_vec());
+            }
+            other => panic!("Expected tail(5) Put, got: {other:?}"),
+        }
+        match &ops[7] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &make_list_parent_key(5));
+                assert_eq!(value, &make_encode_list_parent("t", 5, "notes"));
+            }
+            other => panic!("Expected parent(5) Put, got: {other:?}"),
+        }
+        match &ops[8] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &make_list_head_key(6));
+                assert_eq!(value, &0i64.to_be_bytes().to_vec());
+            }
+            other => panic!("Expected head(6) Put, got: {other:?}"),
+        }
+        match &ops[9] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &make_list_tail_key(6));
+                assert_eq!(value, &0i64.to_be_bytes().to_vec());
+            }
+            other => panic!("Expected tail(6) Put, got: {other:?}"),
+        }
+        match &ops[10] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &make_list_parent_key(6));
+                assert_eq!(value, &make_encode_list_parent("t", 5, "tasks"));
+            }
+            other => panic!("Expected parent(6) Put, got: {other:?}"),
         }
     }
 
@@ -1860,26 +1835,22 @@ mod tests {
             InsertOp::extract_and_validate(&entry, &mut reader, &super::OpContext::default())
                 .unwrap();
 
-        match &result.write_steps[0] {
-            TraceStep::Write(ops) => {
-                // 1 column Put + 1 counter bump = 2 (no list ops)
-                assert_eq!(ops.len(), 2, "ops: {ops:?}");
-                match &ops[0] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &proof_col);
-                        assert_eq!(value, &name_value);
-                    }
-                    other => panic!("Expected Put, got: {other:?}"),
-                }
-                match &ops[1] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &make_schema_next_id_key("t"));
-                        assert_eq!(value, &6i64.to_be_bytes().to_vec());
-                    }
-                    other => panic!("Expected counter Put, got: {other:?}"),
-                }
+        let ops = &result.write_steps;
+        // 1 column Put + 1 counter bump = 2 (no list ops)
+        assert_eq!(ops.len(), 2, "ops: {ops:?}");
+        match &ops[0] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &proof_col);
+                assert_eq!(value, &name_value);
             }
-            other => panic!("Expected Write step, got: {other:?}"),
+            other => panic!("Expected Put, got: {other:?}"),
+        }
+        match &ops[1] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &make_schema_next_id_key("t"));
+                assert_eq!(value, &6i64.to_be_bytes().to_vec());
+            }
+            other => panic!("Expected counter Put, got: {other:?}"),
         }
     }
 

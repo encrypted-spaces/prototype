@@ -463,6 +463,7 @@ class DemoLauncher(App):
         self.release_build = False
         self.gpu_proving = False
         self.cache_disabled = False
+        self.merk_avl = False  # build server + app with --features avl (AVL merk backend; MRT is the default)
         self.log_level = "info"
         self.default_zoom = 100
         self.instance_counter = 0
@@ -507,6 +508,9 @@ class DemoLauncher(App):
                 with Horizontal(classes="option-row"):
                     yield Switch(id="cache-switch", value=False)
                     yield Label("Disable client-side cache")
+                with Horizontal(classes="option-row"):
+                    yield Switch(id="avl-switch", value=False)
+                    yield Label("AVL merk backend (--features avl)")
                 yield Label("  Log level", classes="option-label-muted")
                 yield Select(
                     [("error", "error"), ("warn", "warn"), ("info", "info"),
@@ -556,6 +560,8 @@ class DemoLauncher(App):
                     pass
         elif event.switch.id == "cache-switch":
             self.cache_disabled = event.value
+        elif event.switch.id == "avl-switch":
+            self.merk_avl = event.value
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "log-level-select":
@@ -686,20 +692,35 @@ class DemoLauncher(App):
 
         # Always run cargo build — Cargo's own fingerprinting handles
         # staleness detection and is a fast no-op when nothing changed.
-        # When GPU proving is on, the server needs --features cuda,real-proofs,
-        # which can't share an invocation with the demo binary (features only
-        # apply to packages that declare them). Otherwise build both at once
-        # to avoid paying Cargo's startup overhead twice.
+        #
+        # Per-package features can't always share one multi-package invocation:
+        # cuda/real-proofs are server-only, and `--features` applies per selected
+        # package. The `mrt` (radix-tree backend) feature exists on *both* the
+        # server and the demo app and MUST match on both ends or their data
+        # commitments diverge. So whenever any feature is requested we build the
+        # server and demo separately, each with its own feature set; with no
+        # features we build both at once to save Cargo's startup overhead.
+        server_feats = []
         if self.gpu_proving and self.use_risc0:
+            server_feats += ["cuda", "real-proofs"]
+        if self.merk_avl:
+            server_feats.append("avl")
+        demo_feats = ["avl"] if self.merk_avl else []
+
+        def _feat_args(feats):
+            return ["--features", ",".join(feats)] if feats else []
+
+        if server_feats or demo_feats:
             steps.append(
-                ("Building server (--features cuda,real-proofs)...",
-                 ["cargo", "build", "-p", "encrypted-spaces-backend-server",
-                  "--features", "cuda,real-proofs"] + cargo_profile_args,
+                (f"Building server ({','.join(server_feats) or 'default'})...",
+                 ["cargo", "build", "-p", "encrypted-spaces-backend-server"]
+                 + _feat_args(server_feats) + cargo_profile_args,
                  WORKSPACE_ROOT),
             )
             steps.append(
-                ("Building demo binary...",
-                 ["cargo", "build", "-p", "encrypted-spaces-demo"] + cargo_profile_args,
+                (f"Building demo app ({','.join(demo_feats) or 'default'})...",
+                 ["cargo", "build", "-p", "encrypted-spaces-demo"]
+                 + _feat_args(demo_feats) + cargo_profile_args,
                  WORKSPACE_ROOT),
             )
         else:

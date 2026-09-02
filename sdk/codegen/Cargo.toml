@@ -5,6 +5,13 @@ license.workspace = true
 authors.workspace = true
 edition.workspace = true
 
+[features]
+avl = [
+    "encrypted-spaces-backend/avl",
+    "encrypted-spaces-ffproof/avl",
+    "encrypted-spaces-sdk/avl",
+]
+
 [dependencies]
 encrypted-spaces-acl-types = { workspace = true }
 encrypted-spaces-backend = { workspace = true }

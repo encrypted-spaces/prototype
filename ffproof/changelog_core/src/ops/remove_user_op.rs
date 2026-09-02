@@ -7,7 +7,7 @@ use super::{
     OpReader, OpVerifier, OpVerifyResult,
 };
 use crate::changelog::{ChangelogEntry, ChangelogError, OpType};
-use crate::{BatchOp, ReadOp, TraceStep};
+use crate::{ReadOp, WriteOp};
 use encrypted_spaces_storage_encoding::keys::{
     column_key, parse_key, ParsedKey, KEY_HISTORY_TABLE, USERS_TABLE,
 };
@@ -94,11 +94,11 @@ impl OpVerifier for RemoveUserOp {
             }
         }
 
-        let mut batch_ops: Vec<BatchOp> = Vec::new();
+        let mut batch_ops: Vec<WriteOp> = Vec::new();
 
-        // User columns: BatchOp::Delete (no counter bump — delete doesn't allocate ids)
+        // User columns: WriteOp::Delete (no counter bump — delete doesn't allocate ids)
         for kv in &user_entries {
-            batch_ops.push(BatchOp::Delete {
+            batch_ops.push(WriteOp::Delete {
                 key: kv.key.clone(),
             });
         }
@@ -178,7 +178,7 @@ impl OpVerifier for RemoveUserOp {
             )));
         }
 
-        // _key_history columns: BatchOp::Put (insert).
+        // _key_history columns: WriteOp::Put (insert).
         // For valid_to_change_id, substitute the server-authoritative value
         // (`current_change_id - 1`) instead of the client's changelog
         // entry value.  The server patches kh_query.valid_to_change_id
@@ -194,7 +194,7 @@ impl OpVerifier for RemoveUserOp {
                 .map(|pk| matches!(pk, ParsedKey::Column { column, .. } if column == "valid_to_change_id"))
                 .unwrap_or(false);
             if is_valid_to {
-                batch_ops.push(BatchOp::Put {
+                batch_ops.push(WriteOp::Put {
                     key: col_key.clone(),
                     value: authoritative_valid_to_bytes.clone(),
                 });
@@ -281,10 +281,8 @@ impl OpVerifier for RemoveUserOp {
             )?;
         }
 
-        batch_ops.sort_by(|a, b| a.key().cmp(b.key()));
-
         Ok(OpVerifyResult {
-            write_steps: vec![TraceStep::Write(batch_ops)],
+            write_steps: batch_ops,
         })
     }
 }
@@ -1066,20 +1064,16 @@ mod tests {
         );
 
         // Inspect the emitted batch ops for the _key_history valid_to column.
-        let write_steps = result.unwrap().write_steps;
-        let batch_ops = match &write_steps[0] {
-            TraceStep::Write(ops) => ops,
-            _ => panic!("expected Write step"),
-        };
+        let batch_ops = result.unwrap().write_steps;
 
         let valid_to_key = column_key("_key_history", 1, "valid_to_change_id");
         let valid_to_op = batch_ops
             .iter()
-            .find(|op| op.key() == valid_to_key)
+            .find(|op| crate::ops::write_op_key(op) == valid_to_key)
             .expect("valid_to_change_id batch op not found");
 
         match valid_to_op {
-            BatchOp::Put { value, .. } => {
+            WriteOp::Put { value, .. } => {
                 let decoded = bytes_to_value(value).expect("valid_to_change_id should decode");
                 assert_eq!(
                     decoded.as_i64(),

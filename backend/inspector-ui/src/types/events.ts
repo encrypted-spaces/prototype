@@ -46,25 +46,6 @@ export interface SchemaSnapshotEv {
   tables: TableInfo[];
 }
 
-export interface MerkTreeNode {
-  key_hex: string;
-  label: string;
-  kind: "column" | "row" | "index" | "schema" | "other";
-  hash: string;
-  value_size: number;
-  left: MerkTreeNode | null;
-  right: MerkTreeNode | null;
-}
-
-export interface MerkSnapshotEv {
-  kind: "MerkSnapshot";
-  ts_ms: number;
-  space_id: string;
-  change_id: number;
-  node_count: number;
-  root: MerkTreeNode | null;
-}
-
 export interface ConnectionEv {
   kind: "Connection";
   ts_ms: number;
@@ -127,7 +108,6 @@ export interface ProofEmittedEv {
 
 export type InspectorEvent =
   | SchemaSnapshotEv
-  | MerkSnapshotEv
   | ConnectionEv
   | RequestEv
   | MerkUpdateEv
@@ -137,7 +117,6 @@ export type InspectorEvent =
 
 export const EVENT_KINDS: InspectorEvent["kind"][] = [
   "SchemaSnapshot",
-  "MerkSnapshot",
   "Connection",
   "Request",
   "MerkUpdate",

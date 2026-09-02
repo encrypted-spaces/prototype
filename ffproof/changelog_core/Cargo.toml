@@ -18,14 +18,14 @@ serde_json = { workspace = true }
 
 merk = { workspace = true }
 
-# Tracer dependencies for create_trace re-export
-ffproof-tracer = { path = "../tracer" }
+# Backend selection + the shared trace seam (WriteOp / TraceReplayer / ReadOp)
 ffproof-tracer-shared = { path = "../tracer/shared" }
 
 # Storage encoding for key construction (users_row_key, etc.)
 encrypted-spaces-storage-encoding = { workspace = true }
 
 [features]
+avl = ["ffproof-tracer-shared/avl"]
 bench-timing = []
 
 [dev-dependencies]

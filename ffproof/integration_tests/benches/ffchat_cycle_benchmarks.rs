@@ -26,6 +26,7 @@ use encrypted_spaces_changelog_core::changelog::{initial_clc_state, ChangeLog};
 use encrypted_spaces_sdk::schema::ApplicationSchema;
 use encrypted_spaces_sdk::{File, List, Space, TextArea};
 use ff_common::SharedStateTransport;
+use merk::Backend as _;
 use rand::seq::SliceRandom;
 use rand::Rng;
 use rand::SeedableRng;
@@ -250,7 +251,7 @@ async fn init_chat_state_and_space() -> (Arc<Mutex<SpaceState>>, Space) {
     let mut state = SpaceState::init_server(None, Some(init_cfg), Some(1_000_000_000))
         .await
         .expect("init_server");
-    state.tree_snapshot = state.db.snapshot();
+    state.tree_snapshot = state.db.checkpoint();
     let app_root = state.db.root_hash();
 
     let state = Arc::new(Mutex::new(state));
@@ -274,7 +275,7 @@ async fn reset_to_prepopulated_baseline(
         state.changelog = ChangeLog::new(&current_root);
         state.change_responses.clear();
         state.ff_proof = None;
-        state.tree_snapshot = state.db.snapshot();
+        state.tree_snapshot = state.db.checkpoint();
         // Mirror `reinitialize_changelog`: clear the per-user sigref view
         // alongside the changelog reset, for symmetry with the production
         // path and to keep this baseline reset future-proof.
@@ -290,7 +291,7 @@ async fn reset_to_prepopulated_baseline(
                 .tree_snapshot
                 .as_ref()
                 .expect("tree_snapshot after prepopulation reset")
-                .hash(),
+                .root_hash(),
             current_root
         );
 

@@ -1,11 +1,11 @@
 use crate::common::FFProof;
 use encrypted_spaces_changelog_core::changelog::{
-    verify_op_sequence_flat, ChangeLog, ChangeResponse, ChangelogEntry, ChangelogError,
-    FastForwardRange, FlatEntryBytes,
+    verify_op_sequence_flat, ChangeLog, ChangeResponse, ChangelogEntry, FastForwardRange,
+    FlatEntryBytes,
 };
-use encrypted_spaces_changelog_core::ops::dispatch_extract_and_validate;
-use encrypted_spaces_changelog_core::{create_trace, encode_pruned_compact, InputStep, TraceStep};
+use encrypted_spaces_changelog_core::HandleReader;
 use encrypted_spaces_ffproof_methods::{EXTEND_FF_ELF, EXTEND_FF_ID};
+use ffproof_tracer_shared::{TraceRecorder, TraceWriter, Tree};
 use risc0_zkvm::{default_prover, ExecutorEnv, ProverOpts, SessionStats};
 
 fn flatten_entry_bytes(entries: &[ChangelogEntry]) -> (Vec<u32>, Vec<u8>) {
@@ -26,205 +26,46 @@ fn flatten_entry_bytes(entries: &[ChangelogEntry]) -> (Vec<u32>, Vec<u8>) {
 
 // TODO: make sure errors are handled without panic
 
-/// Apply the write overlay to a range scan result from the snapshot.
+/// Build the FF chunk witness from the changelog entries starting at
+/// `start_idx`.
 ///
-/// Merges overlay entries that fall within `[start, end)` into `snapshot_results`:
-/// - Overlay `Some(value)` → upsert the key
-/// - Overlay `None` (deleted) → remove the key
-///
-/// Returns the merged results sorted by key.
-fn apply_overlay_to_range(
-    mut snapshot_results: Vec<(Vec<u8>, Vec<u8>)>,
-    overlay: &std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>,
-    start: &[u8],
-    end: Option<&[u8]>,
-) -> Vec<(Vec<u8>, Vec<u8>)> {
-    // Collect overlay entries in range
-    for (key, value) in overlay.range::<Vec<u8>, _>(start.to_vec()..) {
-        if let Some(e) = end {
-            if key.as_slice() >= e {
-                break;
-            }
-        }
-        match value {
-            Some(v) => {
-                // Upsert: remove any existing snapshot entry for this key, then add
-                snapshot_results.retain(|(k, _)| k != key);
-                snapshot_results.push((key.clone(), v.clone()));
-            }
-            None => {
-                // Deleted in overlay: remove from results
-                snapshot_results.retain(|(k, _)| k != key);
-            }
-        }
-    }
-    snapshot_results.sort_by(|(a, _), (b, _)| a.cmp(b));
-    snapshot_results
-}
-
-/// Extract `InputStep`s from the changelog entries starting at `start_idx`.
-///
-/// This function runs each op's `extract_and_validate` with a
-/// `ProverReader` that resolves reads against the tree snapshot, then emits
-/// `InputStep::Read` and `InputStep::Write` entries in the correct order.
-/// The resulting steps are fed to `create_trace` which re-resolves them to
-/// build the proof.
-///
-/// A lightweight write overlay (`BTreeMap`) accumulates `Put`/`Delete`
-/// writes from earlier ops so that later ops' key reads can see them
-/// ("read your own writes").  For example, a `CreateSpaceOp` that
-/// inserts a user row will be visible to a subsequent `InsertOp`'s
-/// user-existence check in the same batch.  Prefix and range reads
-/// fall through to the immutable snapshot only.
-/// Note that reads in an op cannot read earlier writes _in the same
-/// op_ (see changelog_core/src/ops/mod.rs).  This only enables reads
-/// between separate ops.
-///
-/// # Arguments
-/// * `changelog` - The changelog containing the hash chain entries
-/// * `_change_responses` - The change responses for the same changelog range
-/// * `start_idx` - The starting index (inclusive)
-/// * `tree_snapshot` - The merk tree snapshot to resolve reads against
-///
-/// # Returns
-/// * `Ok(Vec<InputStep>)` - The collected input steps from all entries in the range
-/// * `Err(String)` - An error message if deserialization or extraction fails
-pub fn extract_input_steps(
+/// Each op runs against a `TraceRecorder` handle over the tree snapshot. The
+/// op returns writes, and this seam applies those writes to the recorder
+/// between entries so later ops can read earlier writes through the same
+/// traced handle ("read your own writes" — the recorder is the overlay).
+/// Reads within an op cannot see that op's own writes, matching the verifier.
+pub fn extract_trace_bytes(
     changelog: &ChangeLog,
-    _change_responses: &[ChangeResponse],
     start_idx: usize,
-    tree_snapshot: &merk::Node,
-) -> Result<Vec<InputStep>, String> {
+    tree_snapshot: &Tree,
+) -> Result<Vec<u8>, String> {
     use encrypted_spaces_changelog_core::changelog::ChangelogEntry;
-    use encrypted_spaces_changelog_core::ops::{OpContext, ProverReader};
-    use ffproof_tracer_shared::{collect_range, prefix_successor, BatchOp, ProvenRead, ReadOp};
-    use merk::GetResult;
+    use encrypted_spaces_changelog_core::ops::{dispatch_extract_and_validate, OpContext};
 
     let end_idx = changelog.num_changes() as usize;
-    let mut input_steps: Vec<InputStep> = Vec::new();
-
-    // Write overlay: accumulates Put/Delete writes from earlier ops so that
-    // later ops can read them without cloning or mutating the tree snapshot.
-    // Key lookups check the overlay first; prefix/range reads merge overlay
-    // entries with snapshot results.
-    //
-    // Overlay values:
-    //   Some(value)  – Put: key exists with this value
-    //   None         – Delete: key was removed
-    let mut write_overlay: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>> =
-        std::collections::BTreeMap::new();
+    let mut recorder = TraceRecorder::new(tree_snapshot);
     let mut ctx = OpContext::for_change_sequence();
 
     for i in start_idx..end_idx {
-        // Parse the ChangelogEntry to determine op type
         let entry = ChangelogEntry::from_bytes(&changelog.changes[i].as_bytes())
             .map_err(|e| format!("Failed to parse changelog entry {i}: {e:?}"))?;
-
-        // Build a resolver that checks the write overlay first, then the snapshot.
-        let resolver = |op: &ReadOp| -> Result<ProvenRead, ChangelogError> {
-            let proven = match op {
-                ReadOp::Key(key) => {
-                    // Check overlay first
-                    let results = if let Some(entry) = write_overlay.get(key.as_slice()) {
-                        match entry {
-                            Some(value) => vec![(key.clone(), value.clone())],
-                            None => vec![], // deleted
-                        }
-                    } else {
-                        // Fall through to snapshot
-                        let result = tree_snapshot.get_value(key).map_err(|e| {
-                            ChangelogError::Generic(format!(
-                                "Tree read failed for key {}: {e:?}",
-                                hex::encode(key)
-                            ))
-                        })?;
-                        match result {
-                            GetResult::Found(value) => vec![(key.clone(), value)],
-                            GetResult::NotFound => vec![],
-                            GetResult::Pruned => {
-                                return Err(ChangelogError::Generic(format!(
-                                    "Pruned node encountered for key {}",
-                                    hex::encode(key)
-                                )));
-                            }
-                        }
-                    };
-                    ProvenRead {
-                        op: op.clone(),
-                        results,
-                    }
-                }
-                ReadOp::Prefix(prefix) => {
-                    let end = prefix_successor(prefix);
-                    let results = apply_overlay_to_range(
-                        collect_range(tree_snapshot, prefix, end.as_deref()),
-                        &write_overlay,
-                        prefix,
-                        end.as_deref(),
-                    );
-                    ProvenRead {
-                        op: op.clone(),
-                        results,
-                    }
-                }
-                ReadOp::Range { start, end } => {
-                    let results = apply_overlay_to_range(
-                        collect_range(tree_snapshot, start, Some(end.as_slice())),
-                        &write_overlay,
-                        start,
-                        Some(end.as_slice()),
-                    );
-                    ProvenRead {
-                        op: op.clone(),
-                        results,
-                    }
-                }
-            };
-            Ok(proven)
-        };
-
         ctx.begin_change(i + 1);
 
-        // Run extract_and_validate with a ProverReader backed by real tree data.
-        let mut reader = ProverReader::new(resolver);
-        let op_result = dispatch_extract_and_validate(&entry, &mut reader, &ctx)
-            .map_err(|e| format!("Op validation failed at entry {i}: {e}"))?;
-
-        // Emit reads first (discovered by the ProverReader), then writes
-        for read_op in reader.logged_reads {
-            input_steps.push(InputStep::Read(vec![read_op]));
-        }
-
-        for write_step in op_result.write_steps {
-            match write_step {
-                TraceStep::Write(ops) => {
-                    // Add Put/Delete writes to the overlay for future ops to read.
-                    let mut resolved_ops = Vec::with_capacity(ops.len());
-                    for op in &ops {
-                        match op {
-                            BatchOp::Put { key, value } => {
-                                write_overlay.insert(key.clone(), Some(value.clone()));
-                                resolved_ops.push(op.clone());
-                            }
-                            BatchOp::Delete { key } => {
-                                write_overlay.insert(key.clone(), None);
-                                resolved_ops.push(op.clone());
-                            }
-                        }
-                    }
-                    input_steps.push(InputStep::Write(resolved_ops));
-                }
-                other => {
-                    return Err(format!(
-                        "Op at entry {i} returned a non-Write step in write_steps: {other:?}"
-                    ));
-                }
-            }
-        }
+        let writes = {
+            let mut reader = HandleReader(&mut recorder);
+            dispatch_extract_and_validate(&entry, &mut reader, &ctx)
+                .map_err(|e| format!("Op validation failed at entry {i}: {e}"))?
+                .write_steps
+        };
+        recorder
+            .apply(&writes)
+            .map_err(|e| format!("Trace apply failed at entry {i}: {e:?}"))?;
         ctx.finish_change(entry.message.op_type);
     }
 
-    Ok(input_steps)
+    recorder
+        .finalize_trace()
+        .map_err(|e| format!("finalize_trace failed: {e:?}"))
 }
 
 /// Generate a FF proof for changes starting at `start_idx` in the changelog.
@@ -251,7 +92,7 @@ pub fn prove_ff_chunk(
     changelog: &ChangeLog,
     change_responses: &[ChangeResponse],
     start_idx: usize,
-    // Compact witness bytes from `encode_pruned_compact`.
+    // Trace witness bytes from `TraceRecorder::finalize_trace`.
     pruned_tree_bytes: Vec<u8>,
 ) -> (FFProof, SessionStats) {
     // Production always uses the real guest image id. The `self_image_id`
@@ -273,7 +114,7 @@ fn prove_ff_chunk_with_image_id(
     changelog: &ChangeLog,
     change_responses: &[ChangeResponse],
     start_idx: usize,
-    // Compact witness bytes from `encode_pruned_compact`.
+    // Trace witness bytes from `TraceRecorder::finalize_trace`.
     pruned_tree_bytes: Vec<u8>,
     // Image id the guest commits to its journal and (for extension chunks)
     // verifies the previous proof against. Always `EXTEND_FF_ID` in
@@ -519,7 +360,7 @@ pub fn update_changelog_proof(
     changelog: &mut ChangeLog,
     change_responses: &[ChangeResponse],
     previous_proof: Option<&FFProof>,
-    tree_snapshot: &merk::Node,
+    tree_snapshot: &Tree,
 ) -> Result<(), String> {
     let start_idx = changelog.proven_up_to;
 
@@ -528,13 +369,10 @@ pub fn update_changelog_proof(
         return Ok(());
     }
 
-    let steps = match extract_input_steps(changelog, change_responses, start_idx, tree_snapshot) {
-        Ok(result) => result,
-        Err(e) => return Err(format!("failed to extract input steps: {e}")),
+    let pruned_tree_bytes = match extract_trace_bytes(changelog, start_idx, tree_snapshot) {
+        Ok(bytes) => bytes,
+        Err(e) => return Err(format!("failed to extract trace witness: {e}")),
     };
-
-    let tracer_proof = create_trace(tree_snapshot, &steps);
-    let pruned_tree_bytes = encode_pruned_compact(&tracer_proof.pruned_tree);
     let (proof, _stats) = prove_ff_chunk(
         previous_proof,
         changelog,
@@ -554,6 +392,7 @@ mod tests {
     use super::*;
     use crate::verifier::verify_ff_internal;
     use encrypted_spaces_changelog_test_utils::{TestServer, TEST_CLIENT_UID};
+    use merk::Backend as _;
     use serial_test::serial;
     use temp_env;
 
@@ -573,15 +412,8 @@ mod tests {
 
     fn extract_and_trace(server: &TestServer, start_idx: usize) -> TraceResult {
         let tree_snapshot = server.tree_snapshot().expect("Tree snapshot should exist");
-        let steps = extract_input_steps(
-            server.changelog(),
-            server.responses(),
-            start_idx,
-            tree_snapshot,
-        )
-        .expect("Failed to extract input steps");
-        let tracer_proof = create_trace(tree_snapshot, &steps);
-        let pruned_tree_bytes = encode_pruned_compact(&tracer_proof.pruned_tree);
+        let pruned_tree_bytes = extract_trace_bytes(server.changelog(), start_idx, tree_snapshot)
+            .expect("Failed to extract trace witness");
         TraceResult { pruned_tree_bytes }
     }
 
@@ -714,7 +546,7 @@ mod tests {
                 // Take snapshot before adding more changes
                 println!(
                     "Tree snapshot hash before add_more_changes: {:?}",
-                    server.tree_snapshot().map(|t| hex::encode(t.hash()))
+                    server.tree_snapshot().map(|t| hex::encode(t.root_hash()))
                 );
 
                 server.add_more_changes(num_changes_per_batch).await;
@@ -730,7 +562,7 @@ mod tests {
                 let tree_snapshot = server.tree_snapshot().expect("Tree snapshot should exist");
                 println!(
                     "Using tree snapshot with hash: {}",
-                    hex::encode(tree_snapshot.hash())
+                    hex::encode(tree_snapshot.root_hash())
                 );
 
                 let tr = extract_and_trace(&server, start_idx);
@@ -1195,15 +1027,8 @@ mod tests {
         let tree_snapshot = server.tree_snapshot().expect("tree snapshot");
         let start_idx = 0usize;
 
-        let steps = extract_input_steps(
-            server.changelog(),
-            server.responses(),
-            start_idx,
-            tree_snapshot,
-        )
-        .expect("extract_input_steps");
-        let tracer_proof = create_trace(tree_snapshot, &steps);
-        let pruned_tree_bytes = encode_pruned_compact(&tracer_proof.pruned_tree);
+        let pruned_tree_bytes = extract_trace_bytes(server.changelog(), start_idx, tree_snapshot)
+            .expect("extract_trace_bytes");
 
         let tail = server.changelog().get_tail(start_idx);
         let mut entries: Vec<Vec<u8>> = tail.changes.iter().map(|e| e.as_bytes()).collect();

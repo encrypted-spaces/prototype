@@ -6,7 +6,7 @@ use super::{
     validate_user_access, OpContext, OpReader, OpVerifier, OpVerifyResult,
 };
 use crate::changelog::{ChangelogEntry, ChangelogError, OpType};
-use crate::{ReadOp, TraceStep};
+use crate::ReadOp;
 use encrypted_spaces_storage_encoding::keys::{column_key, KEY_HISTORY_TABLE, USERS_TABLE};
 /// Columns that a RefreshKeys operation is allowed to modify on `_users`.
 pub const REFRESH_KEYS_ALLOWED_COLUMNS: &[&str] = &["update_key", "auth_key", "status"];
@@ -213,10 +213,8 @@ impl OpVerifier for RefreshKeysOp {
             "refresh_keys",
         )?;
 
-        batch_ops.sort_by(|a, b| a.key().cmp(b.key()));
-
         Ok(OpVerifyResult {
-            write_steps: vec![TraceStep::Write(batch_ops)],
+            write_steps: batch_ops,
         })
     }
 }

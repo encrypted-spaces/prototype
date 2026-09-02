@@ -20,7 +20,7 @@ use encrypted_spaces_changelog_core::time::{
     validate_accepted_at_server_time_against_local_clock, validate_change_timestamp_at_acceptance,
     validate_timestamp_hwm, TIMESTAMP_HWM_TOLERANCE_SECONDS,
 };
-use encrypted_spaces_changelog_core::BatchOp;
+use encrypted_spaces_changelog_core::WriteOp;
 use encrypted_spaces_storage_encoding::{classify_insert_id, hashstore_hash, InsertId, HASH_LEN};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -116,7 +116,7 @@ pub(crate) struct CompletedChange {
     /// `None` when the entry was discharged via a fast-forward path (ragged
     /// apply or inclusion proof); in that case callers fall back to
     /// [`CompletedChange::ff_inserted_ids`] / a re-verified response.
-    pub(crate) sequential_writes: Option<Vec<BatchOp>>,
+    pub(crate) sequential_writes: Option<Vec<WriteOp>>,
     /// Row ids captured from ragged fast-forward application, keyed by entry
     /// signature. Empty for the sequential path.
     pub(crate) ff_inserted_ids: std::collections::BTreeMap<Vec<u8>, i64>,
@@ -125,7 +125,7 @@ pub(crate) struct CompletedChange {
 /// Internal carrier for the writes produced while discharging a pending
 /// change; folded into a [`CompletedChange`] by [`Space::submit_and_complete`].
 struct CompletionWrites {
-    sequential: Option<Vec<BatchOp>>,
+    sequential: Option<Vec<WriteOp>>,
     ff_inserted_ids: std::collections::BTreeMap<Vec<u8>, i64>,
 }
 
@@ -1471,12 +1471,12 @@ impl Space {
 
     /// Validate the pruned Merkle tree and apply the change response to client state.
     /// Returns `SdkError::FastForwardRequired` if the client is out-of-sync,
-    /// otherwise the per-op `BatchOp` writes from the verified proof.
+    /// otherwise the per-op `WriteOp` writes from the verified proof.
     pub fn validate_and_apply_change(
         &self,
         change: &Change,
         response: &ChangeResponse,
-    ) -> Result<Vec<BatchOp>> {
+    ) -> Result<Vec<WriteOp>> {
         let entry = &change.entry;
 
         // Read all state fields atomically in one lock to prevent races with
@@ -1584,12 +1584,13 @@ impl Space {
         // Reduce prunes retention keys — data encrypted with those keys
         // can no longer be decrypted. Skip the splice and let
         // apply_state_update reanchor (clear) the cache instead.
+        // `cache_update_from_writes` itself returns None when the write set
+        // contains a non-point op the cache cannot splice; both Nones flow to
+        // the same reanchor below.
         let cache_update = if entry.message.op_type == OpType::Reduce {
             None
         } else {
-            Some(crate::kv_cache::cache_update_from_writes(
-                change, &writes, &schemas,
-            ))
+            crate::kv_cache::cache_update_from_writes(change, &writes, &schemas)
         };
 
         self.apply_state_update(
@@ -1693,9 +1694,10 @@ impl Space {
                     state.kv_cache.advance_anchor(response.new_root, update);
                 }
                 None => {
-                    // Reduce and FF ragged-change replay pass None.
-                    // Reanchor (clear + set new root) so the cache doesn't
-                    // hold data anchored to the old commitment.
+                    // Reduce, FF ragged-change replay, and write sets with
+                    // non-point ops pass None. Reanchor (clear + set new
+                    // root) so the cache holds nothing the transition could
+                    // have invalidated.
                     state.kv_cache.reanchor(response.new_root);
                 }
             }
@@ -2404,7 +2406,7 @@ impl Space {
         // from advancing to an unverified state.
         let mut inserted_ids: std::collections::BTreeMap<Vec<u8>, i64> =
             std::collections::BTreeMap::new();
-        let mut ragged_cache_updates: Vec<(Change, Vec<BatchOp>)> = Vec::new();
+        let mut ragged_cache_updates: Vec<(Change, Vec<WriteOp>)> = Vec::new();
 
         for (change, response) in ff_data.changes.iter().zip(ff_data.responses.iter()) {
             let state_values = self.with_state(|state| {
@@ -2587,9 +2589,12 @@ impl Space {
                 let schemas = state.table_schemas.clone();
                 let current_dc = state.current_data_commitment;
                 for (change, writes) in &ragged_cache_updates {
-                    let update =
-                        crate::kv_cache::cache_update_from_writes(change, writes, &schemas);
-                    state.kv_cache.advance_anchor(current_dc, update);
+                    match crate::kv_cache::cache_update_from_writes(change, writes, &schemas) {
+                        Some(update) => state.kv_cache.advance_anchor(current_dc, update),
+                        // Non-point write op: unspliceable — clear rather
+                        // than retain entries the op may have invalidated.
+                        None => state.kv_cache.reanchor(current_dc),
+                    }
                 }
             });
         }

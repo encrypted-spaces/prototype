@@ -185,7 +185,7 @@ pub fn user_registration_query(uid: u32) -> Query {
 pub struct TestServer {
     state: SpaceState,
     /// Snapshot of the tree before changes were applied (needed for batch proof generation)
-    tree_snapshot: Option<merk::Node>,
+    tree_snapshot: Option<encrypted_spaces_backend::merk_storage::Tree>,
     /// The UID used for changelog entries in this test server
     user_uid: u32,
 }
@@ -197,13 +197,13 @@ impl TestServer {
     pub fn responses(&self) -> &Vec<ChangeResponse> {
         &self.state.change_responses
     }
-    pub fn tree_snapshot(&self) -> Option<&merk::Node> {
+    pub fn tree_snapshot(&self) -> Option<&encrypted_spaces_backend::merk_storage::Tree> {
         self.tree_snapshot.as_ref()
     }
     /// Update the tree snapshot to the current state of the database.
     /// Call this after proving a batch to prepare for the next batch.
     pub fn update_tree_snapshot(&mut self) {
-        self.tree_snapshot = self.state.db.snapshot();
+        self.tree_snapshot = self.state.db.checkpoint();
     }
     /// Creates a new ChangeLog with the specified number of test changes.
     ///
@@ -247,7 +247,7 @@ impl TestServer {
         let mut state = init_test_server_state(None, user_uids).await;
 
         // Take initial tree snapshot before any changes are made
-        let tree_snapshot = state.db.snapshot();
+        let tree_snapshot = state.db.checkpoint();
 
         let client_uid = user_uid;
         let auth1 = AuthContext::new(Some(client_uid as i64), SpaceId::from([0u8; 16]));
@@ -409,7 +409,7 @@ impl TestServer {
         assert!(!user_uids.is_empty(), "need at least one user");
 
         let mut state = init_test_server_state(None, user_uids).await;
-        let tree_snapshot = state.db.snapshot();
+        let tree_snapshot = state.db.checkpoint();
 
         // Track each user's last change_id for sigref
         let mut user_last_change: HashMap<u32, u32> = HashMap::new();

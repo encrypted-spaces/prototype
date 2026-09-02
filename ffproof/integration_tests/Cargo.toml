@@ -36,6 +36,15 @@ risc0-zkvm = { workspace = true, features = ["client"] }
 encrypted-spaces-ffproof-methods-bench = { path = "../methods_bench" }
 
 [features]
+avl = [
+    "encrypted-spaces-ffproof/avl",
+    "encrypted-spaces-backend/avl",
+    "encrypted-spaces-backend-server/avl",
+    "encrypted-spaces-changelog-core/avl",
+    "encrypted-spaces-changelog-test-utils/avl",
+    "encrypted-spaces-ffproof-methods-bench/avl",
+    "encrypted-spaces-sdk/avl",
+]
 # Passthrough features so the wall-clock bench can be invoked as:
 #   cargo bench -p encrypted-spaces-ff-test --features real-proofs,cuda
 real-proofs = ["encrypted-spaces-ffproof/real-proofs"]

@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use encrypted_spaces_backend::merk_storage::{parse_key, ParsedKey};
 use encrypted_spaces_backend::schema::Schema;
-use encrypted_spaces_changelog_core::{changelog::Change, prefix_successor, BatchOp};
+use encrypted_spaces_changelog_core::{changelog::Change, prefix_successor, WriteOp};
 use encrypted_spaces_storage_encoding::keys;
 
 use super::CacheUpdate;
@@ -13,7 +13,7 @@ use super::CacheUpdate;
 /// [`super::KvCache::advance_anchor`].
 ///
 /// A hash-backed column (`Text`/`Blob`) stores a 32-byte digest in its
-/// `BatchOp::Put`; the actual bytes live in `change.hashed_values`. We
+/// `WriteOp::Put`; the actual bytes live in `change.hashed_values`. We
 /// resolve those to the full value before splicing so the cache holds the
 /// same representation a SELECT proof yields and the decrypt path reads it
 /// back identically. A hash-backed write whose digest is absent from the
@@ -25,16 +25,24 @@ use super::CacheUpdate;
 /// tainted, the row's byte range `[row_key, prefix_successor)` is added to
 /// `coverage_extensions` so a later id-read hits the cache. Same shape for
 /// deletes: a delete naming every non-id column authenticates the absence.
+///
+/// Returns `None` when `writes` contain any non-point operation
+/// (`DeleteRange`/`DeletePrefix`/`MovePrefix`): the cache cannot splice
+/// those incrementally, and silently skipping them would retain entries the
+/// operation invalidated. Callers must treat `None` as "cannot splice" and
+/// [`reanchor`](super::KvCache::reanchor) (clear) instead. Today's p2 ops
+/// emit only point writes, so this is a fail-safe for future ops; full
+/// range/move splicing can replace it if the performance ever matters.
 pub fn cache_update_from_writes(
     change: &Change,
-    writes: &[BatchOp],
+    writes: &[WriteOp],
     schemas: &HashMap<String, Schema>,
-) -> CacheUpdate {
+) -> Option<CacheUpdate> {
     let mut update = CacheUpdate::new();
     let mut tainted_rows: BTreeSet<(String, i64)> = BTreeSet::new();
     for op in writes {
         match op {
-            BatchOp::Put { key, value } => match resolve_put_value(key, value, schemas, change) {
+            WriteOp::Put { key, value } => match resolve_put_value(key, value, schemas, change) {
                 Some(bytes) => update.put(key.clone(), bytes),
                 None => {
                     if let Ok(ParsedKey::Column { table, row_id, .. }) = parse_key(key) {
@@ -42,7 +50,10 @@ pub fn cache_update_from_writes(
                     }
                 }
             },
-            BatchOp::Delete { key } => update.delete(key.clone()),
+            WriteOp::Delete { key } => update.delete(key.clone()),
+            WriteOp::DeleteRange { .. }
+            | WriteOp::DeletePrefix { .. }
+            | WriteOp::MovePrefix { .. } => return None,
         }
     }
     for range in full_row_coverage(writes, schemas, /* deletes = */ false, &tainted_rows) {
@@ -51,7 +62,7 @@ pub fn cache_update_from_writes(
     for range in full_row_coverage(writes, schemas, /* deletes = */ true, &tainted_rows) {
         update.extend_coverage(range.0, range.1);
     }
-    update
+    Some(update)
 }
 
 /// Resolve a `Put`'s stored bytes to the value the cache should hold.
@@ -95,7 +106,7 @@ fn resolve_put_value(
 /// absence). Rows in `tainted` (a hash-backed value couldn't be resolved)
 /// are skipped so we never claim coverage over an incomplete row.
 fn full_row_coverage(
-    writes: &[BatchOp],
+    writes: &[WriteOp],
     schemas: &HashMap<String, Schema>,
     deletes: bool,
     tainted: &BTreeSet<(String, i64)>,
@@ -104,8 +115,8 @@ fn full_row_coverage(
     let mut per_row: BTreeMap<(String, i64), BTreeSet<String>> = BTreeMap::new();
     for op in writes {
         let key = match (op, deletes) {
-            (BatchOp::Put { key, .. }, false) => key,
-            (BatchOp::Delete { key }, true) => key,
+            (WriteOp::Put { key, .. }, false) => key,
+            (WriteOp::Delete { key }, true) => key,
             _ => continue,
         };
         if let Ok(ParsedKey::Column {
@@ -144,7 +155,7 @@ fn full_row_coverage(
 
 /// Last new-row id touching `table` in `writes`. A row counts as new when its
 /// puts cover every non-id column declared in `schema`.
-pub fn new_row_id_for_table(writes: &[BatchOp], table: &str, schema: &Schema) -> Option<i64> {
+pub fn new_row_id_for_table(writes: &[WriteOp], table: &str, schema: &Schema) -> Option<i64> {
     let schema_non_id_cols: BTreeSet<String> = schema
         .columns
         .iter()
@@ -158,7 +169,7 @@ pub fn new_row_id_for_table(writes: &[BatchOp], table: &str, schema: &Schema) ->
     let mut per_row: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
     for op in writes {
         let key = match op {
-            BatchOp::Put { key, .. } => key,
+            WriteOp::Put { key, .. } => key,
             _ => continue,
         };
         if let Ok(ParsedKey::Column {
@@ -248,17 +259,18 @@ mod tests {
         let change = change_with_sidecar(sidecar);
 
         let writes = vec![
-            BatchOp::Put {
+            WriteOp::Put {
                 key: keys::column_key("t", 7, "small"),
                 value: vec![1, 2, 3],
             },
-            BatchOp::Put {
+            WriteOp::Put {
                 key: keys::column_key("t", 7, "large"),
                 value: [0xAB; 32].to_vec(),
             },
         ];
 
-        let update = cache_update_from_writes(&change, &writes, &schemas);
+        let update = cache_update_from_writes(&change, &writes, &schemas)
+            .expect("point-only writes must be spliceable");
 
         assert_eq!(update.writes.len(), 2);
         assert_eq!(update.coverage_extensions.len(), 1);
@@ -275,22 +287,55 @@ mod tests {
         let change = change_with_sidecar(HashedValues::new());
 
         let writes = vec![
-            BatchOp::Put {
+            WriteOp::Put {
                 key: keys::column_key("t", 7, "small"),
                 value: vec![1, 2, 3],
             },
-            BatchOp::Put {
+            WriteOp::Put {
                 key: keys::column_key("t", 7, "large"),
                 value: [0xAB; 32].to_vec(),
             },
         ];
 
-        let update = cache_update_from_writes(&change, &writes, &schemas);
+        let update = cache_update_from_writes(&change, &writes, &schemas)
+            .expect("point-only writes must be spliceable");
 
         assert_eq!(update.writes.len(), 1, "only the resolvable Put is spliced");
         assert!(
             update.coverage_extensions.is_empty(),
             "tainted row must not receive a coverage extension"
         );
+    }
+
+    /// Any non-point write op makes the batch unspliceable: the helper must
+    /// return `None` so callers reanchor (clear) instead of silently
+    /// retaining entries the operation may have invalidated.
+    #[test]
+    fn non_point_write_ops_force_reanchor() {
+        let schemas = HashMap::new();
+        let change = change_with_sidecar(HashedValues::new());
+        let point = WriteOp::Put {
+            key: keys::column_key("t", 1, "c"),
+            value: b"v".to_vec(),
+        };
+        for non_point in [
+            WriteOp::DeleteRange {
+                start: b"a".to_vec(),
+                end: b"z".to_vec(),
+            },
+            WriteOp::DeletePrefix {
+                prefix: b"a".to_vec(),
+            },
+            WriteOp::MovePrefix {
+                from: b"a".to_vec(),
+                to: b"b".to_vec(),
+            },
+        ] {
+            let writes = vec![point.clone(), non_point.clone()];
+            assert!(
+                cache_update_from_writes(&change, &writes, &schemas).is_none(),
+                "batch containing {non_point:?} must be unspliceable"
+            );
+        }
     }
 }

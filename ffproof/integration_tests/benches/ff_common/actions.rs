@@ -166,7 +166,7 @@ async fn init_action_state_and_space() -> (Arc<Mutex<SpaceState>>, Space) {
         .reinitialize_changelog()
         .await
         .expect("reinitialize_changelog");
-    state_raw.tree_snapshot = state_raw.db.snapshot();
+    state_raw.tree_snapshot = state_raw.db.checkpoint();
     let app_root = state_raw.db.root_hash();
 
     let state = Arc::new(Mutex::new(state_raw));

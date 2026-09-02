@@ -113,11 +113,11 @@ pub struct KvData {
 }
 
 impl KvData {
-    /// Convert to the matching `BatchOp` for tracer proof steps.
+    /// Convert to the matching `WriteOp` for tracer proof steps.
     /// Uses the provided `key` (which may differ from `self.key` for
     /// insert ops where the proof key has the real row_id).
-    pub fn to_batch_op(&self, key: &[u8]) -> crate::BatchOp {
-        crate::BatchOp::Put {
+    pub fn to_batch_op(&self, key: &[u8]) -> crate::WriteOp {
+        crate::WriteOp::Put {
             key: key.to_vec(),
             value: self.value.clone(),
         }
@@ -431,7 +431,11 @@ pub struct ChangeLog {
     ff_inclusion_proof_cache: Option<ProofCache>,
 }
 
-/// A serialized pruned Merk tree plus the roots it advances between.
+/// A per-change merk trace witness (opaque bytes from
+/// `TraceRecorder::finalize_trace`) plus the roots it advances between.
+/// The struct and field names predate the trace model — they carried a
+/// serialized pruned Merk tree — and are kept for serialized-state and
+/// call-site continuity.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PrunedMerkleTreeTriple {
     pruned_merkle_tree: Vec<u8>,
@@ -679,63 +683,43 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-struct PrunedTreeReader<'a> {
-    tree: &'a merk::Node,
-}
+use crate::{TraceReader, TraceWriter};
 
-impl<'a> PrunedTreeReader<'a> {
-    fn new(tree: &'a merk::Node) -> Self {
-        Self { tree }
-    }
-}
+/// Adapts a merk traced handle (`TraceRecorder` on the prove side,
+/// `TraceReplayer` on verify) into an [`OpReader`](crate::ops::OpReader),
+/// translating each `ReadOp` to the handle's `get`/`get_prefix`/`get_range`.
+///
+/// Reads are answered by the handle (on verify, authenticated against the
+/// trace witness). Writes are not applied here — the seam applies the op's
+/// returned `Vec<WriteOp>` to the same handle afterwards, so reads never
+/// observe the op's own writes.
+///
+/// Holds no state of its own: the underlying handle records its own read-set
+/// (`TraceRecorder::reads()`), so callers that need the read list read it from
+/// the handle after running the op rather than from this adapter. The single
+/// prove/verify/storage seam across crates uses this one type.
+pub struct HandleReader<'a>(pub &'a mut dyn TraceReader);
 
-impl crate::ops::OpReader for PrunedTreeReader<'_> {
+impl crate::ops::OpReader for HandleReader<'_> {
     fn read(&mut self, op: crate::ReadOp) -> Result<crate::ProvenRead, ChangelogError> {
-        read_from_pruned_tree(self.tree, op)
+        let results = match &op {
+            crate::ReadOp::Key(key) => self
+                .0
+                .get(key)
+                .map_err(merk_read_err)?
+                .map(|value| vec![(key.clone(), value)])
+                .unwrap_or_default(),
+            crate::ReadOp::Prefix(prefix) => self.0.get_prefix(prefix).map_err(merk_read_err)?,
+            crate::ReadOp::Range { start, end } => {
+                self.0.get_range(start, end).map_err(merk_read_err)?
+            }
+        };
+        Ok(crate::ProvenRead { op, results })
     }
 }
 
-fn read_from_pruned_tree(
-    tree: &merk::Node,
-    op: crate::ReadOp,
-) -> Result<crate::ProvenRead, ChangelogError> {
-    let results = match &op {
-        crate::ReadOp::Key(key) => match ffproof_tracer_shared::lookup_value_verified(tree, key) {
-            merk::GetResult::Found(value) => vec![(key.clone(), value)],
-            merk::GetResult::NotFound => vec![],
-            merk::GetResult::Pruned => {
-                return Err(ChangelogError::Generic(format!(
-                    "verify_proof: pruned tree witness is missing key {}",
-                    hex::encode(key)
-                )));
-            }
-        },
-        crate::ReadOp::Prefix(prefix) => {
-            let end = crate::prefix_successor(prefix);
-            crate::collect_range(tree, prefix, end.as_deref())
-        }
-        crate::ReadOp::Range { start, end } => {
-            crate::collect_range(tree, start, Some(end.as_slice()))
-        }
-    };
-    Ok(crate::ProvenRead { op, results })
-}
-
-fn flatten_write_steps(
-    result: crate::ops::OpVerifyResult,
-) -> Result<Vec<crate::BatchOp>, ChangelogError> {
-    let mut writes = Vec::new();
-    for step in result.write_steps {
-        match step {
-            crate::TraceStep::Write(ops) => writes.extend(ops),
-            crate::TraceStep::Read(_) => {
-                return Err(ChangelogError::Generic(
-                    "verify_proof: extract_and_validate emitted a Read in write_steps".to_string(),
-                ));
-            }
-        }
-    }
-    Ok(writes)
+fn merk_read_err(e: merk::Error) -> ChangelogError {
+    ChangelogError::Generic(format!("verify_proof: trace read failed: {e}"))
 }
 
 impl ChangeLog {
@@ -899,17 +883,18 @@ impl ChangeLog {
         self.current_clc_state().root.into()
     }
 
-    /// Verify root progression + pruned tree witness for a single change by
-    /// re-running the op-specific `extract_and_validate` directly against
-    /// the witness, then applying E&V's writes and checking the resulting
-    /// root. Returns the per-op batch the server applied.
+    /// Verify root progression + trace witness for a single change by
+    /// re-running the op-specific `extract_and_validate` against a
+    /// [`crate::TraceReplayer`] (reads authenticated against the witness),
+    /// then applying the op's returned writes to the replayer and checking the
+    /// resulting root. Returns the per-op batch the server applied.
     pub fn verify_proof_and_validate(
         change: &ChangelogEntry,
         pruned_merkle_tree: &[u8],
         old_root: &[u8; 32],
         new_root: &[u8; 32],
         current_change_id: usize,
-    ) -> Result<Vec<crate::BatchOp>, ChangelogError> {
+    ) -> Result<Vec<crate::WriteOp>, ChangelogError> {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             Self::verify_proof_and_validate_inner(
                 change,
@@ -921,7 +906,7 @@ impl ChangeLog {
         }))
         .map_err(|payload| {
             ChangelogError::Generic(format!(
-                "verify_proof: pruned tree witness verification panicked: {}",
+                "verify_proof: trace witness verification panicked: {}",
                 panic_payload_to_string(payload)
             ))
         })?
@@ -929,18 +914,11 @@ impl ChangeLog {
 
     fn verify_proof_and_validate_inner(
         change: &ChangelogEntry,
-        pruned_merkle_tree: &[u8],
+        trace_bytes: &[u8],
         old_root: &[u8; 32],
         new_root: &[u8; 32],
         current_change_id: usize,
-    ) -> Result<Vec<crate::BatchOp>, ChangelogError> {
-        let pruned_tree = postcard::from_bytes::<crate::PrunedMerkleTree>(pruned_merkle_tree)
-            .map_err(|e| {
-                ChangelogError::Generic(format!(
-                    "verify_proof: pruned tree proof deserialize failed: {e}"
-                ))
-            })?;
-
+    ) -> Result<Vec<crate::WriteOp>, ChangelogError> {
         if !validate_parent_change(change.parent_change, current_change_id) {
             return Err(ChangelogError::Generic(format!(
                 "verify_proof: invalid parent_change={} for current_change_id={current_change_id}",
@@ -948,30 +926,28 @@ impl ChangeLog {
             )));
         }
 
-        let mut tree = crate::pruned_to_merk(pruned_tree).ok_or_else(|| {
-            ChangelogError::Generic("verify_proof: pruned tree witness is empty".to_string())
-        })?;
-        tree.commit();
+        // Decode the witness and authenticate it against the expected start root.
+        let mut replayer =
+            crate::TraceReplayer::new_verified(trace_bytes, *old_root).map_err(|e| {
+                ChangelogError::Generic(format!(
+                    "verify_proof: trace decode / start-root authentication failed: {e}"
+                ))
+            })?;
 
-        if tree.hash() != *old_root {
-            return Err(ChangelogError::Generic(
-                "verify_proof: start root mismatch".to_string(),
-            ));
-        }
-
-        let mut reader = PrunedTreeReader::new(&tree);
+        // Re-run the op against the authenticated handle (reads only), then apply
+        // the op's returned writes to the same replayer and check the end root.
         let ctx = crate::ops::OpContext::for_change_id(current_change_id);
-        let op_result = crate::ops::dispatch_extract_and_validate(change, &mut reader, &ctx)?;
-        let writes = flatten_write_steps(op_result)?;
-
-        let mut maybe_tree = crate::apply_batch(Some(tree), &writes, merk::PanicSource {});
-        let computed_end = match maybe_tree.as_mut() {
-            Some(tree) => {
-                tree.commit();
-                tree.hash()
-            }
-            None => [0u8; 32],
+        let writes = {
+            let mut reader = HandleReader(&mut replayer);
+            crate::ops::dispatch_extract_and_validate(change, &mut reader, &ctx)?.write_steps
         };
+        replayer.apply(&writes).map_err(|e| {
+            ChangelogError::Generic(format!("verify_proof: applying writes failed: {e}"))
+        })?;
+
+        let computed_end = replayer.root_hash().map_err(|e| {
+            ChangelogError::Generic(format!("verify_proof: end root_hash failed: {e}"))
+        })?;
         if computed_end != *new_root {
             return Err(ChangelogError::Generic(
                 "verify_proof: end root mismatch".to_string(),
@@ -1397,7 +1373,9 @@ pub fn check_sigref_continuity(
 /// # Arguments
 /// * `entries` - Serialized `ChangelogEntry` bytes, one per change in the chunk
 /// * `range` - The FastForwardRange identifying the range of changes
-/// * `pruned_tree_bytes` - Postcard-serialized `PrunedMerkleTree` covering all changes
+/// * `pruned_tree_bytes` - the trace witness bytes (from
+///   `TraceRecorder::finalize_trace`) covering all changes, consumed by
+///   `TraceReplayer::new_verified`
 /// * `start_change_id` - The absolute change ID of the first change in this batch
 ///   (0 for the first proof, `previous_io.end_change_id` for subsequent proofs)
 /// * `sigref_map` - Per-user sigref state, threaded across recursive chunks
@@ -1435,11 +1413,10 @@ pub fn verify_op_sequence(
 #[derive(Default, serde::Serialize, serde::Deserialize, Debug)]
 pub struct VerificationLoopTimings {
     pub value_cache_check_cycles: u64,
+    /// Witness decode + start-root authentication, one step in the merk
+    /// trace model (`TraceReplayer::new_verified`). The old decode / rebuild
+    /// / commit / root-check phases no longer exist as separate stages.
     pub pruned_tree_cycles: u64,
-    pub pruned_tree_decode_cycles: u64,
-    pub pruned_tree_rebuild_cycles: u64,
-    pub pruned_tree_commit_cycles: u64,
-    pub pruned_tree_root_check_cycles: u64,
     pub entry_decode_cycles: u64,
     pub sigref_parent_cycles: u64,
     pub extract_validate_cycles: u64,
@@ -1448,7 +1425,6 @@ pub struct VerificationLoopTimings {
     pub reader_read_key_ops: u64,
     pub reader_read_range_ops: u64,
     pub reader_read_prefix_ops: u64,
-    pub write_prepare_cycles: u64,
     pub overlay_apply_cycles: u64,
     pub normalize_cycles: u64,
     pub final_replay_cycles: u64,
@@ -1477,7 +1453,7 @@ pub struct FastForwardJournal {
 
 #[cfg(feature = "bench-timing")]
 struct TimedPrunedTreeReader<'a> {
-    inner: PrunedTreeReader<'a>,
+    inner: HandleReader<'a>,
     cycle_count: fn() -> u64,
     read_cycles: u64,
     read_ops: u64,
@@ -1488,9 +1464,9 @@ struct TimedPrunedTreeReader<'a> {
 
 #[cfg(feature = "bench-timing")]
 impl<'a> TimedPrunedTreeReader<'a> {
-    fn new(tree: &'a merk::Node, cycle_count: fn() -> u64) -> Self {
+    fn new(replayer: &'a mut crate::TraceReplayer, cycle_count: fn() -> u64) -> Self {
         Self {
-            inner: PrunedTreeReader::new(tree),
+            inner: HandleReader(replayer),
             cycle_count,
             read_cycles: 0,
             read_ops: 0,
@@ -1529,8 +1505,8 @@ impl crate::ops::OpReader for TimedPrunedTreeReader<'_> {
 #[cfg(feature = "bench-timing")]
 /// Verify a sequence while collecting cycle timings.
 ///
-/// `pruned_tree_bytes` must be encoded with `encode_pruned_compact`; the
-/// non-flat pure verifier keeps using postcard-encoded `PrunedMerkleTree` bytes.
+/// `pruned_tree_bytes` is the trace witness from `TraceRecorder::finalize_trace`,
+/// consumed by `TraceReplayer::new_verified`.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_op_sequence_timed(
     entries: &[Vec<u8>],
@@ -1827,7 +1803,7 @@ fn verify_op_sequence_inner(
     verify_op_sequence_with_tree(
         entries,
         range,
-        decode_postcard_pruned_tree(pruned_tree_bytes),
+        pruned_tree_bytes,
         start_change_id,
         sigref_map,
         recent_roots,
@@ -1835,46 +1811,32 @@ fn verify_op_sequence_inner(
     )
 }
 
-fn decode_postcard_pruned_tree(pruned_tree_bytes: &[u8]) -> Option<merk::Node> {
-    let pruned_tree: crate::PrunedMerkleTree = match postcard::from_bytes(pruned_tree_bytes) {
-        Ok(p) => p,
-        Err(e) => {
-            println!("Failed to deserialize pruned tree: {:?}", e);
-            return None;
-        }
-    };
-
-    match crate::pruned_to_merk(pruned_tree) {
-        Some(t) => Some(t),
-        None => {
-            println!("Failed to verify: pruned tree is empty");
-            None
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn verify_op_sequence_with_tree(
     entries: &dyn EntryByteSequence,
     range: &FastForwardRange,
-    tree: Option<merk::Node>,
+    trace_bytes: &[u8],
     start_change_id: u32,
     sigref_map: &mut BTreeMap<u32, (u32, [u8; 32])>,
     recent_roots: &mut Vec<(u32, [u8; 32])>,
     timestamp_hwm: &mut u64,
 ) -> bool {
-    use merk::PanicSource;
-
-    let Some(mut tree) = tree else {
-        return false;
-    };
-
     let start_idx: u32 = 0;
     let end_idx = range.end_change_id;
     let start_dc = range.start_dc;
     let end_dc = range.end_dc;
     let start_dc_bytes: [u8; 32] = start_dc.as_bytes().try_into().unwrap();
     let end_dc_bytes: [u8; 32] = end_dc.as_bytes().try_into().unwrap();
+
+    // Decode the trace witness and authenticate it against the start data
+    // commitment (folds decode + start-root check into one step).
+    let mut replayer = match crate::TraceReplayer::new_verified(trace_bytes, start_dc_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("Failed to decode/authenticate trace witness start root: {e}");
+            return false;
+        }
+    };
 
     if !range.start_clc_state.verify_for_change_id(start_change_id) {
         println!(
@@ -1933,12 +1895,6 @@ fn verify_op_sequence_with_tree(
             "FastForwardRange.end_clc_state is inconsistent: tree_size {} != start ({}) + chunk_len ({}), or peaks/root malformed",
             range.end_clc_state.tree_size, range.start_clc_state.tree_size, chunk_len
         );
-        return false;
-    }
-
-    tree.commit();
-    if tree.hash() != start_dc_bytes {
-        println!("Failed to verify: computed start root does not match");
         return false;
     }
 
@@ -2006,32 +1962,24 @@ fn verify_op_sequence_with_tree(
             return false;
         }
 
-        let mut reader = PrunedTreeReader::new(&tree);
         ctx.begin_change(current_change_id);
-        let op_result = match crate::ops::dispatch_extract_and_validate(&entry_i, &mut reader, &ctx)
-        {
-            Ok(r) => r,
-            Err(e) => {
-                println!("Op validation failed at entry {current_change_id}: {e}");
-                return false;
+        // Reads authenticate against the witness; the op's returned writes are
+        // applied to the replayer (so the next entry observes them) and the end
+        // data-commitment check below confirms the cumulative result.
+        let writes = {
+            let mut reader = HandleReader(&mut replayer);
+            match crate::ops::dispatch_extract_and_validate(&entry_i, &mut reader, &ctx) {
+                Ok(r) => r.write_steps,
+                Err(e) => {
+                    println!("Op validation failed at entry {current_change_id}: {e}");
+                    return false;
+                }
             }
         };
-
-        let writes = match flatten_write_steps(op_result) {
-            Ok(w) => w,
-            Err(e) => {
-                println!("Op at entry {current_change_id} produced invalid writes: {e}");
-                return false;
-            }
-        };
-        let maybe_tree = crate::apply_batch(Some(tree), &writes, PanicSource {});
-        tree = match maybe_tree {
-            Some(t) => t,
-            None => {
-                println!("Tree became empty after entry {current_change_id}");
-                return false;
-            }
-        };
+        if let Err(e) = replayer.apply(&writes) {
+            println!("Op at entry {current_change_id} failed to apply writes: {e}");
+            return false;
+        }
 
         ctx.finish_change(entry_i.message.op_type);
 
@@ -2050,10 +1998,19 @@ fn verify_op_sequence_with_tree(
         }
     }
 
-    tree.commit();
-    if tree.hash() != end_dc_bytes {
-        println!("Failed to verify changes; ending data root does not match");
-        return false;
+    // `root_hash` is fallible since the merk port: keep "the replayer could not
+    // produce a root" distinct from "it produced one that does not match" so a
+    // failed proof points at the right layer.
+    match replayer.root_hash() {
+        Ok(end) if end == end_dc_bytes => {}
+        Ok(_) => {
+            println!("Failed to verify changes; ending data root does not match");
+            return false;
+        }
+        Err(e) => {
+            println!("Failed to verify changes; end root_hash failed: {e}");
+            return false;
+        }
     }
 
     let computed_end = working_tree
@@ -2067,10 +2024,11 @@ fn verify_op_sequence_with_tree(
     true
 }
 
-/// Verify flat entry bytes with compact pruned witness bytes.
+/// Verify flat entry bytes with a merk trace witness.
 ///
-/// This is the production guest input shape. `pruned_tree_bytes` must be
-/// encoded with `encode_pruned_compact`.
+/// This is the production guest input shape. `pruned_tree_bytes` is the trace
+/// witness from `TraceRecorder::finalize_trace`, consumed by
+/// `TraceReplayer::new_verified`.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_op_sequence_flat(
     entries: FlatEntryBytes<'_>,
@@ -2092,20 +2050,6 @@ pub fn verify_op_sequence_flat(
     )
 }
 
-fn decode_compact_pruned_tree(pruned_tree_bytes: &[u8]) -> Option<merk::Node> {
-    match crate::decode_pruned_compact_to_merk(pruned_tree_bytes) {
-        Ok(Some(t)) => Some(t),
-        Ok(None) => {
-            println!("Failed to verify: pruned tree is empty");
-            None
-        }
-        Err(e) => {
-            println!("Failed to decode compact pruned tree into Merk: {:?}", e);
-            None
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn verify_op_sequence_compact_inner(
     entries: &dyn EntryByteSequence,
@@ -2119,7 +2063,7 @@ fn verify_op_sequence_compact_inner(
     verify_op_sequence_with_tree(
         entries,
         range,
-        decode_compact_pruned_tree(pruned_tree_bytes),
+        pruned_tree_bytes,
         start_change_id,
         sigref_map,
         recent_roots,
@@ -2141,8 +2085,6 @@ fn verify_op_sequence_timed_inner(
     timestamp_hwm: &mut u64,
     cycle_count: fn() -> u64,
 ) -> (bool, VerificationLoopTimings) {
-    use merk::PanicSource;
-
     let mut timings = VerificationLoopTimings::default();
 
     let start_idx: u32 = 0;
@@ -2213,33 +2155,15 @@ fn verify_op_sequence_timed_inner(
     }
 
     let pruned_tree_t0 = cycle_count();
-
-    let t0 = cycle_count();
-    let mut tree = match crate::decode_pruned_compact_to_merk(pruned_tree_bytes) {
-        Ok(Some(t)) => t,
-        Ok(None) => {
-            println!("Failed to verify: pruned tree is empty");
-            return (false, timings);
-        }
+    // `new_verified` folds witness decode + start-root authentication into one step.
+    let mut replayer = match crate::TraceReplayer::new_verified(pruned_tree_bytes, start_dc_bytes) {
+        Ok(r) => r,
         Err(e) => {
-            println!("Failed to decode compact pruned tree into Merk: {:?}", e);
+            println!("Failed to decode/authenticate trace witness start root: {e}");
             return (false, timings);
         }
     };
-    timings.pruned_tree_decode_cycles = cycle_count() - t0;
-
-    let t0 = cycle_count();
-    tree.commit();
-    timings.pruned_tree_commit_cycles = cycle_count() - t0;
-
-    let t0 = cycle_count();
-    let start_root_matches = tree.hash() == start_dc_bytes;
-    timings.pruned_tree_root_check_cycles = cycle_count() - t0;
     timings.pruned_tree_cycles = cycle_count() - pruned_tree_t0;
-    if !start_root_matches {
-        println!("Failed to verify: computed start root does not match");
-        return (false, timings);
-    }
 
     let mut working_tree = MmrTree {
         peaks: range.start_clc_state.peaks.clone(),
@@ -2308,40 +2232,29 @@ fn verify_op_sequence_timed_inner(
         }
         timings.sigref_parent_cycles += cycle_count() - t0;
 
-        let mut reader = TimedPrunedTreeReader::new(&tree, cycle_count);
         ctx.begin_change(current_change_id);
 
         let t0 = cycle_count();
-        let op_result = match crate::ops::dispatch_extract_and_validate(&entry_i, &mut reader, &ctx)
-        {
-            Ok(r) => r,
+        let op_result = {
+            let mut reader = TimedPrunedTreeReader::new(&mut replayer, cycle_count);
+            let res = crate::ops::dispatch_extract_and_validate(&entry_i, &mut reader, &ctx);
+            reader.drain_into(&mut timings);
+            res
+        };
+        timings.extract_validate_cycles += cycle_count() - t0;
+        let writes = match op_result {
+            Ok(r) => r.write_steps,
             Err(e) => {
                 println!("Op validation failed at entry {current_change_id}: {e}");
                 return (false, timings);
             }
         };
-        timings.extract_validate_cycles += cycle_count() - t0;
-        reader.drain_into(&mut timings);
 
         let t0 = cycle_count();
-        let writes = match flatten_write_steps(op_result) {
-            Ok(w) => w,
-            Err(e) => {
-                println!("Op at entry {current_change_id} produced invalid writes: {e}");
-                return (false, timings);
-            }
-        };
-        timings.write_prepare_cycles += cycle_count() - t0;
-
-        let t0 = cycle_count();
-        let maybe_tree = crate::apply_batch(Some(tree), &writes, PanicSource {});
-        tree = match maybe_tree {
-            Some(t) => t,
-            None => {
-                println!("Tree became empty after entry {current_change_id}");
-                return (false, timings);
-            }
-        };
+        if let Err(e) = replayer.apply(&writes) {
+            println!("Op at entry {current_change_id} failed to apply writes: {e}");
+            return (false, timings);
+        }
         timings.overlay_apply_cycles += cycle_count() - t0;
 
         ctx.finish_change(entry_i.message.op_type);
@@ -2362,10 +2275,16 @@ fn verify_op_sequence_timed_inner(
     }
 
     let t0 = cycle_count();
-    tree.commit();
-    if tree.hash() != end_dc_bytes {
-        println!("Failed to verify changes; ending data root does not match");
-        return (false, timings);
+    match replayer.root_hash() {
+        Ok(end) if end == end_dc_bytes => {}
+        Ok(_) => {
+            println!("Failed to verify changes; ending data root does not match");
+            return (false, timings);
+        }
+        Err(e) => {
+            println!("Failed to verify changes; end root_hash failed: {e}");
+            return (false, timings);
+        }
     }
 
     let computed_end = working_tree
@@ -2536,7 +2455,7 @@ mod tests {
         };
         let op = kv.to_batch_op(b"real_key");
         match op {
-            crate::BatchOp::Put { key, value } => {
+            crate::WriteOp::Put { key, value } => {
                 assert_eq!(key, b"real_key");
                 assert_eq!(value, b"42");
             }

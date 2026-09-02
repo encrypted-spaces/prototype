@@ -1,7 +1,7 @@
 [
   {
     "group": "core",
-    "packages": "-p encrypted-spaces-crypto -p encrypted-spaces-key-manager -p encrypted-spaces-retention -p encrypted-spaces-acl-types -p encrypted-spaces-storage-encoding -p encrypted-spaces-changelog-test-utils -p encrypted-spaces-changelog-core -p encrypted-spaces-zkp -p encrypted-spaces-ffproof -p ffproof-tracer -p encrypted-spaces-ff-test",
+    "packages": "-p encrypted-spaces-crypto -p encrypted-spaces-key-manager -p encrypted-spaces-retention -p encrypted-spaces-acl-types -p encrypted-spaces-storage-encoding -p encrypted-spaces-changelog-test-utils -p encrypted-spaces-changelog-core -p encrypted-spaces-zkp -p encrypted-spaces-ffproof -p encrypted-spaces-ff-test",
     "filter": ""
   },
   {
@@ -17,6 +17,11 @@
   {
     "group": "demo",
     "packages": "-p encrypted-spaces-demo -p encrypted-spaces-demo-test-harness",
+    "filter": ""
+  },
+  {
+    "group": "avl",
+    "packages": "--features avl -p ffproof-tracer-shared -p encrypted-spaces-changelog-core -p encrypted-spaces-backend -p encrypted-spaces-backend-server -p encrypted-spaces-changelog-test-utils -p encrypted-spaces-ffproof -p encrypted-spaces-sdk -p encrypted-spaces-ff-test -p encrypted-spaces-demo -p encrypted-spaces-demo-test-harness",
     "filter": ""
   }
 ]

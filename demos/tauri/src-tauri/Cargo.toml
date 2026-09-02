@@ -5,6 +5,11 @@ license.workspace = true
 authors.workspace = true
 edition.workspace = true
 
+[features]
+# Run the demo on the MRT (Merkle Radix Tree) merk backend. Must match the
+# server's feature or their data commitments diverge; AVL is the default.
+avl = ["encrypted-spaces-sdk/avl", "encrypted-spaces-sdk-codegen/avl"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 encrypted-spaces-sdk-codegen = { workspace = true }

@@ -34,9 +34,8 @@ use encrypted_spaces_backend::{
 use encrypted_spaces_backend_server::app_config::{BootstrapDataSource, SpaceInitConfig};
 use encrypted_spaces_backend_server::SpaceState;
 use encrypted_spaces_changelog_core::changelog::{Change, ChangeResponse, FastForwardData};
-use encrypted_spaces_changelog_core::{create_trace, encode_pruned_compact};
 use encrypted_spaces_ffproof::common::FFProof;
-use encrypted_spaces_ffproof::prover::{extract_input_steps, prove_ff_chunk};
+use encrypted_spaces_ffproof::prover::{extract_trace_bytes, prove_ff_chunk};
 use encrypted_spaces_key_manager::{InviteRequest, RekeyRequest};
 use encrypted_spaces_sdk::{
     schema::{ApplicationSchema, ColumnType, SchemaBuilder},
@@ -314,16 +313,8 @@ async fn prove_pending_and_get_cycles(state: &Arc<Mutex<SpaceState>>) -> u64 {
         .as_ref()
         .expect("No tree snapshot — state should have one after init");
 
-    let steps = extract_input_steps(
-        &state.changelog,
-        &state.change_responses,
-        start_idx,
-        tree_snapshot,
-    )
-    .expect("extract_input_steps failed");
-
-    let tracer_proof = create_trace(tree_snapshot, &steps);
-    let tracer_proof_bytes = encode_pruned_compact(&tracer_proof.pruned_tree);
+    let tracer_proof_bytes = extract_trace_bytes(&state.changelog, start_idx, tree_snapshot)
+        .expect("extract_trace_bytes failed");
     let _quiet = SuppressStderr::new();
     let (proof, stats) = prove_ff_chunk(
         state.ff_proof.as_ref(),
@@ -536,7 +527,7 @@ async fn build_fixture() -> CycleFixture {
         .reinitialize_changelog()
         .await
         .expect("reinitialize_changelog");
-    state_raw.tree_snapshot = state_raw.db.snapshot();
+    state_raw.tree_snapshot = state_raw.db.checkpoint();
     let app_root = state_raw.db.root_hash();
 
     let state = Arc::new(Mutex::new(state_raw));

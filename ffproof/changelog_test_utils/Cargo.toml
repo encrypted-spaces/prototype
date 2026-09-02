@@ -5,6 +5,13 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+avl = [
+    "encrypted-spaces-backend/avl",
+    "encrypted-spaces-backend-server/avl",
+    "encrypted-spaces-changelog-core/avl",
+]
+
 [dependencies]
 base64 = { workspace = true }
 encrypted-spaces-changelog-core = { workspace = true }

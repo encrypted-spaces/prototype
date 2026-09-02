@@ -6,6 +6,11 @@ authors.workspace = true
 edition.workspace = true
 
 [features]
+avl = [
+    "merk",
+    "encrypted-spaces-changelog-core/avl",
+    "ffproof-tracer-shared/avl",
+]
 default = ["merk_verify"]
 merk_verify = ["dep:merk", "dep:encrypted-spaces-changelog-core"]
 merk = ["merk_verify", "dep:merk", "dep:encrypted-spaces-changelog-core"]

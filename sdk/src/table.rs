@@ -538,8 +538,9 @@ struct FetchedRows {
 
 /// Specification for a join operation.
 ///
-/// The server generates a single `TracerProof` covering both the main table
-/// and targeted FK lookups on the joined table — no full table scans.
+/// The server generates a single reads-only trace proof covering both the
+/// main table and targeted FK lookups on the joined table — no full table
+/// scans.
 pub(crate) struct JoinSpec {
     /// Joined table name (may include alias: `"users"` or `"users as u"`).
     pub table: String,

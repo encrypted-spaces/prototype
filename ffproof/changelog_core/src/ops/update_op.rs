@@ -6,7 +6,7 @@ use super::{
     OpVerifyResult,
 };
 use crate::changelog::{ChangelogEntry, ChangelogError, OpType};
-use crate::{BatchOp, ReadOp, TraceStep};
+use crate::{ReadOp, WriteOp};
 use encrypted_spaces_storage_encoding::keys::column_key;
 use encrypted_spaces_storage_encoding::stored_value::value_to_bytes;
 use std::collections::BTreeMap;
@@ -177,7 +177,7 @@ impl OpVerifier for UpdateOp {
         }
 
         // Emit one Put per changed column
-        let mut batch_ops: Vec<BatchOp> = parsed_entries
+        let mut batch_ops: Vec<WriteOp> = parsed_entries
             .iter()
             .map(|parsed| parsed.kv.to_batch_op(parsed.key))
             .collect();
@@ -200,7 +200,7 @@ impl OpVerifier for UpdateOp {
         }
 
         Ok(OpVerifyResult {
-            write_steps: vec![TraceStep::Write(batch_ops)],
+            write_steps: batch_ops,
         })
     }
 }
@@ -413,13 +413,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(result.write_steps.len(), 1);
-        match &result.write_steps[0] {
-            TraceStep::Write(ops) => {
-                assert_eq!(ops.len(), 2);
-            }
-            other => panic!("Expected Write step, got: {other:?}"),
-        }
+        let ops = &result.write_steps;
+        assert_eq!(ops.len(), 2);
     }
 
     #[test]
@@ -583,10 +578,10 @@ mod tests {
         );
     }
 
-    /// Verify that short Value entries produce BatchOp::Put.
+    /// Verify that short Value entries produce WriteOp::Put.
     #[test]
     fn test_update_op_emits_put_for_short_values() {
-        use crate::BatchOp;
+        use crate::WriteOp;
         let col = column_key("t", 5, "name");
         let short_value = b"\"Ada\"".to_vec(); // 5 bytes
 
@@ -619,18 +614,14 @@ mod tests {
         )
         .unwrap();
 
-        match &result.write_steps[0] {
-            TraceStep::Write(ops) => {
-                assert_eq!(ops.len(), 1);
-                match &ops[0] {
-                    BatchOp::Put { key, value } => {
-                        assert_eq!(key, &col);
-                        assert_eq!(value, &short_value);
-                    }
-                    other => panic!("Expected Put for short value, got: {other:?}"),
-                }
+        let ops = &result.write_steps;
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            WriteOp::Put { key, value } => {
+                assert_eq!(key, &col);
+                assert_eq!(value, &short_value);
             }
-            other => panic!("Expected Write step, got: {other:?}"),
+            other => panic!("Expected Put for short value, got: {other:?}"),
         }
     }
 
@@ -670,9 +661,7 @@ mod tests {
         .unwrap();
         reader.assert_all_consumed().unwrap();
 
-        let TraceStep::Write(ops) = &result.write_steps[0] else {
-            panic!("expected Write step");
-        };
+        let ops = &result.write_steps;
         assert_eq!(ops.len(), 1);
     }
 
@@ -717,9 +706,7 @@ mod tests {
         .unwrap();
         reader.assert_all_consumed().unwrap();
 
-        let TraceStep::Write(ops) = &result.write_steps[0] else {
-            panic!("expected Write step");
-        };
+        let ops = &result.write_steps;
         assert_eq!(ops.len(), 3);
     }
 
@@ -772,9 +759,7 @@ mod tests {
         .unwrap();
         reader.assert_all_consumed().unwrap();
 
-        let TraceStep::Write(ops) = &result.write_steps[0] else {
-            panic!("expected Write step");
-        };
+        let ops = &result.write_steps;
         assert_eq!(ops.len(), 4);
     }
 
@@ -968,9 +953,7 @@ mod tests {
         let result = UpdateOp::extract_and_validate(&entry, &mut reader, &ctx).unwrap();
         reader.assert_all_consumed().unwrap();
 
-        let TraceStep::Write(ops) = &result.write_steps[0] else {
-            panic!("expected Write step");
-        };
+        let ops = &result.write_steps;
         assert_eq!(ops.len(), 3);
     }
 

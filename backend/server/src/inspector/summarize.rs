@@ -1,7 +1,7 @@
 //! Turns database / changelog state into the inspector's event payloads:
-//! Merk-tree serialization, per-entry summaries, table schemas, op labels,
-//! and query descriptions. Kept out of `db.rs` so the operation code there
-//! only has to *emit* events, not build them.
+//! per-entry summaries, table schemas, op labels, and query descriptions.
+//! Kept out of `db.rs` so the operation code there only has to *emit*
+//! events, not build them.
 
 use crate::inspector;
 use encrypted_spaces_backend::internal_schemas::is_internal_table;
@@ -11,81 +11,6 @@ use encrypted_spaces_backend::query::{
 };
 use encrypted_spaces_changelog_core::changelog::{Change, OpType};
 use std::collections::BTreeSet;
-
-/// Serialize a `merk::Node` recursively into the wire format the inspector
-/// UI consumes. Returns `(root_node, total_node_count)`. The full subtree
-/// is included; demo recordings stay well under a few hundred nodes per
-/// snapshot so this is fine.
-pub(crate) fn serialize_merk_tree(
-    node: Option<&merk::Node>,
-) -> (Option<inspector::MerkTreeNode>, u32) {
-    fn walk(n: &merk::Node, count: &mut u32) -> inspector::MerkTreeNode {
-        *count += 1;
-        let key = n.key();
-        let (label, kind) = label_for_key(key);
-        let mut hash_hex = hex::encode(n.hash());
-        hash_hex.truncate(16);
-        let left = n.child(true).map(|c| Box::new(walk(c, count)));
-        let right = n.child(false).map(|c| Box::new(walk(c, count)));
-        inspector::MerkTreeNode {
-            key_hex: hex::encode(key),
-            label,
-            kind: kind.to_string(),
-            hash: hash_hex,
-            value_size: n.value().len(),
-            left,
-            right,
-        }
-    }
-    let mut count = 0;
-    let root = node.map(|n| walk(n, &mut count));
-    (root, count)
-}
-
-/// Best-effort human-readable label for a Merk key. Falls back to a hex
-/// dump for keys that don't parse — never panics.
-fn label_for_key(key: &[u8]) -> (String, &'static str) {
-    match parse_key(key) {
-        Ok(ParsedKey::Column {
-            table,
-            row_id,
-            column,
-        }) => (format!("{table}/{row_id}/{column}"), "column"),
-        Ok(ParsedKey::Row { table, row_id }) => (format!("{table}/{row_id}"), "row"),
-        Ok(ParsedKey::RowPrefix { table }) => (format!("{table}/*"), "row"),
-        Ok(ParsedKey::Index {
-            table,
-            column,
-            row_id,
-            ..
-        }) => (format!("idx:{table}.{column}→{row_id}"), "index"),
-        Ok(ParsedKey::Schema { table }) => (format!("schema:{table}"), "schema"),
-        Ok(ParsedKey::SchemaColumns { table }) => (format!("schema:{table}/columns"), "schema"),
-        Ok(ParsedKey::SchemaNextId { table }) => (format!("schema:{table}/next_id"), "schema"),
-        Ok(ParsedKey::SchemaIdMode { table }) => (format!("schema:{table}/id_mode"), "schema"),
-        Ok(ParsedKey::AclRule { table, op }) => (format!("acl:{table}/{op}"), "schema"),
-        Ok(ParsedKey::OnlyViaActions { table, op }) => {
-            (format!("only_via_actions:{table}/{op}"), "schema")
-        }
-        Ok(ParsedKey::Action {
-            primary_table,
-            name,
-        }) => (format!("action:{primary_table}/{name}"), "schema"),
-        Ok(ParsedKey::ActionMarker { primary_table }) => {
-            (format!("action_marker:{primary_table}"), "other")
-        }
-        Ok(ParsedKey::StoreSchema { store }) => (format!("store:{store}"), "schema"),
-        Ok(ParsedKey::StoreEntry { store, key }) => {
-            let k = hex::encode(&key[..key.len().min(8)]);
-            (format!("store:{store}/{k}"), "other")
-        }
-        Ok(ParsedKey::StorePrefix { store }) => (format!("store:{store}/*"), "other"),
-        Err(_) => {
-            let preview = hex::encode(&key[..key.len().min(8)]);
-            (format!("?{preview}"), "other")
-        }
-    }
-}
 
 fn column_type_label(t: &encrypted_spaces_backend::schema::ColumnType) -> &'static str {
     use encrypted_spaces_backend::schema::ColumnType::*;

@@ -37,7 +37,7 @@ use super::{
     OpReader, OpVerifier, OpVerifyResult, UpdateOp,
 };
 use crate::changelog::{ChangelogEntry, ChangelogError, KvData};
-use crate::{BatchOp, ReadOp, TraceStep};
+use crate::{ReadOp, WriteOp};
 use encrypted_spaces_acl_types::{
     AccessRule, ActionLeg, Assertion, ColumnNamespace, ComparisonOp, RuleValue,
 };
@@ -448,12 +448,12 @@ fn dispatch_cascade_delete(
     let schema_columns = read_schema_columns(table, op_name, reader, ctx)?;
     let indexed_columns = read_schema_indexes(table, reader, ctx)?;
 
-    let mut delete_ops: Vec<BatchOp> = Vec::new();
+    let mut delete_ops: Vec<WriteOp> = Vec::new();
     for row_id in &row_ids {
         // Column-key deletes are derivable directly from the schema —
         // no row-content read needed.
         for col in &schema_columns {
-            delete_ops.push(BatchOp::Delete {
+            delete_ops.push(WriteOp::Delete {
                 key: column_key(table, *row_id, col),
             });
         }
@@ -469,7 +469,7 @@ fn dispatch_cascade_delete(
     }
 
     Ok(OpVerifyResult {
-        write_steps: vec![TraceStep::Write(delete_ops)],
+        write_steps: delete_ops,
     })
 }
 
