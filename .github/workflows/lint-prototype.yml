@@ -68,6 +68,9 @@ jobs:
         uses: ./.github/actions/setup-rust-ci
         with:
           ssh-private-key: ${{ secrets.MERK_NOMIC_SSH_KEY }}
+          # Same save rule as the build workflow: one clippy cache, saved
+          # from `main`, restored by every branch.
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Clippy (full workspace, all targets)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings

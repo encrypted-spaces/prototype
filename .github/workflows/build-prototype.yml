@@ -100,6 +100,13 @@ jobs:
         uses: ./.github/actions/setup-rust-ci
         with:
           ssh-private-key: ${{ secrets.MERK_NOMIC_SSH_KEY }}
+          # One rust-cache per matrix group (see the action's input docs).
+          cache-key: ${{ matrix.group }}
+          # Save only from `main`; every other run (PRs, manual dispatches on
+          # a branch) restores main's entries and never saves its own, so the
+          # 10 GB repo cache quota holds one set of per-group entries no
+          # matter how many branches run.
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2

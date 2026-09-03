@@ -20,8 +20,23 @@
     "filter": ""
   },
   {
-    "group": "avl",
-    "packages": "--features avl -p ffproof-tracer-shared -p encrypted-spaces-changelog-core -p encrypted-spaces-backend -p encrypted-spaces-backend-server -p encrypted-spaces-changelog-test-utils -p encrypted-spaces-ffproof -p encrypted-spaces-sdk -p encrypted-spaces-ff-test -p encrypted-spaces-demo -p encrypted-spaces-demo-test-harness",
+    "group": "core-avl",
+    "packages": "--features avl -p ffproof-tracer-shared -p encrypted-spaces-changelog-core -p encrypted-spaces-changelog-test-utils -p encrypted-spaces-ffproof -p encrypted-spaces-ff-test",
+    "filter": ""
+  },
+  {
+    "group": "backend-avl",
+    "packages": "--features avl -p encrypted-spaces-backend -p encrypted-spaces-backend-server",
+    "filter": ""
+  },
+  {
+    "group": "sdk-avl",
+    "packages": "--features avl -p encrypted-spaces-sdk",
+    "filter": ""
+  },
+  {
+    "group": "demo-avl",
+    "packages": "--features avl -p encrypted-spaces-demo -p encrypted-spaces-demo-test-harness",
     "filter": ""
   }
 ]

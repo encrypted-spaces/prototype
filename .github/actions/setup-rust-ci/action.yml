@@ -11,6 +11,24 @@ inputs:
       SSH key for the encrypted-spaces/merk-private repo. Optional — when
       empty (e.g. on forks without access to the secret), the SSH setup and
       access-check steps are skipped.
+  cache-key:
+    required: false
+    default: ""
+    description: >
+      Extra component for the rust-cache key. rust-cache keys on the job id,
+      which is the same (`test`) for every entry of a matrix job, so without
+      this every matrix group restores and races to save one cache; only the
+      fastest group's artifacts ever persist and the rest rebuild each run.
+      Pass the matrix group so each group keeps its own cache.
+  cache-save:
+    required: false
+    default: "true"
+    description: >
+      Whether to upload the cache at the end of the job ("true"/"false").
+      Caches are scoped to the ref that saved them; PR runs can restore the
+      default branch's entries but their own saves are only visible to that
+      PR and count against the repo's 10 GB quota. Callers pass false off
+      `main` so one set of per-group entries serves every branch.
 
 runs:
   using: composite
@@ -64,6 +82,8 @@ runs:
         RUSTUP_TOOLCHAIN: ${{ steps.rust-toolchain.outputs.toolchain }}
       with:
         workspaces: . -> target
+        key: ${{ inputs.cache-key }}
+        save-if: ${{ inputs.cache-save == 'true' }}
 
     - name: Cache apt packages
       uses: actions/cache@v4
