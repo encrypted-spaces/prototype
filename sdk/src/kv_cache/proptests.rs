@@ -112,6 +112,16 @@ proptest! {
         for (s, e) in extensions {
             store.extend_coverage(s.clone(), e.clone());
             oracle.extend(s, e);
+            let intervals = store.intervals();
+            prop_assert_eq!(&intervals, &oracle.intervals);
+            for (start, end) in &intervals {
+                prop_assert!(start < end, "empty or reversed interval");
+            }
+            for interval in intervals.windows(2) {
+                let (_, left_end) = &interval[0];
+                let (right_start, _) = &interval[1];
+                prop_assert!(left_end < right_start, "overlapping or adjacent intervals");
+            }
         }
         for (s, e) in queries {
             prop_assert_eq!(store.covers_range(&s, &e), oracle.covers(&s, &e));

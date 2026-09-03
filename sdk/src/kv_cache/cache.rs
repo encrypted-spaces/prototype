@@ -137,7 +137,7 @@ impl KvCache {
             return;
         }
         for (k, v) in kv_pairs {
-            self.storage.put_point(k, Some(v));
+            self.storage.put_point(k, v);
         }
         for (s, e) in coverage_ranges {
             self.storage.extend_coverage(s, e);
@@ -154,8 +154,8 @@ impl KvCache {
         if self.enabled {
             for w in update.writes {
                 match w {
-                    CacheWrite::Put(k, v) => self.storage.put_point(k, Some(v)),
-                    CacheWrite::Delete(k) => self.storage.put_point(k, None),
+                    CacheWrite::Put(k, v) => self.storage.put_point(k, v),
+                    CacheWrite::Delete(k) => self.storage.delete_point(&k),
                 }
             }
             for (start, end) in update.coverage_extensions {
@@ -188,7 +188,7 @@ impl KvCache {
             return true;
         }
         for (k, v) in &verified.kv_pairs {
-            self.storage.put_point(k.clone(), Some(v.clone()));
+            self.storage.put_point(k.clone(), v.clone());
         }
 
         let present: std::collections::HashSet<&[u8]> = verified
@@ -209,7 +209,7 @@ impl KvCache {
                 }
                 ReadOp::Key(k) => {
                     if !present.contains(k.as_slice()) {
-                        self.storage.put_point(k.clone(), None);
+                        self.storage.delete_point(k);
                     }
                 }
             }
@@ -726,12 +726,7 @@ impl<'a> KvCacheReader<'a> {
                     return Ok(Some(
                         entries
                             .into_iter()
-                            .filter_map(|(key, entry)| match entry {
-                                DataEntry::Value { bytes, .. } => {
-                                    Some((key.to_vec(), bytes.clone()))
-                                }
-                                DataEntry::Deleted => None,
-                            })
+                            .map(|(key, entry)| (key.to_vec(), entry.bytes.clone()))
                             .collect::<Vec<_>>(),
                     ));
                 }
@@ -823,9 +818,7 @@ fn decrypt_cached_entries(
     let mut warm: Vec<(&OnceLock<Vec<u8>>, Vec<u8>)> = Vec::new();
 
     for (key, entry) in entries {
-        let DataEntry::Value { bytes, decrypted } = entry else {
-            continue;
-        };
+        let DataEntry { bytes, decrypted } = entry;
 
         let parsed = parse_key(key);
         let Ok(ParsedKey::Column {
@@ -1207,7 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn key_read_with_no_kv_pair_records_tombstone() {
+    fn key_read_with_no_kv_pair_records_point_interval() {
         let mut cache = KvCache::new([0; 32]);
         let row_key = keys::row_key(TABLE, 7);
         let verified = VerifiedRows {
@@ -1216,8 +1209,17 @@ mod tests {
             kv_pairs: Vec::new(),
             read_ops: vec![ReadOp::Key(row_key.clone())],
         };
+        let mut point_end = row_key.clone();
+        point_end.push(0);
+        let mut neighbour_end = point_end.clone();
+        neighbour_end.push(0);
+        cache
+            .storage
+            .extend_coverage(point_end.clone(), neighbour_end.clone());
         cache.apply_select([0; 32], &verified);
-        assert_eq!(cache.storage.get_point(&row_key), Some(&DataEntry::Deleted));
+        assert_eq!(cache.storage.lookup_point(&row_key), Some(None));
+        assert!(cache.storage.covers_range(&row_key, &neighbour_end));
+        assert_eq!(cache.storage.interval_count(), 1);
     }
 
     #[test]
@@ -1229,10 +1231,10 @@ mod tests {
         update.delete(keys::row_key(TABLE, 6));
         cache.advance_anchor([7; 32], update);
         assert_eq!(cache.anchor(), &[7; 32]);
-        assert_eq!(cache.storage.get_point(&k), Some(&DataEntry::value(v)));
+        assert_eq!(cache.storage.get_point(&k), Some(v.as_slice()));
         assert_eq!(
-            cache.storage.get_point(&keys::row_key(TABLE, 6)),
-            Some(&DataEntry::Deleted)
+            cache.storage.lookup_point(&keys::row_key(TABLE, 6)),
+            Some(None)
         );
     }
 
@@ -1633,13 +1635,16 @@ mod tests {
 
         // The per-entry memo slot is warm after the first read.
         let col_key = keys::column_key(TABLE, 1, "secret");
-        match cache.storage.get_point(&col_key).expect("cached entry") {
-            DataEntry::Value { decrypted, .. } => assert!(
-                decrypted.get().is_some(),
-                "OnceLock memo should be populated after the first decrypt"
-            ),
-            DataEntry::Deleted => panic!("unexpected tombstone"),
-        }
+        assert!(
+            cache
+                .storage
+                .get_entry(&col_key)
+                .expect("cached entry")
+                .decrypted
+                .get()
+                .is_some(),
+            "OnceLock memo should be populated after the first decrypt"
+        );
 
         // Second read: served from the memo — no additional decrypt.
         let rows2 = hit_rows(
@@ -2466,9 +2471,7 @@ mod tests {
     #[test]
     fn data_entry_debug_and_equality_ignore_decrypt_memo() {
         let memoized = DataEntry::value(vec![1, 2, 3]);
-        if let DataEntry::Value { decrypted, .. } = &memoized {
-            decrypted.set(vec![9, 9, 9]).unwrap();
-        }
+        memoized.decrypted.set(vec![9, 9, 9]).unwrap();
 
         let cold = DataEntry::value(vec![1, 2, 3]);
         assert_eq!(memoized, cold);

@@ -17,14 +17,14 @@ use super::CacheUpdate;
 /// resolve those to the full value before splicing so the cache holds the
 /// same representation a SELECT proof yields and the decrypt path reads it
 /// back identically. A hash-backed write whose digest is absent from the
-/// sidecar is skipped, and its row is marked tainted so it does not get a
-/// coverage extension (an id-read must not return a row with a hole).
+/// sidecar makes the whole update unspliceable: a covered row must be complete
+/// at the new anchor, so callers must reanchor rather than retain stale data.
 ///
 /// When `writes` cover *every* non-id column of a row's schema (i.e. a
-/// full insert or a complete replacement update) and no column was
-/// tainted, the row's byte range `[row_key, prefix_successor)` is added to
-/// `coverage_extensions` so a later id-read hits the cache. Same shape for
-/// deletes: a delete naming every non-id column authenticates the absence.
+/// full insert or a complete replacement update), the row's byte range
+/// `[row_key, prefix_successor)` is added to `coverage_extensions` so a later
+/// id-read hits the cache. Same shape for deletes: a delete naming every
+/// non-id column authenticates the absence.
 ///
 /// Returns `None` when `writes` contain any non-point operation
 /// (`DeleteRange`/`DeletePrefix`/`MovePrefix`): the cache cannot splice
@@ -39,15 +39,26 @@ pub fn cache_update_from_writes(
     schemas: &HashMap<String, Schema>,
 ) -> Option<CacheUpdate> {
     let mut update = CacheUpdate::new();
-    let mut tainted_rows: BTreeSet<(String, i64)> = BTreeSet::new();
     for op in writes {
         match op {
             WriteOp::Put { key, value } => match resolve_put_value(key, value, schemas, change) {
                 Some(bytes) => update.put(key.clone(), bytes),
                 None => {
-                    if let Ok(ParsedKey::Column { table, row_id, .. }) = parse_key(key) {
-                        tainted_rows.insert((table, row_id));
-                    }
+                    let (table, column) = match parse_key(key) {
+                        Ok(ParsedKey::Column { table, column, .. }) => (table, column),
+                        _ => ("<unparsed>".to_string(), "<unparsed>".to_string()),
+                    };
+                    let signature_prefix =
+                        &change.entry.signature[..change.entry.signature.len().min(8)];
+                    log::error!(
+                        "cache_update_from_writes: server delivered an incomplete sidecar for \
+                         hash-backed table={table}, column={column}; parent_change={}, uid={}, \
+                         signature_prefix={}",
+                        change.entry.parent_change,
+                        change.entry.uid,
+                        hex::encode(signature_prefix),
+                    );
+                    return None;
                 }
             },
             WriteOp::Delete { key } => update.delete(key.clone()),
@@ -56,10 +67,10 @@ pub fn cache_update_from_writes(
             | WriteOp::MovePrefix { .. } => return None,
         }
     }
-    for range in full_row_coverage(writes, schemas, /* deletes = */ false, &tainted_rows) {
+    for range in full_row_coverage(writes, schemas, /* deletes = */ false) {
         update.extend_coverage(range.0, range.1);
     }
-    for range in full_row_coverage(writes, schemas, /* deletes = */ true, &tainted_rows) {
+    for range in full_row_coverage(writes, schemas, /* deletes = */ true) {
         update.extend_coverage(range.0, range.1);
     }
     Some(update)
@@ -69,8 +80,8 @@ pub fn cache_update_from_writes(
 ///
 /// For a hash-backed column the stored bytes are a 32-byte digest that
 /// indexes `change.hashed_values`; returns `Some(full_value)` when the
-/// sidecar can resolve it, or `None` (skip + taint) when it can't. For
-/// every other column the stored bytes are the value itself.
+/// sidecar can resolve it, or `None` when it can't. For every other column
+/// the stored bytes are the value itself.
 fn resolve_put_value(
     key: &[u8],
     value: &[u8],
@@ -84,16 +95,7 @@ fn resolve_put_value(
         {
             if col.column_type.is_hash_backed() {
                 let hash: [u8; 32] = value.try_into().ok()?;
-                return match change.hashed_values.get(&hash) {
-                    Some(bytes) => Some(bytes.clone()),
-                    None => {
-                        log::warn!(
-                            "cache_update_from_writes: hash-backed {table}.{column} digest \
-                             missing from sidecar; row not spliced or coverage-extended"
-                        );
-                        None
-                    }
-                };
+                return change.hashed_values.get(&hash).cloned();
             }
         }
     }
@@ -103,13 +105,11 @@ fn resolve_put_value(
 /// Row byte ranges produced by writes that cover every non-id column of a
 /// row's schema. `deletes = true` runs the same test against Delete ops so
 /// a full-row delete extends coverage (the row is now an authenticated
-/// absence). Rows in `tainted` (a hash-backed value couldn't be resolved)
-/// are skipped so we never claim coverage over an incomplete row.
+/// absence).
 fn full_row_coverage(
     writes: &[WriteOp],
     schemas: &HashMap<String, Schema>,
     deletes: bool,
-    tainted: &BTreeSet<(String, i64)>,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
     let id_field = encrypted_spaces_backend::merk_storage::ID_FIELD;
     let mut per_row: BTreeMap<(String, i64), BTreeSet<String>> = BTreeMap::new();
@@ -132,9 +132,6 @@ fn full_row_coverage(
     per_row
         .into_iter()
         .filter_map(|((table, row_id), columns)| {
-            if tainted.contains(&(table.clone(), row_id)) {
-                return None;
-            }
             let schema = schemas.get(&table)?;
             let schema_columns: BTreeSet<String> = schema
                 .columns
@@ -277,16 +274,26 @@ mod tests {
     }
 
     #[test]
-    fn unresolvable_hash_backed_taints_row_and_skips_coverage() {
+    fn unresolvable_hash_backed_put_rejects_whole_update() {
         // The hash-backed `large` digest is missing from the sidecar, so it
-        // is not spliced and the row must not be coverage-extended (an
-        // id-read would otherwise return the row missing `large`).
+        // makes the whole update unspliceable. Even the unrelated complete
+        // row must not be spliced before callers reanchor.
         let mut schemas = HashMap::new();
         schemas.insert("t".to_string(), schema_with_hashed());
 
-        let change = change_with_sidecar(HashedValues::new());
+        let mut sidecar = HashedValues::new();
+        sidecar.insert([0xCD; 32], vec![8, 8, 8]);
+        let change = change_with_sidecar(sidecar);
 
         let writes = vec![
+            WriteOp::Put {
+                key: keys::column_key("t", 8, "small"),
+                value: vec![4, 5, 6],
+            },
+            WriteOp::Put {
+                key: keys::column_key("t", 8, "large"),
+                value: [0xCD; 32].to_vec(),
+            },
             WriteOp::Put {
                 key: keys::column_key("t", 7, "small"),
                 value: vec![1, 2, 3],
@@ -297,13 +304,9 @@ mod tests {
             },
         ];
 
-        let update = cache_update_from_writes(&change, &writes, &schemas)
-            .expect("point-only writes must be spliceable");
-
-        assert_eq!(update.writes.len(), 1, "only the resolvable Put is spliced");
         assert!(
-            update.coverage_extensions.is_empty(),
-            "tainted row must not receive a coverage extension"
+            cache_update_from_writes(&change, &writes, &schemas).is_none(),
+            "an incomplete sidecar must reject the whole cache update"
         );
     }
 

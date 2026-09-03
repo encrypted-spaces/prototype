@@ -1,8 +1,7 @@
 //! Interval algebra + point map underlying [`crate::KvCache`].
 //!
 //! Two pieces of state:
-//! - `points: BTreeMap<key, DataEntry>` — a `Value { bytes, .. }` presence or a
-//!   `Deleted` tombstone.
+//! - `points: BTreeMap<key, DataEntry>` — authenticated key/value presences.
 //! - `intervals: BTreeMap<start, end>` — half-open `[start, end)` byte ranges
 //!   that are fully known. Invariant: intervals are non-overlapping and
 //!   non-adjacent (adjacent ranges merge on insert).
@@ -15,21 +14,18 @@ use std::sync::OnceLock;
 
 /// A cache data entry.
 ///
-/// `Value::decrypted` is a lazy per-entry decrypted-bytes memoization slot.
+/// `decrypted` is a lazy per-entry decrypted-bytes memoization slot.
 /// It is not soundness-bearing: equality and debug output ignore it.
-pub(crate) enum DataEntry {
-    Value {
-        /// Raw bytes authenticated by the proof at the cache anchor.
-        bytes: Vec<u8>,
-        /// Lazily populated decrypted bytes for encrypted columns.
-        decrypted: OnceLock<Vec<u8>>,
-    },
-    Deleted,
+pub(crate) struct DataEntry {
+    /// Raw bytes authenticated by the proof at the cache anchor.
+    pub(crate) bytes: Vec<u8>,
+    /// Lazily populated decrypted bytes for encrypted columns.
+    pub(crate) decrypted: OnceLock<Vec<u8>>,
 }
 
 impl DataEntry {
     pub(crate) fn value(bytes: Vec<u8>) -> Self {
-        Self::Value {
+        Self {
             bytes,
             decrypted: OnceLock::new(),
         }
@@ -38,22 +34,13 @@ impl DataEntry {
 
 impl std::fmt::Debug for DataEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DataEntry::Value { bytes, .. } => {
-                f.debug_struct("Value").field("bytes", bytes).finish()
-            }
-            DataEntry::Deleted => f.write_str("Deleted"),
-        }
+        f.debug_struct("Value").field("bytes", &self.bytes).finish()
     }
 }
 
 impl PartialEq for DataEntry {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (DataEntry::Value { bytes: a, .. }, DataEntry::Value { bytes: b, .. }) => a == b,
-            (DataEntry::Deleted, DataEntry::Deleted) => true,
-            _ => false,
-        }
+        self.bytes == other.bytes
     }
 }
 
@@ -75,19 +62,20 @@ impl CoverageStore {
         self.intervals.clear();
     }
 
-    /// Record `key → Some(value)` (presence) or `key → None` (tombstone).
-    pub fn put_point(&mut self, key: Vec<u8>, value: Option<Vec<u8>>) {
-        let entry = match value {
-            Some(bytes) => DataEntry::value(bytes),
-            None => DataEntry::Deleted,
-        };
-        self.points.insert(key, entry);
+    /// Record an authenticated key/value presence.
+    pub fn put_point(&mut self, key: Vec<u8>, value: Vec<u8>) {
+        self.points.insert(key, DataEntry::value(value));
     }
 
-    /// `None` means no point stored; `Some(DataEntry::Deleted)` is a tombstone;
-    /// `Some(DataEntry::Value { .. })` is a stored value.
+    /// Return the stored value bytes, if the key has a point entry.
     #[cfg(test)]
-    pub fn get_point(&self, key: &[u8]) -> Option<&DataEntry> {
+    pub fn get_point(&self, key: &[u8]) -> Option<&[u8]> {
+        self.points.get(key).map(|entry| entry.bytes.as_slice())
+    }
+
+    /// Return the full entry for tests that inspect the decryption memo.
+    #[cfg(test)]
+    pub(crate) fn get_entry(&self, key: &[u8]) -> Option<&DataEntry> {
         self.points.get(key)
     }
 
@@ -97,15 +85,27 @@ impl CoverageStore {
         self.points.len()
     }
 
+    /// Number of coverage intervals currently stored (test-only assertion helper).
+    #[cfg(test)]
+    pub fn interval_count(&self) -> usize {
+        self.intervals.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn intervals(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.intervals
+            .iter()
+            .map(|(start, end)| (start.clone(), end.clone()))
+            .collect()
+    }
+
     /// Resolve a single key against points and coverage:
     /// - `Some(Some(bytes))` — a value is present;
-    /// - `Some(None)` — an authenticated absence (a tombstone, or no point
-    ///   inside a covered range);
+    /// - `Some(None)` — an authenticated absence (no point inside a covered range);
     /// - `None` — unknown (no point and not covered).
     pub fn lookup_point(&self, key: &[u8]) -> Option<Option<Vec<u8>>> {
         match self.points.get(key) {
-            Some(DataEntry::Value { bytes, .. }) => Some(Some(bytes.clone())),
-            Some(DataEntry::Deleted) => Some(None),
+            Some(entry) => Some(Some(entry.bytes.clone())),
             None => {
                 // The immediate successor of `key`; `[key, succ)` is the
                 // single-point range, covered iff `key` sits in an interval.
@@ -142,12 +142,13 @@ impl CoverageStore {
         let mut new_start = start;
         let mut new_end = end;
 
-        // Candidates are intervals with start <= new_end AND end >= new_start
-        // (overlap or touch at endpoint).
+        // Walk backward through the candidate suffix and stop at the first gap.
+        // Non-overlapping, non-adjacent intervals make every earlier interval a gap too.
         let to_merge: Vec<(Vec<u8>, Vec<u8>)> = self
             .intervals
             .range(..=new_end.clone())
-            .filter(|(_, e)| **e >= new_start)
+            .rev()
+            .take_while(|(_, e)| **e >= new_start)
             .map(|(s, e)| (s.clone(), e.clone()))
             .collect();
 
@@ -164,17 +165,35 @@ impl CoverageStore {
         self.intervals.insert(new_start, new_end);
     }
 
-    /// Iterate present (non-tombstone) point entries whose key starts with
-    /// `prefix`, in sorted key order.
+    /// Delete every cached point in `[start, end)` and mark the whole range known.
+    ///
+    /// Draining values and extending coverage are one logical operation: coverage
+    /// without the drain could leave a stale presence authoritative at the new
+    /// cache anchor.
+    pub fn delete_range(&mut self, start: &[u8], end: &[u8]) {
+        if start >= end {
+            return;
+        }
+        self.points
+            .extract_if(start.to_vec()..end.to_vec(), |_, _| true)
+            .for_each(drop);
+        self.extend_coverage(start.to_vec(), end.to_vec());
+    }
+
+    /// Delete exactly `key`, represented as its point-sized coverage interval.
+    pub fn delete_point(&mut self, key: &[u8]) {
+        let mut end = key.to_vec();
+        end.push(0);
+        self.delete_range(key, &end);
+    }
+
+    /// Iterate point entries whose key starts with `prefix`, in sorted key order.
     pub fn iter_prefix_present(&self, prefix: &[u8]) -> impl Iterator<Item = (&Vec<u8>, &Vec<u8>)> {
         let p = prefix.to_vec();
         self.points
             .range(p.clone()..)
             .take_while(move |(k, _)| k.starts_with(&p))
-            .filter_map(|(k, v)| match v {
-                DataEntry::Value { bytes, .. } => Some((k, bytes)),
-                DataEntry::Deleted => None,
-            })
+            .map(|(k, v)| (k, &v.bytes))
     }
 
     /// Iterate present entries whose key starts with `prefix`, preserving
@@ -187,10 +206,9 @@ impl CoverageStore {
         self.points
             .range(p.clone()..)
             .take_while(move |(k, _)| k.starts_with(&p))
-            .filter(|(_, v)| matches!(v, DataEntry::Value { .. }))
     }
 
-    /// Iterate present (non-tombstone) point entries in the half-open range
+    /// Iterate point entries in the half-open range
     /// `[start, end)`, in sorted key order.
     pub fn iter_range_present(
         &self,
@@ -199,10 +217,7 @@ impl CoverageStore {
     ) -> impl Iterator<Item = (&Vec<u8>, &Vec<u8>)> {
         self.points
             .range(start.to_vec()..end.to_vec())
-            .filter_map(|(k, v)| match v {
-                DataEntry::Value { bytes, .. } => Some((k, bytes)),
-                DataEntry::Deleted => None,
-            })
+            .map(|(k, v)| (k, &v.bytes))
     }
 
     /// Iterate present entries in the half-open range `[start, end)`,
@@ -213,9 +228,7 @@ impl CoverageStore {
         start: &[u8],
         end: &[u8],
     ) -> impl Iterator<Item = (&Vec<u8>, &DataEntry)> {
-        self.points
-            .range(start.to_vec()..end.to_vec())
-            .filter(|(_, v)| matches!(v, DataEntry::Value { .. }))
+        self.points.range(start.to_vec()..end.to_vec())
     }
 
     /// Largest covered prefix of `[start, end)` walking forward from
@@ -317,14 +330,17 @@ mod tests {
     }
 
     #[test]
-    fn lookup_point_distinguishes_present_tombstone_absent_unknown() {
+    fn lookup_point_distinguishes_present_covered_absent_unknown() {
         let mut cs = CoverageStore::new();
         // Present value.
-        cs.put_point(s(b"k1"), Some(s(b"v1")));
+        cs.put_point(s(b"k1"), s(b"v1"));
         assert_eq!(cs.lookup_point(b"k1"), Some(Some(s(b"v1"))));
-        // Explicit tombstone.
-        cs.put_point(s(b"k2"), None);
+        // Point-sized coverage records authenticated absence.
+        cs.delete_point(b"k2");
         assert_eq!(cs.lookup_point(b"k2"), Some(None));
+        let mut k2_end = s(b"k2");
+        k2_end.push(0);
+        assert!(cs.covers_range(b"k2", &k2_end));
         // Unknown key with no coverage.
         assert_eq!(cs.lookup_point(b"k3"), None);
         // Covered gap: absence is authenticated.
@@ -372,6 +388,44 @@ mod tests {
     }
 
     #[test]
+    fn extend_merge_scan_is_bounded_to_merge_candidates() {
+        let mut cs = CoverageStore::new();
+        for i in 0..100u8 {
+            cs.extend_coverage(vec![i, 0], vec![i, 1]);
+        }
+        cs.extend_coverage(vec![99, 0], vec![100, 0]);
+        assert_eq!(cs.interval_count(), 100);
+        assert!(cs.covers_range(&[99, 0], &[100, 0]));
+    }
+
+    #[test]
+    fn extend_merge_scan_takes_candidate_suffix_until_first_gap() {
+        let mut cs = CoverageStore::new();
+        cs.extend_coverage(s(b"a"), s(b"b"));
+        cs.extend_coverage(s(b"c"), s(b"e"));
+        cs.extend_coverage(s(b"f"), s(b"h"));
+
+        // Touch the interval on the left, overlap the one on the right, and
+        // stop before the disjoint interval preceding both.
+        cs.extend_coverage(s(b"e"), s(b"g"));
+
+        assert_eq!(cs.intervals(), vec![(s(b"a"), s(b"b")), (s(b"c"), s(b"h"))]);
+    }
+
+    #[test]
+    fn delete_range_drains_points_and_covers_range() {
+        let mut cs = CoverageStore::new();
+        cs.put_point(s(b"a"), s(b"1"));
+        cs.put_point(s(b"b"), s(b"2"));
+        cs.put_point(s(b"c"), s(b"3"));
+        cs.delete_range(b"a", b"c");
+        assert_eq!(cs.point_count(), 1);
+        assert_eq!(cs.lookup_point(b"a"), Some(None));
+        assert_eq!(cs.lookup_point(b"b"), Some(None));
+        assert_eq!(cs.lookup_point(b"c"), Some(Some(s(b"3"))));
+    }
+
+    #[test]
     fn extend_ignores_zero_length() {
         let mut cs = CoverageStore::new();
         cs.extend_coverage(s(b"a"), s(b"a"));
@@ -381,20 +435,17 @@ mod tests {
     #[test]
     fn points_put_and_get() {
         let mut cs = CoverageStore::new();
-        cs.put_point(s(b"a"), Some(s(b"1")));
-        cs.put_point(s(b"b"), None);
-        assert_eq!(cs.get_point(b"a"), Some(&DataEntry::value(s(b"1"))));
-        assert_eq!(cs.get_point(b"b"), Some(&DataEntry::Deleted));
+        cs.put_point(s(b"a"), s(b"1"));
+        assert_eq!(cs.get_point(b"a"), Some(b"1".as_slice()));
         assert_eq!(cs.get_point(b"c"), None);
     }
 
     #[test]
-    fn iter_prefix_present_excludes_tombstones_and_outsiders() {
+    fn iter_prefix_present_excludes_outsiders() {
         let mut cs = CoverageStore::new();
-        cs.put_point(s(b"row/1/col"), Some(s(b"v1")));
-        cs.put_point(s(b"row/2/col"), None);
-        cs.put_point(s(b"row/3/col"), Some(s(b"v3")));
-        cs.put_point(s(b"other/4"), Some(s(b"v4")));
+        cs.put_point(s(b"row/1/col"), s(b"v1"));
+        cs.put_point(s(b"row/3/col"), s(b"v3"));
+        cs.put_point(s(b"other/4"), s(b"v4"));
         let got: Vec<_> = cs
             .iter_prefix_present(b"row/")
             .map(|(k, _)| k.clone())
@@ -405,9 +456,9 @@ mod tests {
     #[test]
     fn iter_range_present_respects_half_open_end() {
         let mut cs = CoverageStore::new();
-        cs.put_point(s(b"a"), Some(s(b"1")));
-        cs.put_point(s(b"b"), Some(s(b"2")));
-        cs.put_point(s(b"c"), Some(s(b"3")));
+        cs.put_point(s(b"a"), s(b"1"));
+        cs.put_point(s(b"b"), s(b"2"));
+        cs.put_point(s(b"c"), s(b"3"));
         let got: Vec<_> = cs
             .iter_range_present(b"a", b"c")
             .map(|(k, _)| k.clone())

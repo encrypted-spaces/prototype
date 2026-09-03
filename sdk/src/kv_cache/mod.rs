@@ -3,9 +3,9 @@
 //! A [`KvCache`] holds two kinds of authenticated knowledge anchored to a
 //! single state commitment:
 //!
-//! - **Point entries** — a key's exact value, or its proven absence.
-//! - **Coverage intervals** — half-open byte ranges within which every key's
-//!   presence or absence is known. A missing point inside coverage is
+//! - **Point entries** — authenticated key/value presences.
+//! - **Coverage intervals** — half-open byte ranges within which every key is
+//!   known. A missing point inside coverage is
 //!   authenticated absence; outside coverage means "unknown — ask the
 //!   server".
 //!
