@@ -44,6 +44,7 @@ bytesize = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+p3-batch-stark = { workspace = true }
 
 
 [[bench]]

@@ -18,6 +18,7 @@ members = [
     "sdk/codegen",
     "sdk_fuzzer",
     "zkp",
+    "zkp/src/spongefish-stark",
 ]
 resolver = "2"
 
@@ -121,32 +122,32 @@ ed25519-dalek = { version = "2.2.0", features = ["alloc", "serde"] }
 libcrux-kem = "0.0.5"
 
 # zkp stuff
-p3-air = "^0.5.2"
-p3-baby-bear = "^0.5.2"
-p3-blake3-air = "^0.5.2"
-p3-challenger = "^0.5.2"
-p3-circle = "^0.5.2"
-p3-commit = "^0.5.2"
-p3-dft = "^0.5.2"
-p3-field = "^0.5.2"
-p3-fri = "^0.5.2"
-p3-keccak = "^0.5.2"
-p3-keccak-air = "^0.5.2"
-p3-koala-bear = "^0.5.2"
-p3-lookup = "^0.5.2"
-p3-matrix = "^0.5.2"
-p3-maybe-rayon = "^0.5.2"
-p3-merkle-tree = "^0.5.2"
-p3-mersenne-31 = "^0.5.2"
-p3-poseidon2 = "^0.5.2"
-p3-poseidon2-air = "^0.5.2"
-p3-sha256 = "^0.5.2"
-p3-symmetric = "^0.5.2"
-p3-uni-stark = "^0.5.2"
-p3-batch-stark = "^0.5.2"
-spongefish = "0.7.0"
-spongefish-circuit = "0.7.0"
-spongefish-stark = { git = "https://github.com/mmaker/spongefish-stark.git", rev = "44e111df21444be4faf94dd54ed03ad26d513de5" }
+p3-air = "^0.6.3"
+p3-baby-bear = "^0.6.3"
+p3-blake3-air = "^0.6.3"
+p3-challenger = "^0.6.3"
+p3-circle = "^0.6.3"
+p3-commit = "^0.6.3"
+p3-dft = "^0.6.3"
+p3-field = "^0.6.3"
+p3-fri = "^0.6.3"
+p3-keccak = "^0.6.3"
+p3-keccak-air = "^0.6.3"
+p3-koala-bear = "^0.6.3"
+p3-lookup = "^0.6.3"
+p3-matrix = "^0.6.3"
+p3-maybe-rayon = "^0.6.3"
+p3-merkle-tree = "^0.6.3"
+p3-mersenne-31 = "^0.6.3"
+p3-poseidon2 = "^0.6.3"
+p3-poseidon2-air = "^0.6.3"
+p3-sha256 = "^0.6.3"
+p3-symmetric = "^0.6.3"
+p3-uni-stark = "^0.6.3"
+p3-batch-stark = "^0.6.3"
+spongefish = "^0.7.4"
+spongefish-circuit = "^0.7.4"
+spongefish-stark = { path = "zkp/src/spongefish-stark" }
 num-bigint = "0.4.6"
 num-traits = "0.2.19"
 

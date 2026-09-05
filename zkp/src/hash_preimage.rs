@@ -23,26 +23,35 @@ pub struct KoalaBearPoseidon2_16PreimageAir {
 
 impl KoalaBearPoseidon2_16PreimageAir {
     pub fn new(expected_blocks: &[[Option<KoalaBear>; P2_16_CONFIG.width]]) -> Self {
+        assert!(
+            !expected_blocks.is_empty(),
+            "at least one block is required"
+        );
+        let input_count = expected_blocks.len();
+
         let air = Poseidon2Air::new(poseidon_round_constants());
-        let selector = expected_blocks
-            .as_flattened()
-            .iter()
-            .map(|x| match x {
-                Some(_) => KoalaBear::ONE,
-                None => KoalaBear::ZERO,
-            })
-            .collect();
-        let expected = expected_blocks
-            .as_flattened()
-            .iter()
-            .map(|x| x.unwrap_or(KoalaBear::ZERO))
-            .collect();
+        let mut selector = Vec::with_capacity(input_count * P2_16_CONFIG.width);
+        let mut expected = Vec::with_capacity(input_count * P2_16_CONFIG.width);
+        for block in expected_blocks.iter().copied() {
+            for value in block {
+                selector.push(if value.is_some() {
+                    KoalaBear::ONE
+                } else {
+                    KoalaBear::ZERO
+                });
+                expected.push(value.unwrap_or(KoalaBear::ZERO));
+            }
+        }
 
         Self {
             air,
             expected,
             selector,
         }
+    }
+
+    pub(crate) fn input_count(&self) -> usize {
+        self.expected.len() / P2_16_CONFIG.width
     }
 }
 
@@ -61,6 +70,10 @@ impl BaseAir<KoalaBear> for KoalaBearPoseidon2_16PreimageAir {
             flat_preprocessed.extend_from_slice(expected_chunk);
         }
         Some(DenseMatrix::new(flat_preprocessed, P2_16_CONFIG.width * 2))
+    }
+
+    fn preprocessed_width(&self) -> usize {
+        P2_16_CONFIG.width * 2
     }
 }
 
@@ -95,11 +108,46 @@ impl<AB: AirBuilder<F = KoalaBear>> Air<AB> for KoalaBearPoseidon2_16PreimageAir
 impl KoalaBearPoseidon2_16PreimageAir {
     pub fn generate_trace_rows(
         &self,
-        inputs: &[[KoalaBear; P2_16_CONFIG.width]],
+        inputs: Vec<[KoalaBear; P2_16_CONFIG.width]>,
         extra_capacity_bits: usize,
     ) -> DenseMatrix<KoalaBear> {
         let constants = poseidon_round_constants();
 
         generate_poseidon2_16_trace(inputs, &constants, extra_capacity_bits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use p3_matrix::Matrix;
+    use spongefish_stark::{
+        air::AirTracePadding, ff::KoalaBearConfig, security_profile::Conservative,
+    };
+
+    #[test]
+    fn keeps_logical_rows_separate_from_hiding_safe_trace_preparation() {
+        for (input_count, expected_height) in
+            [(1, 128), (2, 128), (31, 128), (128, 128), (129, 256)]
+        {
+            let expected_blocks = vec![[None; P2_16_CONFIG.width]; input_count];
+            let inputs = vec![[KoalaBear::ZERO; P2_16_CONFIG.width]; input_count];
+            let air = KoalaBearPoseidon2_16PreimageAir::new(&expected_blocks);
+            let prepared = KoalaBearConfig::<Conservative>::prepare_air(
+                &air,
+                input_count,
+                AirTracePadding::RepeatLast,
+            );
+
+            assert_eq!(air.input_count(), input_count);
+            assert_eq!(air.preprocessed_trace().unwrap().height(), input_count);
+            assert_eq!(prepared.trace_height(), expected_height);
+            assert_eq!(
+                prepared
+                    .generate_trace(&inputs, |inputs| air.generate_trace_rows(inputs, 0))
+                    .height(),
+                expected_height
+            );
+        }
     }
 }

@@ -2,7 +2,7 @@ use alloc::{vec, vec::Vec};
 use core::{borrow::Borrow, marker::PhantomData, ptr};
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
-use spongefish::{Encoding, VerificationError, VerificationResult};
+use spongefish::{Encoding, VerificationResult};
 use std::borrow::BorrowMut;
 
 use crate::{
@@ -24,11 +24,15 @@ use p3_field::PrimeCharacteristicRing;
 use p3_koala_bear::KoalaBear;
 use p3_matrix::{dense::DenseMatrix, Matrix};
 use p3_maybe_rayon::prelude::*;
-use p3_uni_stark::{
-    prove_with_preprocessed, setup_preprocessed, verify_with_preprocessed, StarkGenericConfig,
-};
+#[cfg(test)]
+use p3_uni_stark::StarkGenericConfig;
+#[cfg(test)]
+use p3_uni_stark::{setup_preprocessed, verify_with_preprocessed};
+#[cfg(test)]
+use spongefish_stark::ff::KoalaBearStarkConfig;
 use spongefish_stark::{
-    ff::{KoalaBearConfig, KoalaBearStarkConfig},
+    air::{AirTracePadding, PreparedAir},
+    ff::KoalaBearConfig,
     security_profile::Conservative,
 };
 
@@ -64,9 +68,10 @@ pub struct PoseidonMveProof<M: Mkem> {
 
     /// Fiat-Shamir challenge derived during proving.
     pub challenge: [u8; 32],
-    /// Pad values used by the STARK proof.
+    /// Real response pad values used by the STARK proof.
     ///
-    /// The first `KEYMATERIAL_LIMBS` limbs encode prover response.
+    /// The first `KEYMATERIAL_LIMBS` limbs encode prover responses. Deterministic
+    /// trace padding is reconstructed by the AIR and is not serialized.
     pub pads: Vec<HashBlock>,
 
     /// Serialized STARK proof for the mVE relation.
@@ -116,13 +121,9 @@ fn expected_blocks_from_commitments(
     kept_commitments: &[KeyCommitment],
 ) -> Vec<HashBlockMask> {
     let real_count = 1 + kept_commitments.len();
-    let padded_count = real_count.next_power_of_two();
-    // println!("expected_blocks_from_commitments, padding size is {padded_count} (real_count = {real_count})");
-    let mut expected_blocks = Vec::with_capacity(padded_count);
+    let mut expected_blocks = Vec::with_capacity(real_count);
     expected_blocks.push(commitment_to_mask(key_commitment));
     expected_blocks.extend(kept_commitments.iter().map(commitment_to_mask));
-    let last = *expected_blocks.last().expect("at least key commitment");
-    expected_blocks.resize(padded_count, last);
     expected_blocks
 }
 
@@ -130,11 +131,10 @@ fn responses_from_pads(
     pads: &[HashBlock],
     num_responses: usize,
 ) -> Result<Vec<KeyMaterial>, MveError> {
-    let expected_len = (num_responses + 1).next_power_of_two() - 1;
-    if pads.len() != expected_len {
+    if pads.len() != num_responses {
         return Err(MveError::VerificationInputError);
     }
-    Ok(pads[..num_responses]
+    Ok(pads
         .iter()
         .map(|state| KeyMaterial::from_slice(&state[..KEYMATERIAL_LIMBS]))
         .collect::<Vec<_>>())
@@ -221,7 +221,7 @@ impl<M: Mkem, const K: usize, const U: usize> PoseidonMve<M, K, U> {
             .chain(keep_messages.iter())
             .cloned()
             .collect::<Vec<_>>();
-        let mut hash_inputs = witness
+        let hash_inputs = witness
             .iter()
             .map(|x| derivation.key_to_hash_state(x))
             .collect::<Vec<_>>();
@@ -250,32 +250,20 @@ impl<M: Mkem, const K: usize, const U: usize> PoseidonMve<M, K, U> {
             .map(|state| KeyMaterial::from_slice(&state[..KEYMATERIAL_LIMBS]))
             .collect::<Vec<_>>();
 
-        let mut pads = response_states;
+        let pads = response_states;
         prover_state.prover_messages(&responses);
-
-        // Pad to next power of two as required by plonky3's trace generation.
-        let real_count = hash_inputs.len(); // 1 (key) + keep_count
-        let padded_count = real_count.next_power_of_two();
-        let last_pad = *pads.last().unwrap();
-        let last_hash = *hash_inputs.last().unwrap();
-        // To pad, use the last pad and hash values
-        pads.resize(padded_count - 1, last_pad);
-        hash_inputs.resize(padded_count, last_hash);
 
         let kept_commitments = keep_indices
             .iter()
             .map(|&idx| committed_messages[idx])
             .collect::<Vec<_>>();
         let expected_blocks = expected_blocks_from_commitments(key_commitment, &kept_commitments);
-        let pad_blocks = pads.clone();
-        let air = MveAirKoalaBearPoseidon2_16::new(&expected_blocks, &pad_blocks);
+        let air = MveAirKoalaBearPoseidon2_16::new(&expected_blocks, &pads);
 
         let proof = air.prove(&hash_inputs);
-        debug_assert!(
-            MveAirKoalaBearPoseidon2_16::new(&expected_blocks, &pad_blocks)
-                .verify(&proof)
-                .is_ok()
-        );
+        debug_assert!(MveAirKoalaBearPoseidon2_16::new(&expected_blocks, &pads)
+            .verify(&proof)
+            .is_ok());
 
         PoseidonMveProof {
             ciphertexts: kept_ciphertexts,
@@ -283,7 +271,7 @@ impl<M: Mkem, const K: usize, const U: usize> PoseidonMve<M, K, U> {
             opened,
             kept_commitments,
             proof,
-            pads: pad_blocks,
+            pads,
         }
     }
 
@@ -557,15 +545,20 @@ impl MveAirKoalaBearPoseidon2_16 {
     pub fn new(expected_blocks: &[HashBlockMask], pads: &[HashBlock]) -> Self {
         assert_eq!(expected_blocks.len(), pads.len() + 1);
         let air = KoalaBearPoseidon2_16PreimageAir::new(expected_blocks);
-        let first_pad = HashBlock::default();
-        let pads = [first_pad]
-            .iter()
-            .chain(pads.iter())
+        let pads = core::iter::once(HashBlock::default())
+            .chain(pads.iter().copied())
             .flatten()
-            .copied()
             .collect::<Vec<_>>();
 
         Self { air, sum: pads }
+    }
+
+    fn prepare(&self) -> PreparedAir<'_, Self> {
+        KoalaBearConfig::<Conservative>::prepare_air(
+            self,
+            self.air.input_count(),
+            AirTracePadding::RepeatLast,
+        )
     }
 }
 
@@ -598,6 +591,10 @@ impl BaseAir<KoalaBear> for MveAirKoalaBearPoseidon2_16 {
             flat_preprocessed.extend_from_slice(sum_chunk);
         }
         Some(DenseMatrix::new(flat_preprocessed, BLOCK_LEN * 3))
+    }
+
+    fn preprocessed_width(&self) -> usize {
+        BLOCK_LEN * 3
     }
 }
 
@@ -654,14 +651,13 @@ impl<AB: AirBuilder<F = KoalaBear>> Air<AB> for MveAirKoalaBearPoseidon2_16 {
 }
 
 impl MveAirKoalaBearPoseidon2_16 {
-    pub fn generate_trace_rows(
+    fn generate_trace_rows(
         &self,
-        inputs: &[HashBlock],
+        inputs: Vec<HashBlock>,
         extra_capacity_bits: usize,
     ) -> DenseMatrix<KoalaBear> {
-        let preimage_matrix = self.air.generate_trace_rows(inputs, extra_capacity_bits);
-
         let s_0 = inputs[0];
+        let preimage_matrix = self.air.generate_trace_rows(inputs, extra_capacity_bits);
 
         let num_cols = preimage_matrix.width() + BLOCK_LEN;
         let num_rows = preimage_matrix.height();
@@ -692,45 +688,17 @@ impl MveAirKoalaBearPoseidon2_16 {
     pub fn prove(&self, inputs: &[HashBlock]) -> Vec<u8> {
         assert_eq!(
             inputs.len(),
-            self.air.expected.len() / BLOCK_LEN,
-            "The inputs should match the number of expected values"
+            self.air.input_count(),
+            "inputs should match the number of unpadded expected values"
         );
-        let trace = self.generate_trace_rows(inputs, 2);
-        let trace_height = trace.height();
-        assert!(
-            trace_height.is_power_of_two(),
-            "Trace height must be a power of two"
-        );
-        let degree_bits = trace_height.trailing_zeros() as usize;
-
-        let preprocessing_config = KoalaBearConfig::<Conservative>::verifier_config();
-        let config = KoalaBearConfig::<Conservative>::prover_config();
-        let preprocessed = setup_preprocessed(&preprocessing_config, self, degree_bits);
-        let proof = prove_with_preprocessed(
-            &config,
-            self,
-            trace,
-            &[],
-            preprocessed.as_ref().map(|(pp, _)| pp),
-        );
-
-        postcard::to_allocvec(&proof).unwrap()
+        let prepared = self.prepare();
+        let trace = prepared.generate_trace(inputs, |inputs| self.generate_trace_rows(inputs, 2));
+        KoalaBearConfig::<Conservative>::prove_prepared_air(&prepared, trace, &[])
     }
 
     pub fn verify(&self, narg_string: &[u8]) -> VerificationResult<()> {
-        let config = KoalaBearConfig::<Conservative>::verifier_config();
-        let proof: p3_uni_stark::Proof<KoalaBearStarkConfig> =
-            postcard::from_bytes(narg_string).map_err(|_| VerificationError)?;
-        let degree_bits = proof.degree_bits.saturating_sub(config.is_zk());
-        let preprocessed = setup_preprocessed(&config, self, degree_bits);
-        verify_with_preprocessed(
-            &config,
-            self,
-            &proof,
-            &[],
-            preprocessed.as_ref().map(|(_, vk)| vk),
-        )
-        .map_err(|_| VerificationError)
+        let prepared = self.prepare();
+        KoalaBearConfig::<Conservative>::verify_prepared_air(&prepared, narg_string, &[])
     }
 }
 
@@ -743,45 +711,26 @@ fn test_koala_bear_preimage() {
         statement: &KoalaBearPoseidon2_16PreimageAir,
         inputs: &[HashBlock],
     ) -> Vec<u8> {
-        let trace = statement.generate_trace_rows(inputs, 2);
-        let trace_height = trace.height();
-        assert!(
-            trace_height.is_power_of_two(),
-            "Trace height must be a power of two"
-        );
-        let degree_bits = trace_height.trailing_zeros() as usize;
-
-        let preprocessing_config = KoalaBearConfig::<Conservative>::verifier_config();
-        let config = KoalaBearConfig::<Conservative>::prover_config();
-        let preprocessed = setup_preprocessed(&preprocessing_config, statement, degree_bits);
-        let proof = prove_with_preprocessed(
-            &config,
+        let prepared = KoalaBearConfig::<Conservative>::prepare_air(
             statement,
-            trace,
-            &[],
-            preprocessed.as_ref().map(|(pp, _)| pp),
+            statement.input_count(),
+            AirTracePadding::RepeatLast,
         );
-
-        postcard::to_allocvec(&proof).unwrap()
+        let trace =
+            prepared.generate_trace(inputs, |inputs| statement.generate_trace_rows(inputs, 2));
+        KoalaBearConfig::<Conservative>::prove_prepared_air(&prepared, trace, &[])
     }
 
     fn verify_preimage(
         statement: &KoalaBearPoseidon2_16PreimageAir,
         narg_string: &[u8],
     ) -> VerificationResult<()> {
-        let config = KoalaBearConfig::<Conservative>::verifier_config();
-        let proof: p3_uni_stark::Proof<KoalaBearStarkConfig> =
-            postcard::from_bytes(narg_string).map_err(|_| VerificationError)?;
-        let degree_bits = proof.degree_bits.saturating_sub(config.is_zk());
-        let preprocessed = setup_preprocessed(&config, statement, degree_bits);
-        verify_with_preprocessed(
-            &config,
+        let prepared = KoalaBearConfig::<Conservative>::prepare_air(
             statement,
-            &proof,
-            &[],
-            preprocessed.as_ref().map(|(_, vk)| vk),
-        )
-        .map_err(|_| VerificationError)
+            statement.input_count(),
+            AirTracePadding::RepeatLast,
+        );
+        KoalaBearConfig::<Conservative>::verify_prepared_air(&prepared, narg_string, &[])
     }
 
     let hasher = KoalaBearPoseidon2_16::default();
@@ -866,6 +815,26 @@ fn test_koala_bear_mve() {
     let narg_string = mveprover.prove(&inputs);
     assert!(mveprover.verify(&narg_string).is_ok());
 
+    let proof: p3_uni_stark::Proof<KoalaBearStarkConfig> =
+        postcard::from_bytes(&narg_string).expect("valid proof bytes");
+    let config = KoalaBearConfig::<Conservative>::verifier_config();
+    let degree_bits = proof.degree_bits.saturating_sub(config.is_zk());
+    let min_hiding_trace_height = KoalaBearConfig::<Conservative>::hiding_trace_height();
+    assert_eq!(
+        1usize << degree_bits,
+        min_hiding_trace_height,
+        "the AIR proof boundary should pad short traces to the PCS hiding minimum"
+    );
+
+    let mut under_height_proof = proof;
+    under_height_proof.degree_bits =
+        min_hiding_trace_height.trailing_zeros() as usize - 1 + config.is_zk();
+    let under_height_proof = postcard::to_allocvec(&under_height_proof).unwrap();
+    assert!(
+        mveprover.verify(&under_height_proof).is_err(),
+        "the verifier should reject proofs below the PCS hiding minimum"
+    );
+
     let mut bad_narg_string = narg_string.clone();
     bad_narg_string[0] ^= 0x01;
     assert!(mveprover.verify(&bad_narg_string).is_err());
@@ -903,6 +872,27 @@ fn test_poseidon_mve_rejects_tampered_proof() {
 
     let proof = PoseidonMve::<M>::prove(&pks, &key_commitment, &key, "tamper_test");
     assert!(PoseidonMve::<M>::verify(&proof, &pks, &key_commitment, "tamper_test").is_ok());
+    assert_eq!(
+        proof.pads.len(),
+        proof.kept_commitments.len(),
+        "only real response pads should be serialized"
+    );
+
+    let mut excess_pads_proof = proof.clone();
+    excess_pads_proof
+        .pads
+        .push(*excess_pads_proof.pads.last().expect("at least one pad"));
+    assert!(
+        PoseidonMve::<M>::verify(&excess_pads_proof, &pks, &key_commitment, "tamper_test").is_err(),
+        "the verifier should reject serialized deterministic padding"
+    );
+
+    let mut missing_pad_proof = proof.clone();
+    missing_pad_proof.pads.pop();
+    assert!(
+        PoseidonMve::<M>::verify(&missing_pad_proof, &pks, &key_commitment, "tamper_test").is_err(),
+        "the verifier should reject a missing real response pad"
+    );
 
     let mut tampered_proof = proof.clone();
     tampered_proof.proof[0] ^= 0x01;
@@ -990,4 +980,428 @@ fn format_size(bytes: usize) -> String {
     } else {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     }
+}
+
+/// Plonky3's hiding-FRI masking (`p3_fri::HidingFriPcs`) only statistically
+/// hides a trace column as long as the verifier learns fewer evaluations of
+/// it than the number of interleaved random rows. This test reads the mVE
+/// trace height straight from the AIR's deterministic padding,
+/// builds the same interleaved-masking construction `HidingFriPcs::commit`
+/// uses, reveals however many points a real Conservative-profile proof
+/// actually reveals, and checks the group key baked into the `pad` column
+/// isn't recoverable from them.
+#[test]
+fn test_mve_hiding_margin_protects_group_key() {
+    use p3_field::{PrimeCharacteristicRing, PrimeField32};
+
+    let derivation = DerivationKoalaBearPoseidon2_16::default();
+    let key = KeyMaterial::random();
+    let key_commitment = derivation.commit(&key);
+    let key_state = derivation.key_to_hash_state(&key);
+
+    // The real trace height for MVE_DEFAULT_K/U, straight from the
+    // production padding logic: this test tracks whatever height the code
+    // actually produces, rather than a value we'd have to keep in sync by
+    // hand.
+    let kept_commitments: Vec<KeyCommitment> = (0..MVE_DEFAULT_U)
+        .map(|_| derivation.commit(&KeyMaterial::random()))
+        .collect();
+    let expected_blocks = expected_blocks_from_commitments(&key_commitment, &kept_commitments);
+    let pads = vec![HashBlock::default(); kept_commitments.len()];
+    let air = MveAirKoalaBearPoseidon2_16::new(&expected_blocks, &pads);
+    let n = air.prepare().trace_height();
+
+    // The real number of points a Conservative-profile proof reveals: FRI
+    // query openings plus the two out-of-domain openings, each an element
+    // of the quartic extension field.
+    let num_revealed = KoalaBearConfig::<Conservative>::hiding_revealed_base_field_constraints();
+
+    let mut rng = rand::rng();
+    let mut recovered = [KoalaBear::ZERO; KEYMATERIAL_LIMBS];
+
+    for (limb, recovered_limb) in recovered.iter_mut().enumerate() {
+        let secret = key_state[limb];
+
+        // The masked column: `n` real rows holding `secret` (the `pad`
+        // column is constant across rows, matching the real AIR), then `n`
+        // interleaved random rows, exactly as `HidingFriPcs::commit` builds
+        // its degree-<2n masked polynomial.
+        let mut domain: Vec<(KoalaBear, KoalaBear)> =
+            (0..n).map(|i| (KoalaBear::new(i as u32), secret)).collect();
+        // `rng.random()` can't be used directly here: the workspace's
+        // `rand` and the one `p3_koala_bear`'s `Distribution<KoalaBear>`
+        // impl is built against are different major versions, so reduce a
+        // raw `u32` by hand instead.
+        domain.extend((0..n).map(|i| {
+            (
+                KoalaBear::new((n + i) as u32),
+                KoalaBear::new(rng.random::<u32>() % KoalaBear::ORDER_U32),
+            )
+        }));
+
+        // What the verifier actually sees: `num_revealed` evaluations of
+        // that masked polynomial, standing in for the FRI query openings
+        // and the OOD openings at zeta/zeta*g.
+        let revealed: Vec<(KoalaBear, KoalaBear)> = (0..num_revealed)
+            .map(|i| {
+                let x = KoalaBear::new((2 * n + i) as u32);
+                (x, lagrange_eval(&domain, x))
+            })
+            .collect();
+
+        // Reconstruct whatever polynomial fits all the revealed points and
+        // read off row 0. When `num_revealed >= 2n` this is, by
+        // uniqueness, exactly the real degree-<2n masked polynomial, and
+        // the group key comes out exactly. When `num_revealed < 2n` it's
+        // some other, wrong polynomial that only agrees with the truth at
+        // the revealed points -- evaluating it at row 0 gives an
+        // effectively random wrong value instead.
+        *recovered_limb = lagrange_eval(&revealed, KoalaBear::new(0));
+    }
+
+    assert_ne!(
+        recovered.as_slice(),
+        &key_state[..KEYMATERIAL_LIMBS],
+        "hiding margin at N={n} is unsafe: {num_revealed} revealed points \
+         are enough to recover the group key by interpolation"
+    );
+}
+
+/// Evaluates the unique polynomial of degree `< points.len()` interpolating
+/// `points`, at `x`, via the textbook Lagrange formula. `O(n^2)`; fine for
+/// the small `n` used by the test above.
+#[cfg(test)]
+fn lagrange_eval(points: &[(KoalaBear, KoalaBear)], x: KoalaBear) -> KoalaBear {
+    use p3_field::Field;
+
+    let mut acc = KoalaBear::ZERO;
+    for &(xi, yi) in points {
+        let mut term = yi;
+        for &(xj, _) in points {
+            if xj == xi {
+                continue;
+            }
+            term = term * (x - xj) * (xi - xj).try_inverse().expect("distinct domain points");
+        }
+        acc += term;
+    }
+    acc
+}
+
+/// A [`p3_challenger`] wrapper that transparently delegates every operation
+/// to a real challenger, but also records the return value of every
+/// `sample_bits` call. Plugged into a real, unmodified verification run,
+/// this recovers the real FRI query indices a real verifier derives from
+/// the transcript, without re-deriving that transcript by hand: the
+/// verification logic that computes them stays untouched, so a mistake in
+/// this wrapper makes the wrapped `verify` call itself fail rather than
+/// silently returning wrong indices.
+#[cfg(test)]
+#[derive(Clone)]
+struct IndexLoggingChallenger<C> {
+    inner: C,
+    indices: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+}
+
+#[cfg(test)]
+impl<C, T> p3_challenger::CanObserve<T> for IndexLoggingChallenger<C>
+where
+    C: p3_challenger::CanObserve<T>,
+{
+    fn observe(&mut self, value: T) {
+        self.inner.observe(value);
+    }
+
+    fn observe_slice(&mut self, values: &[T])
+    where
+        T: Clone,
+    {
+        self.inner.observe_slice(values);
+    }
+}
+
+#[cfg(test)]
+impl<C, T> p3_challenger::CanSample<T> for IndexLoggingChallenger<C>
+where
+    C: p3_challenger::CanSample<T>,
+{
+    fn sample(&mut self) -> T {
+        self.inner.sample()
+    }
+}
+
+#[cfg(test)]
+impl<C> p3_challenger::CanSampleBits<usize> for IndexLoggingChallenger<C>
+where
+    C: p3_challenger::CanSampleBits<usize>,
+{
+    fn sample_bits(&mut self, bits: usize) -> usize {
+        let index = self.inner.sample_bits(bits);
+        self.indices.lock().unwrap().push(index);
+        index
+    }
+}
+
+#[cfg(test)]
+impl<C> p3_challenger::FieldChallenger<KoalaBear> for IndexLoggingChallenger<C> where
+    C: p3_challenger::FieldChallenger<KoalaBear>
+{
+}
+
+#[cfg(test)]
+impl<C> p3_challenger::GrindingChallenger for IndexLoggingChallenger<C>
+where
+    C: p3_challenger::GrindingChallenger<Witness = KoalaBear> + Clone + Sync,
+{
+    type Witness = KoalaBear;
+
+    fn grind(&mut self, bits: usize) -> Self::Witness {
+        // Never exercised on the verifier path this wrapper is used for
+        // (grinding is a prover-only operation); delegate for completeness.
+        self.inner.grind(bits)
+    }
+}
+
+/// A [`StarkGenericConfig`] identical to the real `KoalaBearStarkConfig`,
+/// except its `Challenger` is wrapped in [`IndexLoggingChallenger`] so a
+/// real verification run's FRI query indices can be recovered afterward.
+/// Concrete rather than generic over `SC`: `p3_fri`'s `Pcs<Challenge,
+/// Challenger>` impls are generic over the challenger type, but nothing
+/// carries that through an abstract `SC: StarkGenericConfig` bound, so this
+/// is written directly against the one config used here.
+#[cfg(test)]
+#[derive(Clone)]
+struct IndexLoggingConfig {
+    inner: spongefish_stark::ff::KoalaBearStarkConfig,
+    indices: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+}
+
+#[cfg(test)]
+impl StarkGenericConfig for IndexLoggingConfig {
+    type Pcs = <spongefish_stark::ff::KoalaBearStarkConfig as StarkGenericConfig>::Pcs;
+    type Challenge = <spongefish_stark::ff::KoalaBearStarkConfig as StarkGenericConfig>::Challenge;
+    type Challenger = IndexLoggingChallenger<
+        <spongefish_stark::ff::KoalaBearStarkConfig as StarkGenericConfig>::Challenger,
+    >;
+
+    fn pcs(&self) -> &Self::Pcs {
+        self.inner.pcs()
+    }
+
+    fn initialise_challenger(&self) -> Self::Challenger {
+        IndexLoggingChallenger {
+            inner: self.inner.initialise_challenger(),
+            indices: self.indices.clone(),
+        }
+    }
+}
+
+/// Recovers the group key from nothing but a real, serialized
+/// `PoseidonMveProof` and the public commitments that go with it -- no
+/// access to the trace, the witness, or any prover-side randomness.
+///
+/// This is exactly what an honest-but-curious server holding a stored proof
+/// could do: run the real verifier (confirming the proof is genuinely
+/// valid), recover the real FRI query indices it derives along the way
+/// (via [`IndexLoggingChallenger`]), read the actual opened trace values
+/// straight out of the proof bytes (already there, in the clear), and
+/// interpolate the masked `pad` column back to a value at row 0. Whether
+/// that value is the real key depends entirely on whether the trace height
+/// gave hiding mode enough masking rows relative to how many points get
+/// revealed -- see `test_mve_proof_hiding_margin_protects_group_key`.
+#[cfg(test)]
+fn attack_from_proof(
+    key_commitment: &KeyCommitment,
+    kept_commitments: &[KeyCommitment],
+    pads: &[HashBlock],
+    proof_bytes: &[u8],
+) -> [KoalaBear; KEYMATERIAL_LIMBS] {
+    use p3_field::{Field, PrimeCharacteristicRing, TwoAdicField};
+
+    // `p3_util::reverse_bits_len` isn't a direct dependency of this crate;
+    // inlined rather than adding one just for this.
+    fn reverse_bits_len(x: usize, bit_len: usize) -> usize {
+        x.reverse_bits()
+            .overflowing_shr(usize::BITS - bit_len as u32)
+            .0
+    }
+
+    // Reconstruct the AIR from public data only -- the same commitments and
+    // `pads` a real verifier reconstructs it from, never the real witness.
+    let expected_blocks = expected_blocks_from_commitments(key_commitment, kept_commitments);
+    let air = MveAirKoalaBearPoseidon2_16::new(&expected_blocks, pads);
+
+    // Built from a *fresh* `verifier_config()` call, not a `.clone()` of one:
+    // `ChaChaCsrng::clone()` re-seeds from entropy instead of copying state,
+    // so cloning here would silently re-randomize the salt
+    // `commit_preprocessing` uses, and the recomputed `preprocessed_commit`
+    // would stop matching the one baked into the proof's transcript.
+    let indices = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let logging_config = IndexLoggingConfig {
+        inner: KoalaBearConfig::<Conservative>::verifier_config(),
+        indices: indices.clone(),
+    };
+
+    let proof: p3_uni_stark::Proof<IndexLoggingConfig> =
+        postcard::from_bytes(proof_bytes).expect("valid proof bytes");
+    let degree_bits = proof.degree_bits.saturating_sub(logging_config.is_zk());
+    let prepared = air.prepare();
+    let preprocessed = setup_preprocessed(&logging_config, &prepared, degree_bits);
+
+    // Run the real, unmodified verifier. If this is `Err`, the proof itself
+    // is invalid and nothing below should be trusted -- but our own sanity
+    // check already confirmed this exact proof verifies, so this should
+    // always succeed; it's here so a bug in the wrapper fails loudly
+    // instead of silently producing wrong indices.
+    verify_with_preprocessed(
+        &logging_config,
+        &prepared,
+        &proof,
+        &[],
+        preprocessed.as_ref().map(|(_, vk)| vk),
+    )
+    .expect("a real, honestly generated proof must verify");
+
+    // The trace round is the second commitment round whenever ZK randomizes
+    // the trace (always true here): [random, trace, quotient, preprocessed].
+    assert!(
+        proof.commitments.random.is_some(),
+        "expected ZK to be enabled"
+    );
+    const TRACE_ROUND: usize = 1;
+    let pad_start = prepared.width() - BLOCK_LEN;
+    let fri_proof = &proof.opening_proof.1;
+
+    // `IndexLoggingChallenger::sample_bits` logs *every* `sample_bits` call,
+    // not just the per-query domain indices `verify_fri`'s query loop
+    // derives: `check_witness` (used for both the per-commit-phase-round PoW
+    // check and the one query PoW check) also calls `sample_bits`. Those
+    // precede the real per-query indices in the log, one per commit phase
+    // round plus one for the query PoW, so skip exactly that many.
+    let logged = indices.lock().unwrap().clone();
+    let pow_checks = fri_proof.commit_phase_commits.len() + 1;
+    let query_indices = &logged[pow_checks..];
+
+    // For each FRI query, recompute the exact domain point the opening was
+    // taken at (the same formula `p3_fri::verifier::open_input` uses), and
+    // read the actual opened trace row straight out of the proof's batch
+    // openings -- these are genuine, in-the-clear field elements the proof
+    // already contains, not recomputed or assumed. `degree_bits` (read
+    // straight off the proof, not hardcoded) is the pre-doubling trace
+    // height's exponent, so this tracks whatever height the proof actually
+    // used.
+    let log_blowup = 3; // Conservative
+    let log_final_poly_len = 3; // Conservative
+    let total_log_reduction: usize = fri_proof.query_proofs[0]
+        .commit_phase_openings
+        .iter()
+        .map(|o| o.log_arity as usize)
+        .sum();
+    let log_global_max_height = total_log_reduction + log_blowup + log_final_poly_len;
+    let trace_log_height = degree_bits + 1 + log_blowup; // degree_bits is pre-doubling
+    assert_eq!(
+        log_global_max_height, trace_log_height,
+        "expected the trace matrix to be the tallest committed matrix"
+    );
+
+    let g = KoalaBear::two_adic_generator(trace_log_height);
+    let domain_point = |index: usize| -> KoalaBear {
+        KoalaBear::GENERATOR * g.exp_u64(reverse_bits_len(index, trace_log_height) as u64)
+    };
+
+    // Queries are sampled with replacement from a domain of only
+    // `2^trace_log_height` points, so among the revealed draws a handful of
+    // repeats is expected (birthday paradox). A repeated index is the same
+    // point again, not a new constraint, so pin the polynomial down using
+    // only *distinct* points -- Lagrange interpolation over a point that
+    // appears more than once doesn't error, it just silently reconstructs
+    // the wrong polynomial (fewer real constraints than points).
+    let mut seen = std::collections::HashSet::new();
+    let mut points: Vec<(KoalaBear, &[KoalaBear])> = Vec::new();
+    for (&index, query_proof) in query_indices.iter().zip(&fri_proof.query_proofs) {
+        if !seen.insert(index) {
+            continue;
+        }
+        let row = query_proof.input_proof[TRACE_ROUND].opened_values[0].as_slice();
+        points.push((domain_point(index), row));
+    }
+
+    // Row 0 of the un-blown trace domain is `domain.shift() = Val::ONE`
+    // (`TwoAdicFriPcs::natural_domain_for_degree` always shifts by `ONE`;
+    // the LDE domain the FRI queries actually land on is separately
+    // re-shifted to `GENERATOR` by `commit`, which `domain_point` already
+    // accounts for).
+    let row0 = KoalaBear::ONE;
+
+    // Reconstruct whatever polynomial fits all the distinct revealed points
+    // and read off row 0. If the trace has fewer masking rows than points
+    // revealed here, this is, by uniqueness, exactly the real masked
+    // polynomial and the key comes out exactly. Otherwise it's some other,
+    // wrong polynomial that only agrees with the truth at the revealed
+    // points -- evaluating it at row 0 gives an effectively random wrong
+    // value instead.
+    let mut recovered = [KoalaBear::ZERO; KEYMATERIAL_LIMBS];
+    for (limb, recovered_limb) in recovered.iter_mut().enumerate() {
+        let limb_points: Vec<(KoalaBear, KoalaBear)> = points
+            .iter()
+            .map(|&(x, row)| (x, row[pad_start + limb]))
+            .collect();
+        *recovered_limb = lagrange_eval(&limb_points, row0);
+    }
+    recovered
+}
+
+/// Runs [`attack_from_proof`] against a real, serialized `PoseidonMveProof`
+/// built at the real production padding height (not a hardcoded one), and
+/// checks the group key can't be recovered from nothing but the proof
+/// bytes and the public commitments a real verifier already has.
+///
+#[test]
+fn test_mve_proof_hiding_margin_protects_group_key() {
+    let derivation = DerivationKoalaBearPoseidon2_16::default();
+
+    let key = KeyMaterial::random();
+    let key_commitment = derivation.commit(&key);
+    let kept_messages: Vec<KeyMaterial> =
+        (0..MVE_DEFAULT_U).map(|_| KeyMaterial::random()).collect();
+    let kept_commitments: Vec<KeyCommitment> =
+        kept_messages.iter().map(|m| derivation.commit(m)).collect();
+
+    let hash_inputs: Vec<HashBlock> = std::iter::once(&key)
+        .chain(kept_messages.iter())
+        .map(|k| derivation.key_to_hash_state(k))
+        .collect();
+    let key_state = hash_inputs[0];
+    let pads: Vec<HashBlock> = hash_inputs[1..]
+        .iter()
+        .map(|state| {
+            let mut diff = HashBlock::default();
+            for (dst, (val, key_val)) in diff.iter_mut().zip(state.iter().zip(key_state.iter())) {
+                *dst = *val - *key_val;
+            }
+            diff
+        })
+        .collect();
+
+    let expected_blocks = expected_blocks_from_commitments(&key_commitment, &kept_commitments);
+    let air = MveAirKoalaBearPoseidon2_16::new(&expected_blocks, &pads);
+    let padded_count = air.prepare().trace_height();
+
+    // The only proof bytes a server, or anyone else, ever actually sees.
+    let proof_bytes = air.prove(&hash_inputs);
+    assert!(
+        air.verify(&proof_bytes).is_ok(),
+        "sanity check: the real, unwrapped verifier should accept this proof"
+    );
+
+    // The attack: only the proof bytes and the public commitments, never
+    // `hash_inputs`/`key` -- those are passed separately below purely to
+    // check the attack's answer against ground truth.
+    let recovered = attack_from_proof(&key_commitment, &kept_commitments, &pads, &proof_bytes);
+
+    assert_ne!(
+        recovered.as_slice(),
+        &key_state[..KEYMATERIAL_LIMBS],
+        "hiding margin at padded height {padded_count} is unsafe: the real proof leaked the pad column"
+    );
 }
