@@ -48,6 +48,18 @@ use spongefish_circuit::{
 use crate::security_profile::SecurityParameters;
 use crate::{HashRelationBackend, RelationArithmetization, RelationChallenge, RelationField};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProvingError;
+
+mod terminal_mask;
+
+#[cfg(all(test, feature = "poseidon2", feature = "p3-koala-bear"))]
+mod masking_tests;
+
+#[cfg(all(test, feature = "poseidon2", feature = "p3-koala-bear"))]
+#[allow(dead_code)]
+mod production_fixtures;
+
 // --------------------------------------
 // Constants for the protocol
 // --------------------------------------
@@ -159,6 +171,7 @@ struct HashLookupAir<H, F, const WIDTH: usize, const LIN_WIDTH: usize> {
     io_multiplicities: MultiplicityColumns<F, WIDTH>,
     linear_multiplicities: MultiplicityColumns<F, WIDTH>,
     trace_len: usize,
+    terminal_masking: bool,
 }
 
 /// AIR for public-variables lookup tables.
@@ -174,6 +187,7 @@ struct LinearConstraintsAir<F, const WIDTH: usize, const LIN_WIDTH: usize> {
     constraints: LinearConstraintsInstance<F>,
     trace_len: usize,
     active_width: usize,
+    terminal_masking: bool,
 }
 
 /// Combined AIR for the generic relation.
@@ -217,6 +231,7 @@ where
             io_multiplicities,
             linear_multiplicities,
             trace_len,
+            terminal_masking: false,
         }
     }
 }
@@ -244,6 +259,7 @@ impl<F, const WIDTH: usize, const LIN_WIDTH: usize> LinearConstraintsAir<F, WIDT
             constraints,
             trace_len,
             active_width,
+            terminal_masking: false,
         }
     }
 }
@@ -260,6 +276,7 @@ pub struct PreparedRelation<B: HashRelationBackend<WIDTH>, const WIDTH: usize> {
     instance: PermutationInstance<RelationField<B, { WIDTH }>, WIDTH>,
     linear_constraints: LinearConstraintsInstance<RelationField<B, { WIDTH }>>,
     linear_width: usize,
+    terminal_masking: bool,
     original_constraints_len: usize,
     hash_log_len: usize,
     public_log_len: usize,
@@ -346,6 +363,12 @@ where
             instance,
             linear_constraints,
             linear_width,
+            terminal_masking: linear_width > 0
+                && terminal_mask::supported::<
+                    RelationField<B, WIDTH>,
+                    RelationChallenge<B, WIDTH>,
+                    WIDTH,
+                >(),
             original_constraints_len,
             hash_log_len,
             public_log_len,
@@ -412,6 +435,27 @@ where
             <B::Config as StarkGenericConfig>::Challenger,
         >>::Commitment: Sync,
     {
+        self.try_prove(backend, witness)
+            .expect("terminal-mask challenge retry limit exceeded")
+    }
+
+    pub fn try_prove(
+        &self,
+        backend: &B,
+        witness: &PreparedWitness<B, WIDTH>,
+    ) -> Result<Vec<u8>, ProvingError>
+    where
+        p3_uni_stark::Domain<B::Config>: Send + Sync,
+        <B::Config as StarkGenericConfig>::Pcs: Sync,
+        <<B::Config as StarkGenericConfig>::Pcs as p3_commit::Pcs<
+            RelationChallenge<B, { WIDTH }>,
+            <B::Config as StarkGenericConfig>::Challenger,
+        >>::ProverData: Sync,
+        <<B::Config as StarkGenericConfig>::Pcs as p3_commit::Pcs<
+            RelationChallenge<B, { WIDTH }>,
+            <B::Config as StarkGenericConfig>::Challenger,
+        >>::Commitment: Sync,
+    {
         assert_eq!(
             backend.security_parameters(),
             self.security_parameters,
@@ -423,43 +467,64 @@ where
             "prepared witness trace length does not match prepared relation",
         );
 
-        let (airs, traces) = self.generate_trace_rows(witness);
-        let log_degrees = self.trace_degree_bits();
-        assert_eq!(
-            trace_degree_bits(&traces),
-            log_degrees,
-            "generated trace degrees do not match prepared relation",
-        );
-        let config = backend.prover_config();
-        for trace in &traces {
-            crate::hiding::assert_safe_trace_height::<B::Config>(
-                &config,
-                self.security_parameters,
-                trace.height(),
+        let proof = terminal_mask::retry_completed_proofs(|| {
+            let (airs, traces) = self.generate_trace_rows(witness);
+            let log_degrees = self.trace_degree_bits();
+            assert_eq!(
+                trace_degree_bits(&traces),
+                log_degrees,
+                "generated trace degrees do not match prepared relation",
             );
-        }
-        // Transparent preprocessed commitments are public verifier-recomputed data, so they use the
-        // deterministic verifier config. Witness-bearing commitments below use fresh prover config.
-        let preprocessing_config = backend.verifier_config();
-        let log_ext_degrees = log_ext_degrees(&log_degrees, &config);
-        let prover_data =
-            ProverData::from_airs_and_degrees(&preprocessing_config, &airs, &log_ext_degrees);
-        #[cfg(debug_assertions)]
-        for (air, lookups) in airs.iter().zip(&prover_data.common.lookups) {
-            crate::hiding::debug_assert_air_row_window(
-                air,
-                !lookups.is_empty(),
-                <p3_lookup::InteractionSymbolicBuilder<
-                    RelationField<B, { WIDTH }>,
-                    RelationChallenge<B, { WIDTH }>,
-                > as p3_air::AirBuilder>::WINDOW,
-            );
-        }
-        let publics = vec![Vec::new(); airs.len()];
-        let trace_refs = traces.iter().collect::<Vec<_>>();
-        let instances = StarkInstance::new_multiple(&airs, &trace_refs, &publics);
-        let proof = p3_batch_stark::prove_batch(&config, &instances, &prover_data);
-        postcard::to_allocvec(&proof).expect("proof serialization should succeed")
+            let config = backend.prover_config();
+            for trace in &traces {
+                crate::hiding::assert_safe_trace_height::<B::Config>(
+                    &config,
+                    self.security_parameters,
+                    trace.height(),
+                );
+            }
+            // Transparent preprocessed commitments are public verifier-recomputed data, so they use the
+            // deterministic verifier config. Witness-bearing commitments below use fresh prover config.
+            let preprocessing_config = backend.verifier_config();
+            let log_ext_degrees = log_ext_degrees(&log_degrees, &config);
+            let prover_data =
+                ProverData::from_airs_and_degrees(&preprocessing_config, &airs, &log_ext_degrees);
+            #[cfg(debug_assertions)]
+            for (air, lookups) in airs.iter().zip(&prover_data.common.lookups) {
+                crate::hiding::debug_assert_air_row_window(
+                    air,
+                    !lookups.is_empty(),
+                    <p3_lookup::InteractionSymbolicBuilder<
+                        RelationField<B, { WIDTH }>,
+                        RelationChallenge<B, { WIDTH }>,
+                    > as p3_air::AirBuilder>::WINDOW,
+                );
+            }
+            let publics = vec![Vec::new(); airs.len()];
+            let trace_refs = traces.iter().collect::<Vec<_>>();
+            let instances = StarkInstance::new_multiple(&airs, &trace_refs, &publics);
+            let proof = p3_batch_stark::prove_batch(&config, &instances, &prover_data);
+            let accepted = if self.terminal_masking_enabled() {
+                let challenges = terminal_mask::replay_lookup_challenges(
+                    &config,
+                    &airs,
+                    &log_degrees,
+                    &publics,
+                    &prover_data.common,
+                    &proof,
+                )
+                .expect("completed proof must match the prepared relation");
+                let beta = challenges
+                    .iter()
+                    .find_map(|instance| instance.get(1))
+                    .expect("masked relation must have lookup challenges");
+                terminal_mask::has_full_degree(*beta)
+            } else {
+                true
+            };
+            (proof, accepted)
+        })?;
+        Ok(postcard::to_allocvec(&proof).expect("proof serialization should succeed"))
     }
 
     /// Verify a STARK proof against this relation and backend.
@@ -482,29 +547,33 @@ where
     }
 
     fn build_airs(&self) -> Vec<PreparedRelationAir<B, WIDTH>> {
-        let hash_air =
+        let mut hash_air =
             HashLookupAir::<B::Air, RelationField<B, { WIDTH }>, WIDTH, MAX_LINEAR_WIDTH>::new(
                 self.hash.clone(),
                 self.instance.clone(),
                 self.linear_constraints.clone(),
                 1usize << self.hash_log_len,
             );
+        hash_air.terminal_masking = self.terminal_masking_enabled();
+        let mut linear_air =
+            LinearConstraintsAir::<RelationField<B, { WIDTH }>, WIDTH, MAX_LINEAR_WIDTH>::new(
+                self.linear_constraints.clone(),
+                1usize << self.linear_log_len,
+                self.linear_width,
+            );
+        linear_air.terminal_masking = self.terminal_masking_enabled();
         vec![
             HashRelationAir::Hash(Box::new(hash_air)),
             HashRelationAir::Public(PublicVarLookupAir::new(
                 self.instance.clone(),
                 1usize << self.public_log_len,
             )),
-            HashRelationAir::Linear(LinearConstraintsAir::<
-                RelationField<B, { WIDTH }>,
-                WIDTH,
-                MAX_LINEAR_WIDTH,
-            >::new(
-                self.linear_constraints.clone(),
-                1usize << self.linear_log_len,
-                self.linear_width,
-            )),
+            HashRelationAir::Linear(linear_air),
         ]
+    }
+
+    fn terminal_masking_enabled(&self) -> bool {
+        self.terminal_masking
     }
 
     fn num_constraints(&self) -> usize {
@@ -523,21 +592,23 @@ where
         Vec<PreparedRelationTrace<B, WIDTH>>,
     ) {
         let hash_trace = self.hash.build_trace(&witness.witness);
-        let trace = pad_dense_matrix_to_height(hash_trace, 1usize << self.hash_log_len);
+        let mut trace = pad_dense_matrix_to_height(hash_trace, 1usize << self.hash_log_len);
         let public_trace = build_public_lookup_main_trace::<RelationField<B, { WIDTH }>>(
             1usize << self.public_log_len,
         );
         let airs = self.build_airs();
-        let mut traces = vec![trace, public_trace];
-        traces.push(build_linear_constraints_trace::<
-            RelationField<B, { WIDTH }>,
-            MAX_LINEAR_WIDTH,
-        >(
-            &witness.witness.linear_constraints,
-            1usize << self.linear_log_len,
-        ));
+        let mut linear_trace =
+            build_linear_constraints_trace::<RelationField<B, { WIDTH }>, MAX_LINEAR_WIDTH>(
+                &witness.witness.linear_constraints,
+                1usize << self.linear_log_len,
+            );
+        if self.terminal_masking_enabled() {
+            let tuples = terminal_mask::sample_tuples();
+            trace = terminal_mask::append_two_row_columns(trace, &tuples);
+            linear_trace = terminal_mask::append_two_row_columns(linear_trace, &tuples);
+        }
 
-        (airs, traces)
+        (airs, vec![trace, public_trace, linear_trace])
     }
 }
 
@@ -611,7 +682,7 @@ where
     F: Field + Unit + PartialEq + Send + Sync,
 {
     fn width(&self) -> usize {
-        self.hash.main_width()
+        self.hash.main_width() + usize::from(self.terminal_masking) * terminal_mask::WIDTH
     }
 
     fn preprocessed_trace(&self) -> Option<RowMajorMatrix<F>> {
@@ -650,11 +721,17 @@ where
             lookup.output_linear_constraints = linear_output;
         }
 
+        if self.terminal_masking {
+            ptrace = terminal_mask::append_two_row_columns(
+                ptrace,
+                &[[<F as PrimeCharacteristicRing>::ONE]; terminal_mask::ROWS],
+            );
+        }
         Some(ptrace)
     }
 
     fn preprocessed_width(&self) -> usize {
-        num_lookup_cols::<WIDTH>()
+        num_lookup_cols::<WIDTH>() + usize::from(self.terminal_masking)
     }
 
     fn num_periodic_columns(&self) -> usize {
@@ -693,17 +770,23 @@ where
 {
     fn width(&self) -> usize {
         num_linear_main_cols::<LIN_WIDTH>()
+            + usize::from(self.terminal_masking) * terminal_mask::WIDTH
     }
 
     fn preprocessed_trace(&self) -> Option<RowMajorMatrix<F>> {
-        Some(build_lin_lookup_trace::<F, LIN_WIDTH>(
-            &self.constraints,
-            self.trace_len,
-        ))
+        let trace = build_lin_lookup_trace::<F, LIN_WIDTH>(&self.constraints, self.trace_len);
+        Some(if self.terminal_masking {
+            terminal_mask::append_two_row_columns(
+                trace,
+                &[[<F as PrimeCharacteristicRing>::ONE]; terminal_mask::ROWS],
+            )
+        } else {
+            trace
+        })
     }
 
     fn preprocessed_width(&self) -> usize {
-        num_linear_preprocessed_cols::<LIN_WIDTH>()
+        num_linear_preprocessed_cols::<LIN_WIDTH>() + usize::from(self.terminal_masking)
     }
 }
 
@@ -735,10 +818,13 @@ where
     F: Field + Unit + PartialEq + Send + Sync,
 {
     fn eval(&self, builder: &mut AB) {
-        self.hash.eval(builder);
+        self.hash.eval(&mut terminal_mask::MainTracePrefix {
+            inner: builder,
+            width: self.hash.main_width(),
+        });
 
         let main = builder.main();
-        let row = main.current_slice();
+        let row = &main.current_slice()[..self.hash.main_width()];
         let frame = self.hash.row_frame(row);
         let invocation = self.hash.invocation::<AB>(&frame);
         let selector = self.hash.lookup_selector::<AB>(&frame);
@@ -754,7 +840,7 @@ where
             output_linear_constraints,
         ) = {
             let preprocessed = builder.preprocessed();
-            let lookup_row = preprocessed.current_slice();
+            let lookup_row = &preprocessed.current_slice()[..num_lookup_cols::<WIDTH>()];
             let lookup_column: &LookupCols<_, WIDTH> = lookup_row.borrow();
             (
                 lookup_column.input_vars,
@@ -829,6 +915,14 @@ where
                 );
             }
         }
+        if self.terminal_masking {
+            terminal_mask::eval(
+                builder,
+                self.hash.main_width(),
+                num_lookup_cols::<WIDTH>(),
+                false,
+            );
+        }
     }
 }
 
@@ -866,13 +960,15 @@ where
     fn eval(&self, builder: &mut AB) {
         let linear_combination = {
             let main = builder.main();
-            let local: &LinearConstraintCols<_, LIN_WIDTH> = main.current_slice().borrow();
+            let local: &LinearConstraintCols<_, LIN_WIDTH> =
+                main.current_slice()[..num_linear_main_cols::<LIN_WIDTH>()].borrow();
             local.linear_combination
         };
         let (linear_coefficients, linear_vars, image_value, linear_multiplicities) = {
             let preprocessed = builder.preprocessed();
-            let prep: &LinearConstraintPreprocessedCols<_, LIN_WIDTH> =
-                preprocessed.current_slice().borrow();
+            let prep: &LinearConstraintPreprocessedCols<_, LIN_WIDTH> = preprocessed
+                .current_slice()[..num_linear_preprocessed_cols::<LIN_WIDTH>()]
+                .borrow();
             (
                 prep.linear_coefficients,
                 prep.linear_vars,
@@ -891,6 +987,14 @@ where
                 LIN_LOOKUP_NAME,
                 [linear_vars[i].into(), linear_combination[i].into()],
                 Count::provided(-multiplicity),
+            );
+        }
+        if self.terminal_masking {
+            terminal_mask::eval(
+                builder,
+                num_linear_main_cols::<LIN_WIDTH>(),
+                num_linear_preprocessed_cols::<LIN_WIDTH>(),
+                true,
             );
         }
     }
@@ -1401,6 +1505,60 @@ mod tests {
     use p3_air::AirLayout;
     use p3_koala_bear::KoalaBear;
     use p3_lookup::{InteractionSymbolicBuilder, Lookups};
+
+    #[test]
+    fn paired_terminal_mask_layout_and_freshness() {
+        use crate::permutation::poseidon2::KoalaBearPoseidon2_16;
+        use spongefish_circuit::permutation::LinearEquation;
+
+        let backend = KoalaBearPoseidon2_16::new();
+        let instance = PermutationInstanceBuilder::<KoalaBear, 16>::new();
+        let witness = PermutationWitnessBuilder::new(backend.permutation());
+        let input = core::array::from_fn(|index| KoalaBear::from_usize(index + 1));
+        let input_vars = core::array::from_fn(|_| instance.allocator().new_field_var());
+        let output_vars = instance.allocate_permutation(&input_vars);
+        let output = witness.allocate_permutation(&input);
+        instance.add_equation(LinearEquation::new(
+            [(<KoalaBear as PrimeCharacteristicRing>::ONE, output_vars[0])],
+            output[0],
+        ));
+        witness.add_equation(LinearEquation::new(
+            [(<KoalaBear as PrimeCharacteristicRing>::ONE, output[0])],
+            output[0],
+        ));
+        let relation = PreparedRelation::new(&backend, &instance);
+        let prepared_witness = relation.prepare_witness(&witness);
+        let (airs, traces) = relation.generate_trace_rows(&prepared_witness);
+        let (_, fresh_traces) = relation.generate_trace_rows(&prepared_witness);
+        let original_widths = [relation.hash.main_width(), MAX_LINEAR_WIDTH];
+
+        for (air_index, original_width) in [0, 2].into_iter().zip(original_widths) {
+            assert_eq!(traces[air_index].width(), original_width + 4);
+            assert_eq!(airs[air_index].width(), original_width + 4);
+            let preprocessed = airs[air_index].preprocessed_trace().unwrap();
+            for row_index in 0..traces[air_index].height() {
+                let row = traces[air_index].row_slice(row_index).unwrap();
+                let fresh_row = fresh_traces[air_index].row_slice(row_index).unwrap();
+                assert_eq!(&row[..original_width], &fresh_row[..original_width]);
+                assert_eq!(
+                    *preprocessed.row_slice(row_index).unwrap().last().unwrap(),
+                    KoalaBear::from_bool(row_index < 2),
+                );
+                if row_index < 2 {
+                    assert_ne!(&row[original_width..], &fresh_row[original_width..]);
+                    let paired_row = traces[2].row_slice(row_index).unwrap();
+                    assert_eq!(&row[original_width..], &paired_row[MAX_LINEAR_WIDTH..]);
+                } else {
+                    assert!(row[original_width..]
+                        .iter()
+                        .all(|value| *value == <KoalaBear as PrimeCharacteristicRing>::ZERO));
+                }
+            }
+        }
+        assert_eq!(traces[1].width(), 1);
+        let proof = relation.prove(&backend, &prepared_witness);
+        assert!(relation.verify(&backend, &proof).is_ok());
+    }
 
     const SELECTOR_TEST_WIDTH: usize = 1;
 

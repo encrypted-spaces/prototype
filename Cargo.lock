@@ -2461,10 +2461,14 @@ dependencies = [
  "encrypted-spaces-zkp",
  "hkdf",
  "once_cell",
+ "p3-field",
+ "p3-lookup",
+ "p3-matrix",
  "rand 0.9.4",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "spongefish-stark",
  "tokio",
  "tracing",
 ]
@@ -8096,6 +8100,7 @@ dependencies = [
 name = "spongefish-stark"
 version = "0.1.0"
 dependencies = [
+ "encrypted-spaces-crypto",
  "hex-literal 1.1.0",
  "keccak 0.1.6",
  "p3-air",
@@ -8118,6 +8123,7 @@ dependencies = [
  "p3-uni-stark",
  "postcard",
  "rand 0.10.1",
+ "serde",
  "spongefish",
  "spongefish-circuit",
 ]

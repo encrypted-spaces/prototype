@@ -9,12 +9,17 @@
 //! inputs.
 
 use std::collections::HashMap;
+#[cfg(panic = "unwind")]
+use std::panic::catch_unwind;
+use std::panic::UnwindSafe;
 
 use encrypted_spaces_crypto::EncryptedKeyMaterial;
 use encrypted_spaces_crypto::{KeyCommitment, KeyMaterial};
 use encrypted_spaces_key_manager::error::KeyManagerError;
+#[cfg(not(test))]
+use encrypted_spaces_zkp::transitions::try_prove_transition as prove_transition;
 use encrypted_spaces_zkp::transitions::{
-    prove_transition, verify_transition, CanonicalPath, KeyTreeTransition,
+    verify_transition, CanonicalPath, KeyTreeTransition, ProvingError,
 };
 
 use super::proof::{
@@ -22,6 +27,27 @@ use super::proof::{
     ExtendProofInput, ExtendVerifyInput, RekeyProofInput, RekeyVerifyInput, SimpleLine2Proofs,
 };
 use super::space_key::{tag, D_DERIVE_TAG, D_HEAD_ENCRYPT_TAG, GB_CHAIN_LINK_TAG, HGK_DERIVE_TAG};
+
+#[cfg(test)]
+mod fault_tests;
+#[cfg(test)]
+use fault_tests::prove_transition;
+
+fn contained_proof<Attempt>(attempt: Attempt) -> Result<Vec<u8>, KeyManagerError>
+where
+    Attempt: FnOnce() -> Result<Vec<u8>, ProvingError> + UnwindSafe,
+{
+    #[cfg(panic = "abort")]
+    {
+        let _ = attempt;
+        Err(KeyManagerError)
+    }
+    #[cfg(panic = "unwind")]
+    {
+        let proof = catch_unwind(attempt).map_err(|_| KeyManagerError)?;
+        proof.map_err(|_| KeyManagerError)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Transition builders (public data only — shared between prover and verifier)
@@ -256,10 +282,19 @@ impl SimpleLine2Proofs<DefaultDerivation> for StarkProver {
         &self,
         input: ExtendProofInput<'_, DefaultDerivation>,
     ) -> Result<Self::ExtendProof, Self::Error> {
-        let transition =
-            build_extend_transition(input.current_d_commitment, input.next_row.commitment);
-        let keys = build_extend_witness(input.current_d_key, input.next_d_key);
-        Ok(prove_transition(input.derivation, &transition, &keys))
+        let ExtendProofInput {
+            current_d_commitment,
+            next_row,
+            derivation,
+            current_d_key,
+            next_d_key,
+        } = input;
+        let next_commitment = next_row.commitment;
+        contained_proof(move || {
+            let transition = build_extend_transition(current_d_commitment, next_commitment);
+            let keys = build_extend_witness(current_d_key, next_d_key);
+            prove_transition(derivation, &transition, &keys)
+        })
     }
 
     fn verify_extend(&self, input: ExtendVerifyInput<'_>, proof: &[u8]) -> Result<(), Self::Error> {
@@ -279,15 +314,30 @@ impl SimpleLine2Proofs<DefaultDerivation> for StarkProver {
             .ok_or(KeyManagerError)?
             .clone();
 
-        let transition = build_rekey_transition(
-            input.old_hgk_commitment,
-            input.next_fgk_row.commitment,
-            chain_ct,
-            input.next_row.commitment,
-            input.next_head_links.d_head_ciphertext.clone(),
-        );
-        let keys = build_rekey_witness(input.old_hgk, input.new_hgk, input.new_d_head);
-        Ok(prove_transition(input.derivation, &transition, &keys))
+        let RekeyProofInput {
+            old_hgk_commitment,
+            next_fgk_row,
+            next_row,
+            next_head_links,
+            derivation,
+            old_hgk,
+            new_hgk,
+            new_d_head,
+        } = input;
+        let fgk_commitment = next_fgk_row.commitment;
+        let d_commitment = next_row.commitment;
+        let d_head_ct = next_head_links.d_head_ciphertext.clone();
+        contained_proof(move || {
+            let transition = build_rekey_transition(
+                old_hgk_commitment,
+                fgk_commitment,
+                chain_ct,
+                d_commitment,
+                d_head_ct,
+            );
+            let keys = build_rekey_witness(old_hgk, new_hgk, new_d_head);
+            prove_transition(derivation, &transition, &keys)
+        })
     }
 
     fn verify_rekey(&self, input: RekeyVerifyInput<'_>, proof: &[u8]) -> Result<(), Self::Error> {
@@ -318,14 +368,18 @@ impl SimpleLine2Proofs<DefaultDerivation> for StarkProver {
             input.survivors,
             input.next_links,
         )?;
-        let keys = build_delete_witness(
-            input.old_hgk,
-            input.new_hgk,
-            input.b_keys,
-            input.d_head_keys,
-            &d_head_seqs,
-        );
-        Ok(prove_transition(input.derivation, &transition, &keys))
+        let DeleteKeysProofInput {
+            derivation,
+            old_hgk,
+            new_hgk,
+            b_keys,
+            d_head_keys,
+            ..
+        } = input;
+        contained_proof(move || {
+            let keys = build_delete_witness(old_hgk, new_hgk, b_keys, d_head_keys, &d_head_seqs);
+            prove_transition(derivation, &transition, &keys)
+        })
     }
 
     fn verify_delete_keys(
@@ -415,6 +469,41 @@ mod tests {
 
     // --- Malformed transition inputs (cheap; run in default lane) ---
 
+    #[cfg(not(panic = "abort"))]
+    #[test]
+    fn contained_proof_returns_success_and_runs_closure_once() {
+        let calls = std::sync::Mutex::new(0usize);
+        let result = contained_proof(|| {
+            *calls.lock().unwrap() += 1;
+            Ok(vec![0xaa, 0xbb, 0xcc])
+        });
+        assert_eq!(result.expect("success"), vec![0xaa, 0xbb, 0xcc]);
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[cfg(not(panic = "abort"))]
+    #[test]
+    fn contained_proof_converts_proving_error_without_panicking() {
+        let result = contained_proof(|| Err(ProvingError));
+        assert!(result.is_err());
+    }
+
+    #[cfg(not(panic = "abort"))]
+    #[test]
+    fn contained_proof_converts_unexpected_panic_to_error() {
+        let calls = std::sync::Mutex::new(0usize);
+        let result = contained_proof(|| {
+            *calls.lock().unwrap() += 1;
+            panic!("simulated prover failure");
+        });
+        assert!(result.is_err(), "panic must not escape as a Vec<u8>");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            1,
+            "closure must run exactly once before the panic; there is no retry"
+        );
+    }
+
     #[test]
     fn delete_mismatched_gb_node_count_returns_err() {
         let d = derivation();
@@ -492,7 +581,7 @@ mod tests {
         assert_eq!(transition.len(), 3);
 
         let keys = build_extend_witness(&current_d, &next_d);
-        let proof = prove_transition(&d, &transition, &keys);
+        let proof = prove_transition(&d, &transition, &keys).expect("prove transition");
         assert!(verify_transition(&transition, &proof).is_ok());
     }
 
@@ -517,7 +606,7 @@ mod tests {
         assert_eq!(transition.len(), 5);
 
         let keys = build_rekey_witness(&old_hgk, &new_hgk, &new_d_head);
-        let proof = prove_transition(&d, &transition, &keys);
+        let proof = prove_transition(&d, &transition, &keys).expect("prove transition");
         assert!(verify_transition(&transition, &proof).is_ok());
     }
 
@@ -543,7 +632,7 @@ mod tests {
         assert_eq!(transition.len(), 5);
 
         let keys = build_delete_witness(&old_hgk, &dgk, &[], &[d_head], &[3]);
-        let proof = prove_transition(&d, &transition, &keys);
+        let proof = prove_transition(&d, &transition, &keys).expect("prove transition");
         assert!(verify_transition(&transition, &proof).is_ok());
     }
 
@@ -573,7 +662,7 @@ mod tests {
         assert_eq!(transition.len(), 8);
 
         let keys = build_delete_witness(&old_hgk, &dgk, &[b0], &[d_head_0, d_head_1], &[5, 2]);
-        let proof = prove_transition(&d, &transition, &keys);
+        let proof = prove_transition(&d, &transition, &keys).expect("prove transition");
         assert!(verify_transition(&transition, &proof).is_ok());
     }
 
@@ -743,7 +832,7 @@ mod tests {
 
         let transition = build_extend_transition(d.commit(&current_d), d.commit(&next_d));
         let keys = build_extend_witness(&current_d, &next_d);
-        let proof = prove_transition(&d, &transition, &keys);
+        let proof = prove_transition(&d, &transition, &keys).expect("prove transition");
 
         let mut bad_proof = proof.clone();
         if bad_proof.len() > 10 {
@@ -761,7 +850,7 @@ mod tests {
 
         let transition = build_extend_transition(d.commit(&current_d), d.commit(&next_d));
         let keys = build_extend_witness(&current_d, &next_d);
-        let proof = prove_transition(&d, &transition, &keys);
+        let proof = prove_transition(&d, &transition, &keys).expect("prove transition");
 
         let wrong_transition =
             build_extend_transition(d.commit(&current_d), d.commit(&KeyMaterial::random()));

@@ -33,6 +33,9 @@
 
 extern crate alloc;
 
+#[cfg(test)]
+extern crate self as spongefish_stark;
+
 use alloc::vec::Vec;
 use p3_air::AirBuilder;
 use p3_field::PrimeCharacteristicRing;

@@ -40,7 +40,9 @@ spongefish = { version = "^0.7.4", default-features = false }
 spongefish-circuit = { version = "^0.7.4", default-features = false }
 
 [dev-dependencies]
+encrypted-spaces-crypto = { workspace = true }
 hex-literal = "1.0"
+serde = { workspace = true }
 
 [[example]]
 name = "poseidon2"

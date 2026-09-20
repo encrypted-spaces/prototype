@@ -24,4 +24,8 @@ tracing = { workspace = true, features = ["attributes"] }
 once_cell = { workspace = true }
 
 [dev-dependencies]
+p3-field = { workspace = true }
+p3-lookup = { workspace = true }
+p3-matrix = { workspace = true }
+spongefish-stark = { workspace = true }
 tokio = { workspace = true }
