@@ -148,7 +148,8 @@ pub trait HashRelationBackend<const WIDTH: usize>: Clone {
     /// reject a backend whose parameters differ from those used at preparation.
     fn security_parameters(&self) -> security_profile::SecurityParameters;
 
-    /// Return the minimum trace height required by this backend's hiding PCS.
+    /// Return the minimum trace height required by this backend's hiding PCS
+    /// under the current/next two-row opening protocol.
     fn hiding_trace_height(&self) -> usize
     where
         <Self::Config as StarkGenericConfig>::Challenge:

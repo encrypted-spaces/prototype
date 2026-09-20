@@ -526,7 +526,7 @@ fn poseidon2_16_relation_can_be_proven_repeatedly_after_padding() {
 fn poseidon2_16_relation_honors_configured_minimum_trace_height() {
     type B = BabyBearPoseidon2_16;
 
-    const MIN_TRACE_HEIGHT: usize = 256;
+    const MIN_TRACE_HEIGHT: usize = 512;
 
     let backend = B::new();
     let default_min_trace_height =

@@ -94,11 +94,11 @@ mod tests {
         let backend = KoalaBearPoseidon2_16::new();
         let statement = PreparedRelation::new(&backend, &raw_instance);
         let weighted_height_sum = statement.logup_weighted_height_sum();
-        // Pin the count weights and 128-row heights for a production-shaped
-        // commit/derive/encrypt relation. It retains more than 18 bits of
+        // Pin the count weights and 256-row heights for a production-shaped
+        // commit/derive/encrypt relation. It retains more than 17 bits of
         // headroom before multiplicities could wrap in KoalaBear.
-        assert_eq!(weighted_height_sum, 7_168);
-        assert!(weighted_height_sum * (1 << 18) < u128::from(KoalaBear::ORDER_U32));
+        assert_eq!(weighted_height_sum, 14_336);
+        assert!(weighted_height_sum * (1 << 17) < u128::from(KoalaBear::ORDER_U32));
 
         let proof = prove_transition(&derivation, &transition, &keys);
         let decoded: p3_batch_stark::BatchProof<KoalaBearStarkConfig> =

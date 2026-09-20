@@ -128,7 +128,7 @@ mod tests {
     #[test]
     fn keeps_logical_rows_separate_from_hiding_safe_trace_preparation() {
         for (input_count, expected_height) in
-            [(1, 128), (2, 128), (31, 128), (128, 128), (129, 256)]
+            [(1, 256), (2, 256), (31, 256), (128, 256), (257, 512)]
         {
             let expected_blocks = vec![[None; P2_16_CONFIG.width]; input_count];
             let inputs = vec![[KoalaBear::ZERO; P2_16_CONFIG.width]; input_count];

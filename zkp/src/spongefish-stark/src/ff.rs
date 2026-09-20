@@ -53,8 +53,8 @@ macro_rules! define_field_config {
         where
             P: crate::security_profile::SecurityProfile,
         {
-            /// Return the number of base-field constraints exposed by the
-            /// profile's FRI queries and out-of-domain openings.
+            /// Return the conservative number of base-field constraints exposed by the
+            /// profile's direct, quotient-derived shifted, and out-of-domain openings.
             pub fn hiding_revealed_base_field_constraints() -> usize {
                 $crate::hiding::revealed_base_field_constraints::<$stark_config>(
                     P::security_parameters(),
@@ -85,6 +85,12 @@ macro_rules! define_field_config {
             where
                 A: p3_air::BaseAir<$field>,
             {
+                #[cfg(debug_assertions)]
+                $crate::hiding::debug_assert_air_row_window(
+                    air,
+                    false,
+                    <p3_air::SymbolicAirBuilder<$field> as p3_air::AirBuilder>::WINDOW,
+                );
                 let trace_height = Self::normalized_trace_height(logical_trace_height);
                 $crate::air::PreparedAir::new(
                     air,
@@ -154,6 +160,12 @@ macro_rules! define_field_config {
             {
                 use p3_matrix::Matrix;
 
+                #[cfg(debug_assertions)]
+                $crate::hiding::debug_assert_air_row_window(
+                    air,
+                    false,
+                    <p3_air::SymbolicAirBuilder<$field> as p3_air::AirBuilder>::WINDOW,
+                );
                 let trace_height = trace.height();
                 let degree_bits = trace_height.trailing_zeros() as usize;
                 let preprocessing_config = Self::verifier_config();

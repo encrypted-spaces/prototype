@@ -89,6 +89,17 @@ preprocessed rows together, and keeps exact statement-degree binding inside
 this crate. Padding remains explicit because a strategy such as `RepeatLast`
 is valid only when the AIR's row and transition semantics permit it.
 
+The conservative opening budget is `wt + 2d`, where `t` is the number of FRI
+queries, `d` is the challenge-field extension degree, and `w = MAX_ROW_WINDOW`
+is currently 2. The `wt` term covers query evaluations across the row window;
+the `2d` term covers the current protocol's two out-of-domain opening points.
+The minimum trace height rounds this budget up to a power of two. Debug builds
+check the AIR's main/preprocessed next-row metadata and lookup interactions
+against this limit. Since that metadata currently distinguishes only one-row
+and two-row constraints, they also check Plonky3's declared
+`AirBuilder::WINDOW`. Wider windows require re-evaluating the hiding budget,
+not just increasing the constant.
+
 See [`examples/poseidon2.rs`](examples/poseidon2.rs) for a
 complete executable example with a linear equation.
 

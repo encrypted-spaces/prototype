@@ -444,6 +444,17 @@ where
         let log_ext_degrees = log_ext_degrees(&log_degrees, &config);
         let prover_data =
             ProverData::from_airs_and_degrees(&preprocessing_config, &airs, &log_ext_degrees);
+        #[cfg(debug_assertions)]
+        for (air, lookups) in airs.iter().zip(&prover_data.common.lookups) {
+            crate::hiding::debug_assert_air_row_window(
+                air,
+                !lookups.is_empty(),
+                <p3_lookup::InteractionSymbolicBuilder<
+                    RelationField<B, { WIDTH }>,
+                    RelationChallenge<B, { WIDTH }>,
+                > as p3_air::AirBuilder>::WINDOW,
+            );
+        }
         let publics = vec![Vec::new(); airs.len()];
         let trace_refs = traces.iter().collect::<Vec<_>>();
         let instances = StarkInstance::new_multiple(&airs, &trace_refs, &publics);

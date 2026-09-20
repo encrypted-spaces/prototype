@@ -841,7 +841,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 [[package]]
 name = "merk"
 version = "2.0.0"
-source = "git+ssh://git@github.com/encrypted-spaces/merk-private.git?branch=experimental-mrt#58c710cf95595c8984d5ca976f267f7fec964464"
+source = "git+ssh://git@github.com/encrypted-spaces/merk-private.git?branch=develop#d527011f3809322ee1f1d1a0f55ae347e3309603"
 dependencies = [
  "ed",
  "serde",
