@@ -12,6 +12,7 @@ base64 = { workspace = true }
 curve25519-dalek.workspace = true
 libcrux-ecdh.workspace = true
 libcrux-ml-kem.workspace = true
+libcrux-platform.workspace = true
 libcrux-kem.workspace = true
 ml-kem.workspace = true
 p3-koala-bear.workspace = true
@@ -35,8 +36,19 @@ postcard.workspace = true
 ed25519-dalek.workspace = true
 ml-dsa.workspace = true
 
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+# The packed `mlkem768::encapsulate` multiplexes to AVX2 at runtime, but the unpacked API
+# is per-backend only. Compiling `simd256` in on x86_64 lets `unpacked_mlkem` dispatch to
+# the matching backend at runtime; without it the unpacked path would be unvectorized
+# while the packed baseline is not, which measures as a wash or a regression.
+libcrux-ml-kem = { workspace = true, features = ["simd256"] }
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+libcrux-ml-kem = { workspace = true, features = ["simd128"] }
+
 [dev-dependencies]
 postcard.workspace = true
+rand_chacha.workspace = true
 criterion.workspace = true
 hex.workspace = true
 libcrux-ecdh.workspace = true
@@ -50,4 +62,3 @@ harness = false
 [features]
 default = []
 std = []
-avx2 = ["libcrux-ml-kem/simd256"]

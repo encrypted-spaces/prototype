@@ -154,7 +154,7 @@ impl<M: Mkem, const K: usize, const U: usize> PoseidonMve<M, K, U> {
         debug_assert_eq!(derivation.commit(key), *key_commitment);
         let instance = MveInstance::<M, K, U>::new(pks, *key_commitment);
         let mut prover_state =
-            spongefish::domain_separator!("mVE shake128 {{M::NAME}} {{K}} {{U}}")
+            spongefish::domain_separator!("mVE shake128 {} {} {}", <M as Mkem>::NAME, K, U)
                 .session(session_identifier)
                 .instance(&instance)
                 .std_prover();
@@ -165,11 +165,16 @@ impl<M: Mkem, const K: usize, const U: usize> PoseidonMve<M, K, U> {
         let (ciphertexts, messages) = {
             use p3_maybe_rayon::prelude::*;
 
+            // Prepare once outside the repetition loop; the benchmark baseline skips it.
+            let prepared = crate::mve::use_prepared_encaps().then(|| mkem.prepare(pks));
             let results = seeds
                 .par_iter()
                 .map(|seed| {
                     let mut rng = rand_chacha::ChaCha12Rng::from_seed(*seed);
-                    let (ciphertext, message) = mkem.encaps(&mut rng, pks);
+                    let (ciphertext, message) = match &prepared {
+                        Some(prepared) => mkem.encaps_prepared(&mut rng, prepared),
+                        None => mkem.encaps(&mut rng, pks),
+                    };
                     (
                         MkemCiphertextGroup {
                             payload: Vec::new(),
@@ -298,12 +303,17 @@ impl<M: Mkem, const K: usize, const U: usize> PoseidonMve<M, K, U> {
         let mkem = M::default();
         let derivation = DerivationKoalaBearPoseidon2_16::default();
         let instance = MveInstance::<M, K, U>::new(pks, *key_commitment);
+        // Delay O(n) preparation until after the cheap proof-length checks.
+        let prepared = crate::mve::use_prepared_encaps().then(|| mkem.prepare(pks));
         let open_entries = open_indices
             .par_iter()
             .zip(proof.opened.par_iter())
             .map(|(&idx, &seed)| {
                 let mut rng = rand_chacha::ChaCha12Rng::from_seed(seed);
-                let (ciphertext, message) = mkem.encaps(&mut rng, pks);
+                let (ciphertext, message) = match &prepared {
+                    Some(prepared) => mkem.encaps_prepared(&mut rng, prepared),
+                    None => mkem.encaps(&mut rng, pks),
+                };
                 (
                     idx,
                     MkemCiphertextGroup {
@@ -354,7 +364,7 @@ impl<M: Mkem, const K: usize, const U: usize> PoseidonMve<M, K, U> {
         let responses = responses_from_pads(&proof.pads, keep_indices.len())?;
 
         let mut transcript_state =
-            spongefish::domain_separator!("mVE shake128 {{M::NAME}} {{K}} {{U}}")
+            spongefish::domain_separator!("mVE shake128 {} {} {}", <M as Mkem>::NAME, K, U)
                 .session(session_identifier)
                 .instance(&instance)
                 .std_prover();
@@ -371,7 +381,7 @@ impl<M: Mkem, const K: usize, const U: usize> PoseidonMve<M, K, U> {
         transcript_state.prover_messages(&responses);
         let generated_responses = transcript_state.narg_string().to_vec();
         let mut verifier_state =
-            spongefish::domain_separator!("mVE shake128 {{M::NAME}} {{K}} {{U}}")
+            spongefish::domain_separator!("mVE shake128 {} {} {}", <M as Mkem>::NAME, K, U)
                 .session(session_identifier)
                 .instance(&instance)
                 .std_verifier(&generated_responses);

@@ -51,6 +51,10 @@ p3-batch-stark = { workspace = true }
 name = "mve_poseidon"
 harness = false
 
+[[bench]]
+name = "mkem_precompute"
+harness = false
+
 
 [features]
 default = ["std", "parallel"]
@@ -62,6 +66,9 @@ std = [
     "rand/thread_rng"
 ]
 parallel = ["p3-maybe-rayon/parallel", "p3-dft/parallel", "p3-uni-stark/parallel"]
+# Benchmark-only: expose `mve::set_prepared_encaps` so the mKEM precomputation can be
+# toggled at runtime and both paths measured in one process. Never enable in production.
+bench-baseline = []
 
 [[bin]]
 name = "zkp"

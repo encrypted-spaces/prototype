@@ -23,6 +23,19 @@ impl Mkem for Ristretto255Dh {
     type IndividualCiphertext = (CompressedRistretto, EncryptedKeyMaterial);
     type Ciphertext = (CompressedRistretto, Vec<EncryptedKeyMaterial>);
     const NAME: &'static str = "RistrettoDh";
+    type Prepared = Vec<RistrettoPoint>;
+
+    fn prepare(&self, pks: &[Self::PublicKey]) -> Self::Prepared {
+        pks.to_vec()
+    }
+
+    fn encaps_prepared<R: CryptoRng + RngCore>(
+        &self,
+        rng: &mut R,
+        prepared: &Self::Prepared,
+    ) -> (Self::Ciphertext, KeyMaterial) {
+        <Self as Mkem>::encaps(self, rng, prepared)
+    }
 
     fn keygen<R: CryptoRng + RngCore>(&self, rng: &mut R) -> (Self::PublicKey, Self::SecretKey) {
         let mut scalar_bytes = [0u8; 64];

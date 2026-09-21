@@ -16,11 +16,10 @@
 use core::fmt;
 
 use libcrux_ecdh::{self, X25519PrivateKey, X25519PublicKey};
-#[cfg(feature = "avx2")]
-use libcrux_ml_kem::mlkem768::avx2::{decapsulate, encapsulate, generate_key_pair};
-#[cfg(not(feature = "avx2"))]
 use libcrux_ml_kem::mlkem768::{decapsulate, encapsulate, generate_key_pair};
 use libcrux_ml_kem::mlkem768::{MlKem768Ciphertext, MlKem768PrivateKey, MlKem768PublicKey};
+
+use crate::pke::xwing_ristretto255::unpacked_mlkem;
 
 use rand_core::{CryptoRng, RngCore};
 use serde::{de, Deserialize, Serialize};
@@ -58,9 +57,31 @@ const XWING_SS_SIZE: usize = 32;
 /// ```
 const XWING_LABEL: &[u8; 6] = b"\\.//^\\";
 
+/// Clamped, non-zero probe scalar for [`x25519_shared_secret_is_usable`].
+const X25519_PROBE_SCALAR: [u8; X25519_PK_SIZE] = [
+    0x48, 0x52, 0x62, 0x1c, 0x0f, 0x5c, 0xd2, 0x8b, 0x1a, 0x7b, 0x4f, 0x2e, 0x63, 0x90, 0x11, 0x5d,
+    0x35, 0x2a, 0x7c, 0x64, 0x08, 0x1e, 0x73, 0x59, 0x26, 0x4d, 0x11, 0x38, 0x6a, 0x0c, 0x37, 0x50,
+];
+
+/// True if `pk_x` yields a usable X25519 shared secret.
+///
+/// `libcrux` rejects the all-zero result produced by small-order points. Any clamped
+/// scalar detects those points, so using `libcrux` avoids maintaining a separate table.
+fn x25519_shared_secret_is_usable(pk_x: &[u8; X25519_PK_SIZE]) -> bool {
+    let pk = X25519PublicKey::from(pk_x);
+    let sk = X25519PrivateKey::from(&X25519_PROBE_SCALAR);
+    libcrux_ecdh::derive(libcrux_ecdh::Algorithm::X25519, &pk, &sk).is_ok()
+}
+
 /// X-Wing public key (encapsulation key).
 ///
 /// Layout: pk_M (1184 bytes) || pk_X (32 bytes)
+///
+/// # Invariant
+///
+/// Every constructor rejects small-order X25519 points, preventing participant-supplied
+/// keys from causing encapsulation to fail. Unlike Ristretto, every 32-byte X25519 string
+/// is a valid encoding, so validation checks point order rather than canonical encoding.
 #[derive(Clone)]
 pub struct XWingPublicKey([u8; XWING_PK_SIZE]);
 
@@ -71,8 +92,23 @@ impl fmt::Debug for XWingPublicKey {
 }
 
 impl XWingPublicKey {
-    /// Create from raw bytes.
-    pub fn from_bytes(bytes: [u8; XWING_PK_SIZE]) -> Self {
+    /// Create from raw bytes, rejecting a small-order X25519 half.
+    pub fn from_bytes(bytes: [u8; XWING_PK_SIZE]) -> Option<Self> {
+        let mut pk_x = [0u8; X25519_PK_SIZE];
+        pk_x.copy_from_slice(&bytes[MLKEM_PK_SIZE..]);
+        x25519_shared_secret_is_usable(&pk_x).then_some(Self(bytes))
+    }
+
+    /// Create from raw bytes known to satisfy the type invariant (key generation).
+    fn from_valid_bytes(bytes: [u8; XWING_PK_SIZE]) -> Self {
+        debug_assert!(
+            {
+                let mut pk_x = [0u8; X25519_PK_SIZE];
+                pk_x.copy_from_slice(&bytes[MLKEM_PK_SIZE..]);
+                x25519_shared_secret_is_usable(&pk_x)
+            },
+            "key generation produced a small-order X25519 point"
+        );
         Self(bytes)
     }
 
@@ -126,7 +162,8 @@ impl<'de> Deserialize<'de> for XWingPublicKey {
         }
         let mut pk = [0u8; XWING_PK_SIZE];
         pk.copy_from_slice(&bytes);
-        Ok(Self(pk))
+        Self::from_bytes(pk)
+            .ok_or_else(|| de::Error::custom("X-Wing public key has a small-order X25519 point"))
     }
 }
 
@@ -388,7 +425,7 @@ impl XWing {
         pk_bytes[..MLKEM_PK_SIZE].copy_from_slice(pk_m.as_slice());
         pk_bytes[MLKEM_PK_SIZE..].copy_from_slice(&pk_x);
 
-        let pk = XWingPublicKey(pk_bytes);
+        let pk = XWingPublicKey::from_valid_bytes(pk_bytes);
         let sk = XWingSecretKey {
             seed,
             sk_m,
@@ -423,7 +460,7 @@ impl XWing {
 
         // ss_X = X25519(ek_X, pk_X)
         let ss_x_bytes_vec = libcrux_ecdh::derive(libcrux_ecdh::Algorithm::X25519, &pk_x, &ek_x)
-            .expect("X25519 derive should not fail");
+            .expect("validated at construction: see XWingPublicKey invariant");
         let mut ss_x_bytes = [0u8; 32];
         ss_x_bytes.copy_from_slice(ss_x_bytes_vec.as_ref());
 
@@ -469,7 +506,7 @@ impl XWing {
 
         // ss_X = X25519(ek_X, pk_X)
         let ss_x_bytes_vec = libcrux_ecdh::derive(libcrux_ecdh::Algorithm::X25519, &pk_x, &ek_x)
-            .expect("X25519 derive should not fail");
+            .expect("validated at construction: see XWingPublicKey invariant");
         let mut ss_x_bytes = [0u8; 32];
         ss_x_bytes.copy_from_slice(ss_x_bytes_vec.as_ref());
 
@@ -530,15 +567,46 @@ impl XWing {
 pub struct XWingMkem(XWing);
 
 /// Ciphertext for the X-Wing-based mKEM.
+///
+/// The ephemeral `ct_x` is shared by construction, so it is stored **once** here rather
+/// than repeated per recipient; [`Mkem::get`] recombines it into a self-contained
+/// [`XWingMkemIndividualCiphertext`] for delivery.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct XWingMkemCiphertext {
     /// Shared ephemeral X25519 public key (ct_x), used by all recipients.
     ct_x: [u8; 32],
-    /// Per-recipient ciphertexts containing ML-KEM ciphertext and encrypted key.
-    cts: Vec<XWingMkemIndividualCiphertext>,
+    /// Per-recipient ciphertext bodies.
+    cts: Vec<XWingMkemBody>,
+}
+
+/// The per-recipient part of a group ciphertext: everything except the shared ephemeral.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct XWingMkemBody {
+    /// Per-recipient ML-KEM-768 ciphertext (1088 bytes).
+    ct_m: Vec<u8>,
+    /// Encrypted key material for the shared group key.
+    ct_key: EncryptedKeyMaterial,
+}
+
+/// Prepared state for one X-Wing recipient.
+pub struct XWingPreparedRecipient {
+    /// ML-KEM-768 encapsulation key in unpacked form (matrix `A`, `t_as_ntt`, `H(pk)`).
+    mlkem_pk: unpacked_mlkem::UnpackedPublicKey,
+    /// Recipient X25519 public key, parsed once.
+    x25519_pk: X25519PublicKey,
+    /// Raw X25519 public key bytes, required by the X-Wing `combiner`.
+    x25519_pk_bytes: [u8; 32],
+}
+
+/// Prepared state for a fixed ordered recipient set.
+pub struct XWingMkemPrepared {
+    recipients: Vec<XWingPreparedRecipient>,
 }
 
 /// Individual ciphertext for a single recipient.
+///
+/// Self-contained: carries the shared ephemeral so a recipient can decapsulate from this
+/// value alone. The wire format of *this* type is unchanged.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct XWingMkemIndividualCiphertext {
     /// The shared ephemeral X25519 public key (needed for decapsulation).
@@ -556,6 +624,7 @@ impl Mkem for XWingMkem {
     type IndividualCiphertext = XWingMkemIndividualCiphertext;
     type Ciphertext = XWingMkemCiphertext;
     type SecretKey = XWingSecretKey;
+    type Prepared = XWingMkemPrepared;
 
     fn keygen<R: CryptoRng + RngCore>(&self, rng: &mut R) -> (Self::PublicKey, Self::SecretKey) {
         // Key generation is the same as regular X-Wing
@@ -591,7 +660,7 @@ impl Mkem for XWingMkem {
 
             // X25519 DH with recipient's public key (reusing our ephemeral key)
             let ss_x_vec = libcrux_ecdh::derive(libcrux_ecdh::Algorithm::X25519, &pk_x, &ek_x)
-                .expect("X25519 derive should not fail");
+                .expect("validated at construction: see XWingPublicKey invariant");
             let mut ss_x = [0u8; 32];
             ss_x.copy_from_slice(ss_x_vec.as_ref());
 
@@ -608,8 +677,66 @@ impl Mkem for XWingMkem {
 
             let ct_key = EncryptedKeyMaterial::encrypt(shared, &key);
 
-            cts.push(XWingMkemIndividualCiphertext {
-                ct_x,
+            cts.push(XWingMkemBody {
+                ct_m: ct_m.as_slice().to_vec(),
+                ct_key,
+            });
+        }
+
+        (XWingMkemCiphertext { ct_x, cts }, key)
+    }
+
+    fn prepare(&self, pks: &[Self::PublicKey]) -> Self::Prepared {
+        let recipients = pks
+            .iter()
+            .map(|pk| XWingPreparedRecipient {
+                mlkem_pk: unpacked_mlkem::unpack(&pk.mlkem_pk()),
+                x25519_pk: pk.x25519_pk(),
+                x25519_pk_bytes: pk.x25519_pk_bytes(),
+            })
+            .collect();
+
+        XWingMkemPrepared { recipients }
+    }
+
+    fn encaps_prepared<R: CryptoRng + RngCore>(
+        &self,
+        rng: &mut R,
+        prepared: &Self::Prepared,
+    ) -> (Self::Ciphertext, KeyMaterial) {
+        // Preserve `encaps` output and RNG consumption for mVE recomputation.
+        let key = KeyMaterial::random_with(rng);
+
+        let mut ek_x_bytes = [0u8; 32];
+        rng.fill_bytes(&mut ek_x_bytes);
+        let ek_x = X25519PrivateKey::from(&ek_x_bytes);
+
+        let ct_x_vec = libcrux_ecdh::secret_to_public(libcrux_ecdh::Algorithm::X25519, &ek_x)
+            .expect("X25519 secret_to_public should not fail");
+        let mut ct_x = [0u8; 32];
+        ct_x.copy_from_slice(ct_x_vec.as_slice());
+
+        let mut cts = Vec::with_capacity(prepared.recipients.len());
+
+        for recipient in &prepared.recipients {
+            let ss_x_vec =
+                libcrux_ecdh::derive(libcrux_ecdh::Algorithm::X25519, &recipient.x25519_pk, &ek_x)
+                    .expect("validated at construction: see XWingPublicKey invariant");
+            let mut ss_x = [0u8; 32];
+            ss_x.copy_from_slice(ss_x_vec.as_ref());
+
+            let mut mlkem_rand = [0u8; 32];
+            rng.fill_bytes(&mut mlkem_rand);
+            let (ct_m, ss_m) = unpacked_mlkem::encapsulate(&recipient.mlkem_pk, mlkem_rand);
+            let mut ss_m_bytes = [0u8; 32];
+            ss_m_bytes.copy_from_slice(ss_m.as_ref());
+
+            let ss = combiner(&ss_m_bytes, &ss_x, &ct_x, &recipient.x25519_pk_bytes);
+            let shared = KeyMaterial::digest(&ss);
+
+            let ct_key = EncryptedKeyMaterial::encrypt(shared, &key);
+
+            cts.push(XWingMkemBody {
                 ct_m: ct_m.as_slice().to_vec(),
                 ct_key,
             });
@@ -619,7 +746,13 @@ impl Mkem for XWingMkem {
     }
 
     fn get(&self, cts: &Self::Ciphertext, index: usize) -> Option<Self::IndividualCiphertext> {
-        cts.cts.get(index).cloned()
+        cts.cts
+            .get(index)
+            .map(|body| XWingMkemIndividualCiphertext {
+                ct_x: cts.ct_x,
+                ct_m: body.ct_m.clone(),
+                ct_key: body.ct_key.clone(),
+            })
     }
 
     fn decaps(&self, sk: &Self::SecretKey, ct: &Self::IndividualCiphertext) -> Option<KeyMaterial> {

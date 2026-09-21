@@ -14,7 +14,6 @@ use spongefish::DuplexSpongeInterface;
 pub use errors::MveError;
 use serde::{Deserialize, Serialize};
 
-// TODO: document features: portable doesn't use AVX2 for Kyber (off by default), and parallel uses rayon for parallelization (on by default)
 // TODO: in the context of a rekey the server can optimistically send only one of the (m0, r0, ctext) tuples, since usually the proofs will be generated honestly and
 //  any of the tuples will decrypt.  If it fails the server can then send the whole list
 // TODO: (perf) use batch check for sigma-proof verification equation in verifier.
@@ -32,7 +31,7 @@ use serde::{Deserialize, Serialize};
 pub const MVE_PARAMS: [(usize, usize); 4] = [
     (247, 30), // 128-bit security
     (100, 50), // 96-bit security: lowest time, higher size
-    (126, 30), // 96-bit security: balanced time/size
+    (126, 30), // 96-bit security: balanced time/size (the default)
     (443, 16), // 96-bit security: lowest size, higher time
 ];
 pub const MVE_DEFAULT_K: usize = 126;
@@ -131,6 +130,37 @@ where
         Some(MveRecipientCiphertext(result))
     }
 }
+
+/// Selects the prover/verifier encapsulation path. Production compiles this to `true`;
+/// `bench-baseline` enables same-binary comparison.
+#[cfg(not(feature = "bench-baseline"))]
+#[inline(always)]
+pub(crate) const fn use_prepared_encaps() -> bool {
+    true
+}
+
+#[cfg(feature = "bench-baseline")]
+mod bench_baseline {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    static USE_PREPARED_ENCAPS: AtomicBool = AtomicBool::new(true);
+
+    /// Benchmark-only: choose the encapsulation path used by [`super::PoseidonMve`].
+    #[doc(hidden)]
+    pub fn set_prepared_encaps(enabled: bool) {
+        USE_PREPARED_ENCAPS.store(enabled, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn use_prepared_encaps() -> bool {
+        USE_PREPARED_ENCAPS.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(feature = "bench-baseline")]
+pub use bench_baseline::set_prepared_encaps;
+#[cfg(feature = "bench-baseline")]
+pub(crate) use bench_baseline::use_prepared_encaps;
 
 pub(crate) fn expand_challenge(k: usize, u: usize, challenge: &[u8]) -> Vec<usize> {
     let length_required = k - u;

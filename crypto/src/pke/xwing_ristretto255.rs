@@ -11,9 +11,6 @@ use core::fmt;
 
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar as RistrettoScalar;
-#[cfg(feature = "avx2")]
-use libcrux_ml_kem::mlkem768::avx2::{decapsulate, encapsulate, generate_key_pair};
-#[cfg(not(feature = "avx2"))]
 use libcrux_ml_kem::mlkem768::{decapsulate, encapsulate, generate_key_pair};
 use libcrux_ml_kem::mlkem768::{MlKem768Ciphertext, MlKem768PrivateKey, MlKem768PublicKey};
 
@@ -25,6 +22,113 @@ use crate::{
     pke::{Kem, Mkem},
     EncryptedKeyMaterial, KeyMaterial,
 };
+
+/// Unpacked ML-KEM-768 encapsulation keys.
+///
+/// Caches the expanded matrix `A`, NTT-domain key vector, and `H(pk)` for reuse.
+///
+/// # Backend selection
+///
+/// libcrux exposes this API per backend, without the packed API's runtime multiplexer.
+/// This module mirrors that runtime selection so prepared and packed paths use the same
+/// acceleration.
+pub(crate) mod unpacked_mlkem {
+    use libcrux_ml_kem::mlkem768::{MlKem768Ciphertext, MlKem768PublicKey};
+
+    #[derive(Clone, Copy)]
+    enum Backend {
+        Portable,
+        #[cfg(target_arch = "x86_64")]
+        Avx2,
+        #[cfg(target_arch = "aarch64")]
+        Neon,
+    }
+
+    /// An unpacked ML-KEM-768 encapsulation key, tagged with the backend that produced
+    /// it. A key unpacked by one backend must only be used with that same backend.
+    pub enum UnpackedPublicKey {
+        Portable(Box<libcrux_ml_kem::mlkem768::portable::unpacked::MlKem768PublicKeyUnpacked>),
+        #[cfg(target_arch = "x86_64")]
+        Avx2(Box<libcrux_ml_kem::mlkem768::avx2::unpacked::MlKem768PublicKeyUnpacked>),
+        #[cfg(target_arch = "aarch64")]
+        Neon(Box<libcrux_ml_kem::mlkem768::neon::unpacked::MlKem768PublicKeyUnpacked>),
+    }
+
+    #[inline]
+    fn backend() -> Backend {
+        #[cfg(target_arch = "x86_64")]
+        if libcrux_platform::simd256_support() {
+            return Backend::Avx2;
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        if libcrux_platform::simd128_support() {
+            return Backend::Neon;
+        }
+
+        Backend::Portable
+    }
+
+    /// The backend selected for unpacked ML-KEM operations.
+    pub fn backend_name() -> &'static str {
+        match backend() {
+            Backend::Portable => "portable",
+            #[cfg(target_arch = "x86_64")]
+            Backend::Avx2 => "avx2",
+            #[cfg(target_arch = "aarch64")]
+            Backend::Neon => "neon",
+        }
+    }
+
+    pub fn unpack(pk: &MlKem768PublicKey) -> UnpackedPublicKey {
+        match backend() {
+            Backend::Portable => {
+                let mut u = Box::new(
+                    libcrux_ml_kem::mlkem768::portable::unpacked::MlKem768PublicKeyUnpacked::default(),
+                );
+                libcrux_ml_kem::mlkem768::portable::unpacked::unpacked_public_key(pk, &mut u);
+                UnpackedPublicKey::Portable(u)
+            }
+            #[cfg(target_arch = "x86_64")]
+            Backend::Avx2 => {
+                let mut u = Box::new(
+                    libcrux_ml_kem::mlkem768::avx2::unpacked::MlKem768PublicKeyUnpacked::default(),
+                );
+                libcrux_ml_kem::mlkem768::avx2::unpacked::unpacked_public_key(pk, &mut u);
+                UnpackedPublicKey::Avx2(u)
+            }
+            #[cfg(target_arch = "aarch64")]
+            Backend::Neon => {
+                let mut u = Box::new(
+                    libcrux_ml_kem::mlkem768::neon::unpacked::MlKem768PublicKeyUnpacked::default(),
+                );
+                libcrux_ml_kem::mlkem768::neon::unpacked::unpacked_public_key(pk, &mut u);
+                UnpackedPublicKey::Neon(u)
+            }
+        }
+    }
+
+    /// Encapsulate against an unpacked key. Byte-identical to the packed
+    /// `mlkem768::encapsulate` for the same randomness.
+    pub fn encapsulate(
+        pk: &UnpackedPublicKey,
+        randomness: [u8; 32],
+    ) -> (MlKem768Ciphertext, [u8; 32]) {
+        match pk {
+            UnpackedPublicKey::Portable(u) => {
+                libcrux_ml_kem::mlkem768::portable::unpacked::encapsulate(u, randomness)
+            }
+            #[cfg(target_arch = "x86_64")]
+            UnpackedPublicKey::Avx2(u) => {
+                libcrux_ml_kem::mlkem768::avx2::unpacked::encapsulate(u, randomness)
+            }
+            #[cfg(target_arch = "aarch64")]
+            UnpackedPublicKey::Neon(u) => {
+                libcrux_ml_kem::mlkem768::neon::unpacked::encapsulate(u, randomness)
+            }
+        }
+    }
+}
 
 /// ML-KEM-768 public key size
 const MLKEM_PK_SIZE: usize = 1184;
@@ -52,6 +156,11 @@ const XWING_RISTRETTO_LABEL: &[u8; 11] = b"\\.//^\\~c[_]";
 /// X-Wing-Ristretto public key (encapsulation key).
 ///
 /// Layout: pk_M (1184 bytes) || pk_R (32 bytes, compressed Ristretto point)
+///
+/// # Invariant
+///
+/// Every constructor requires a canonical compressed Ristretto point, preventing
+/// participant-supplied keys from making encapsulation fail during decompression.
 #[derive(Clone)]
 pub struct XWingRistrettoPublicKey([u8; XWING_RISTRETTO_PK_SIZE]);
 
@@ -62,8 +171,24 @@ impl fmt::Debug for XWingRistrettoPublicKey {
 }
 
 impl XWingRistrettoPublicKey {
-    /// Create from raw bytes.
-    pub fn from_bytes(bytes: [u8; XWING_RISTRETTO_PK_SIZE]) -> Self {
+    /// Create from raw bytes, rejecting a non-canonical Ristretto half.
+    pub fn from_bytes(bytes: [u8; XWING_RISTRETTO_PK_SIZE]) -> Option<Self> {
+        let mut pk_r = [0u8; RISTRETTO_PK_SIZE];
+        pk_r.copy_from_slice(&bytes[MLKEM_PK_SIZE..]);
+        CompressedRistretto(pk_r).decompress()?;
+        Some(Self(bytes))
+    }
+
+    /// Create from raw bytes known to satisfy the type invariant (key generation).
+    fn from_valid_bytes(bytes: [u8; XWING_RISTRETTO_PK_SIZE]) -> Self {
+        debug_assert!(
+            {
+                let mut pk_r = [0u8; RISTRETTO_PK_SIZE];
+                pk_r.copy_from_slice(&bytes[MLKEM_PK_SIZE..]);
+                CompressedRistretto(pk_r).decompress().is_some()
+            },
+            "key generation produced a non-canonical Ristretto point"
+        );
         Self(bytes)
     }
 
@@ -79,11 +204,13 @@ impl XWingRistrettoPublicKey {
         MlKem768PublicKey::from(pk_bytes)
     }
 
-    /// Extract Ristretto public key portion as compressed point.
-    fn ristretto_pk(&self) -> CompressedRistretto {
+    /// Decompress the validated key once, outside the mVE repetition loop.
+    fn ristretto_point(&self) -> RistrettoPoint {
         let mut pk_bytes = [0u8; RISTRETTO_PK_SIZE];
         pk_bytes.copy_from_slice(&self.0[MLKEM_PK_SIZE..]);
         CompressedRistretto(pk_bytes)
+            .decompress()
+            .expect("validated at construction: see XWingRistrettoPublicKey invariant")
     }
 
     /// Get Ristretto public key bytes.
@@ -117,7 +244,9 @@ impl<'de> Deserialize<'de> for XWingRistrettoPublicKey {
         }
         let mut pk = [0u8; XWING_RISTRETTO_PK_SIZE];
         pk.copy_from_slice(&bytes);
-        Ok(Self(pk))
+        Self::from_bytes(pk).ok_or_else(|| {
+            de::Error::custom("X-Wing-Ristretto public key has a non-canonical Ristretto point")
+        })
     }
 }
 
@@ -365,7 +494,7 @@ impl XWingRistretto {
         pk_bytes[..MLKEM_PK_SIZE].copy_from_slice(pk_m.as_slice());
         pk_bytes[MLKEM_PK_SIZE..].copy_from_slice(&pk_r);
 
-        let pk = XWingRistrettoPublicKey(pk_bytes);
+        let pk = XWingRistrettoPublicKey::from_valid_bytes(pk_bytes);
         let sk = XWingRistrettoSecretKey {
             seed,
             sk_m,
@@ -384,7 +513,7 @@ impl XWingRistretto {
         eseed: &[u8; 96],
     ) -> (XWingRistrettoCiphertext, KeyMaterial) {
         let pk_m = pk.mlkem_pk();
-        let pk_r = pk.ristretto_pk();
+        let pk_r_point = pk.ristretto_point();
         let pk_r_bytes = pk.ristretto_pk_bytes();
 
         // Ristretto ephemeral keypair from eseed[32:96]
@@ -397,9 +526,6 @@ impl XWingRistretto {
         let ct_r_bytes = ct_r_point.compress().to_bytes();
 
         // ss_R = ek_R * pk_R (shared secret via DH)
-        let pk_r_point = pk_r
-            .decompress()
-            .expect("public key should be valid Ristretto point");
         let ss_r_point = pk_r_point * ek_r;
         let ss_r_bytes = ss_r_point.compress().to_bytes();
 
@@ -428,7 +554,7 @@ impl XWingRistretto {
         eseed: &[u8; 96],
     ) -> (XWingRistrettoCiphertext, [u8; 32]) {
         let pk_m = pk.mlkem_pk();
-        let pk_r = pk.ristretto_pk();
+        let pk_r_point = pk.ristretto_point();
         let pk_r_bytes = pk.ristretto_pk_bytes();
 
         // Ristretto ephemeral keypair from eseed[32:96]
@@ -441,9 +567,6 @@ impl XWingRistretto {
         let ct_r_bytes = ct_r_point.compress().to_bytes();
 
         // ss_R = ek_R * pk_R (shared secret via DH)
-        let pk_r_point = pk_r
-            .decompress()
-            .expect("public key should be valid Ristretto point");
         let ss_r_point = pk_r_point * ek_r;
         let ss_r_bytes = ss_r_point.compress().to_bytes();
 
@@ -505,16 +628,47 @@ impl XWingRistretto {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct XWingRistrettoMkem(XWingRistretto);
 
+/// Precomputed, randomness-independent state for one recipient.
+pub struct XWingRistrettoPreparedRecipient {
+    /// ML-KEM-768 encapsulation key in unpacked form (matrix `A`, `t_as_ntt`, `H(pk)`).
+    mlkem_pk: unpacked_mlkem::UnpackedPublicKey,
+    /// Recipient Ristretto public key, decompressed once.
+    ristretto_pk: RistrettoPoint,
+    /// Compressed Ristretto public key bytes, required by the combiner.
+    ristretto_pk_bytes: [u8; 32],
+}
+
+/// Precomputed state for a fixed ordered recipient set.
+pub struct XWingRistrettoMkemPrepared {
+    recipients: Vec<XWingRistrettoPreparedRecipient>,
+}
+
 /// Ciphertext for the X-Wing-Ristretto-based mKEM.
+///
+/// The ephemeral `ct_r` is shared by construction, so it is stored **once** here rather
+/// than repeated per recipient; [`Mkem::get`] recombines it into a self-contained
+/// [`XWingRistrettoMkemIndividualCiphertext`] for delivery.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct XWingRistrettoMkemCiphertext {
     /// Shared ephemeral Ristretto public key (ct_r), used by all recipients.
     ct_r: [u8; 32],
-    /// Per-recipient ciphertexts containing ML-KEM ciphertext and encrypted key.
-    cts: Vec<XWingRistrettoMkemIndividualCiphertext>,
+    /// Per-recipient ciphertext bodies.
+    cts: Vec<XWingRistrettoMkemBody>,
+}
+
+/// The per-recipient part of a group ciphertext: everything except the shared ephemeral.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct XWingRistrettoMkemBody {
+    /// Per-recipient ML-KEM-768 ciphertext (1088 bytes).
+    ct_m: Vec<u8>,
+    /// Encrypted key material for the shared group key.
+    ct_key: EncryptedKeyMaterial,
 }
 
 /// Individual ciphertext for a single recipient.
+///
+/// Self-contained: carries the shared ephemeral so a recipient can decapsulate from this
+/// value alone. The wire format of *this* type is unchanged.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct XWingRistrettoMkemIndividualCiphertext {
     /// The shared ephemeral Ristretto public key (needed for decapsulation).
@@ -532,6 +686,61 @@ impl Mkem for XWingRistrettoMkem {
     type IndividualCiphertext = XWingRistrettoMkemIndividualCiphertext;
     type Ciphertext = XWingRistrettoMkemCiphertext;
     type SecretKey = XWingRistrettoSecretKey;
+    type Prepared = XWingRistrettoMkemPrepared;
+
+    fn prepare(&self, pks: &[Self::PublicKey]) -> Self::Prepared {
+        let recipients = pks
+            .iter()
+            .map(|pk| XWingRistrettoPreparedRecipient {
+                mlkem_pk: unpacked_mlkem::unpack(&pk.mlkem_pk()),
+                ristretto_pk: pk.ristretto_point(),
+                ristretto_pk_bytes: pk.ristretto_pk_bytes(),
+            })
+            .collect();
+
+        XWingRistrettoMkemPrepared { recipients }
+    }
+
+    fn encaps_prepared<R: CryptoRng + RngCore>(
+        &self,
+        rng: &mut R,
+        prepared: &Self::Prepared,
+    ) -> (Self::Ciphertext, KeyMaterial) {
+        // Preserve `encaps` output and RNG consumption for mVE recomputation.
+        let key = KeyMaterial::random_with(rng);
+
+        let mut ek_r_bytes = [0u8; 64];
+        rng.fill_bytes(&mut ek_r_bytes);
+        let ek_r = RistrettoScalar::from_bytes_mod_order_wide(&ek_r_bytes);
+
+        let ct_r_point = RistrettoPoint::mul_base(&ek_r);
+        let ct_r = ct_r_point.compress().to_bytes();
+
+        let mut cts = Vec::with_capacity(prepared.recipients.len());
+
+        for recipient in &prepared.recipients {
+            let ss_r_point = recipient.ristretto_pk * ek_r;
+            let ss_r = ss_r_point.compress().to_bytes();
+
+            let mut mlkem_rand = [0u8; 32];
+            rng.fill_bytes(&mut mlkem_rand);
+            let (ct_m, ss_m) = unpacked_mlkem::encapsulate(&recipient.mlkem_pk, mlkem_rand);
+            let mut ss_m_bytes = [0u8; 32];
+            ss_m_bytes.copy_from_slice(ss_m.as_ref());
+
+            let ss = combiner(&ss_m_bytes, &ss_r, &ct_r, &recipient.ristretto_pk_bytes);
+            let shared = KeyMaterial::digest(&ss);
+
+            let ct_key = EncryptedKeyMaterial::encrypt(shared, &key);
+
+            cts.push(XWingRistrettoMkemBody {
+                ct_m: ct_m.as_slice().to_vec(),
+                ct_key,
+            });
+        }
+
+        (XWingRistrettoMkemCiphertext { ct_r, cts }, key)
+    }
 
     fn keygen<R: CryptoRng + RngCore>(&self, rng: &mut R) -> (Self::PublicKey, Self::SecretKey) {
         // Key generation is the same as regular X-Wing-Ristretto
@@ -560,13 +769,10 @@ impl Mkem for XWingRistrettoMkem {
         for pk in pks {
             // Extract recipient's component keys
             let pk_m = pk.mlkem_pk();
-            let pk_r = pk.ristretto_pk();
+            let pk_r_point = pk.ristretto_point();
             let pk_r_bytes = pk.ristretto_pk_bytes();
 
             // Ristretto DH with recipient's public key (reusing our ephemeral key)
-            let pk_r_point = pk_r
-                .decompress()
-                .expect("public key should be valid Ristretto point");
             let ss_r_point = pk_r_point * ek_r;
             let ss_r = ss_r_point.compress().to_bytes();
 
@@ -583,8 +789,7 @@ impl Mkem for XWingRistrettoMkem {
 
             let ct_key = EncryptedKeyMaterial::encrypt(shared, &key);
 
-            cts.push(XWingRistrettoMkemIndividualCiphertext {
-                ct_r,
+            cts.push(XWingRistrettoMkemBody {
                 ct_m: ct_m.as_slice().to_vec(),
                 ct_key,
             });
@@ -594,7 +799,13 @@ impl Mkem for XWingRistrettoMkem {
     }
 
     fn get(&self, cts: &Self::Ciphertext, index: usize) -> Option<Self::IndividualCiphertext> {
-        cts.cts.get(index).cloned()
+        cts.cts
+            .get(index)
+            .map(|body| XWingRistrettoMkemIndividualCiphertext {
+                ct_r: cts.ct_r,
+                ct_m: body.ct_m.clone(),
+                ct_key: body.ct_key.clone(),
+            })
     }
 
     fn decaps(&self, sk: &Self::SecretKey, ct: &Self::IndividualCiphertext) -> Option<KeyMaterial> {

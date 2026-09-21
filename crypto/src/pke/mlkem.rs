@@ -1,7 +1,4 @@
 use core::{fmt, ops::Deref};
-#[cfg(feature = "avx2")]
-use libcrux_ml_kem::mlkem768::avx2::{decapsulate, encapsulate, generate_key_pair};
-#[cfg(not(feature = "avx2"))]
 use libcrux_ml_kem::mlkem768::{decapsulate, encapsulate, generate_key_pair};
 use libcrux_ml_kem::mlkem768::{MlKem768Ciphertext, MlKem768PrivateKey, MlKem768PublicKey};
 use rand::Rng;
