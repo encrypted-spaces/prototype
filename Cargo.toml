@@ -23,7 +23,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 license = "Apache-2.0"
 authors = [
@@ -55,7 +55,7 @@ hyper-tungstenite = { version = "0.5" }
 native-tls = { version = "0.2" }
 instant = { version = "0.1.13" }
 log = { version = "0.4" }
-merk = { git = "ssh://git@github.com/encrypted-spaces/merk-private.git", branch = "develop" }
+merk = { git = "https://github.com/encrypted-spaces/merk.git", tag = "v0.0.2" }
 once_cell = { version = "1.19" }
 prost = { version = "0.14.1" }
 proptest = { version = "1.6", default-features = false, features = ["std"] }

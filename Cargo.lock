@@ -2164,7 +2164,7 @@ dependencies = [
 
 [[package]]
 name = "encrypted-spaces-acl-types"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "pest",
  "pest_derive",
@@ -2174,7 +2174,7 @@ dependencies = [
 
 [[package]]
 name = "encrypted-spaces-backend"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2205,7 +2205,7 @@ dependencies = [
 
 [[package]]
 name = "encrypted-spaces-backend-server"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64 0.22.1",
  "clap 4.6.1",
@@ -2242,7 +2242,7 @@ dependencies = [
 
 [[package]]
 name = "encrypted-spaces-changelog-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "encrypted-spaces-acl-types",
  "encrypted-spaces-storage-encoding",
@@ -2261,7 +2261,7 @@ dependencies = [
 
 [[package]]
 name = "encrypted-spaces-changelog-test-utils"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64 0.22.1",
  "encrypted-spaces-backend",
@@ -2283,7 +2283,7 @@ dependencies = [
 
 [[package]]
 name = "encrypted-spaces-crypto"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -2322,7 +2322,7 @@ dependencies = [
 
 [[package]]
 name = "encrypted-spaces-demo"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2345,7 +2345,7 @@ dependencies = [
 
 [[package]]
 name = "encrypted-spaces-demo-test-harness"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "clap 4.6.1",
@@ -2364,7 +2364,7 @@ dependencies = [
 
 [[package]]
 name = "encrypted-spaces-ff-test"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2395,7 +2395,7 @@ dependencies = [
 
 [[package]]
 name = "encrypted-spaces-ffproof"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -2423,7 +2423,7 @@ dependencies = [
 
 [[package]]
 name = "encrypted-spaces-ffproof-methods"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "risc0-build",
 ]
@@ -2437,7 +2437,7 @@ dependencies = [
 
 [[package]]
 name = "encrypted-spaces-key-manager"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "encrypted-spaces-changelog-core",
@@ -2454,7 +2454,7 @@ dependencies = [
 
 [[package]]
 name = "encrypted-spaces-retention"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "encrypted-spaces-changelog-core",
@@ -2477,7 +2477,7 @@ dependencies = [
 
 [[package]]
 name = "encrypted-spaces-sdk"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aes",
  "async-trait",
@@ -2520,7 +2520,7 @@ dependencies = [
 
 [[package]]
 name = "encrypted-spaces-sdk-codegen"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "encrypted-spaces-acl-types",
  "encrypted-spaces-backend",
@@ -2532,7 +2532,7 @@ dependencies = [
 
 [[package]]
 name = "encrypted-spaces-sdk-fuzzer"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "encrypted-spaces-acl-types",
  "encrypted-spaces-backend",
@@ -2544,7 +2544,7 @@ dependencies = [
 
 [[package]]
 name = "encrypted-spaces-storage-encoding"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "postcard",
  "serde",
@@ -2554,7 +2554,7 @@ dependencies = [
 
 [[package]]
 name = "encrypted-spaces-zkp"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bytesize",
  "criterion",
@@ -4718,8 +4718,8 @@ dependencies = [
 
 [[package]]
 name = "merk"
-version = "2.0.0"
-source = "git+ssh://git@github.com/encrypted-spaces/merk-private.git?branch=develop#d527011f3809322ee1f1d1a0f55ae347e3309603"
+version = "0.0.2"
+source = "git+https://github.com/encrypted-spaces/merk.git?tag=v0.0.2#995438230fa0acd5583082951f5e565f755c56c9"
 dependencies = [
  "ed",
  "serde",
